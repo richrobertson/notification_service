@@ -2,7 +2,7 @@ package notify
 
 func openAPISpec() map[string]any {
 	return map[string]any{
-		"openapi": "3.1.0",
+		"openapi": "3.0.3",
 		"info": map[string]any{
 			"title":       "Notification Service API",
 			"version":     "0.1.0",
@@ -241,21 +241,27 @@ func openAPISpec() map[string]any {
 						"channel":         map[string]any{"type": "string", "enum": []string{"email", "webhook"}},
 						"attempt_number":  map[string]any{"type": "integer"},
 						"status":          map[string]any{"type": "string"},
-						"error_code":      map[string]any{"type": "string"},
-						"next_retry_at":   map[string]any{"type": "string", "format": "date-time"},
-						"completed_at":    map[string]any{"type": "string", "format": "date-time"},
+						"error_code":      map[string]any{"type": "string", "nullable": true},
+						"next_retry_at":   map[string]any{"type": "string", "format": "date-time", "nullable": true},
+						"completed_at":    map[string]any{"type": "string", "format": "date-time", "nullable": true},
 					},
 					"required": []string{"id", "notification_id", "channel", "attempt_number", "status"},
 				},
 				"Notification": map[string]any{
 					"type": "object",
 					"properties": map[string]any{
-						"id":              map[string]any{"type": "string"},
-						"tenant_id":       map[string]any{"type": "string"},
-						"template_id":     map[string]any{"type": "string"},
-						"channels":        map[string]any{"type": "array", "items": map[string]any{"type": "string", "enum": []string{"email", "webhook"}}},
-						"recipient":       map[string]any{"type": "object", "additionalProperties": true},
-						"variables":       map[string]any{"type": "object", "additionalProperties": true},
+						"id":          map[string]any{"type": "string"},
+						"tenant_id":   map[string]any{"type": "string"},
+						"template_id": map[string]any{"type": "string"},
+						"channels":    map[string]any{"type": "array", "items": map[string]any{"type": "string", "enum": []string{"email", "webhook"}}},
+						"recipient": map[string]any{
+							"type":                 "object",
+							"additionalProperties": map[string]any{},
+						},
+						"variables": map[string]any{
+							"type":                 "object",
+							"additionalProperties": map[string]any{},
+						},
 						"idempotency_key": map[string]any{"type": "string"},
 						"status":          map[string]any{"type": "string"},
 						"submitted_at":    map[string]any{"type": "string", "format": "date-time"},
@@ -271,11 +277,17 @@ func openAPISpec() map[string]any {
 				"CreateNotificationInput": map[string]any{
 					"type": "object",
 					"properties": map[string]any{
-						"tenant_id":       map[string]any{"type": "string"},
-						"template_id":     map[string]any{"type": "string"},
-						"channels":        map[string]any{"type": "array", "items": map[string]any{"type": "string", "enum": []string{"email", "webhook"}}, "minItems": 1},
-						"recipient":       map[string]any{"type": "object", "additionalProperties": true},
-						"variables":       map[string]any{"type": "object", "additionalProperties": true},
+						"tenant_id":   map[string]any{"type": "string"},
+						"template_id": map[string]any{"type": "string"},
+						"channels":    map[string]any{"type": "array", "items": map[string]any{"type": "string", "enum": []string{"email", "webhook"}}, "minItems": 1},
+						"recipient": map[string]any{
+							"type":                 "object",
+							"additionalProperties": map[string]any{},
+						},
+						"variables": map[string]any{
+							"type":                 "object",
+							"additionalProperties": map[string]any{},
+						},
 						"idempotency_key": map[string]any{"type": "string"},
 					},
 					"required": []string{"tenant_id", "template_id", "channels", "recipient", "idempotency_key"},

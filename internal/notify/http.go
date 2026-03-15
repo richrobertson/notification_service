@@ -5,7 +5,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"html/template"
 	"net/http"
 	"strings"
 )
@@ -51,9 +50,7 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleSwaggerUI(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_ = swaggerUITemplate.Execute(w, map[string]string{
-		"OpenAPIURL": "/openapi.json",
-	})
+	_, _ = w.Write([]byte(swaggerUIHTML))
 }
 
 func (s *Server) handleOpenAPI(w http.ResponseWriter, _ *http.Request) {
@@ -271,7 +268,7 @@ func newID() string {
 	return hex.EncodeToString(buf[:])
 }
 
-var swaggerUITemplate = template.Must(template.New("swagger-ui").Parse(`<!DOCTYPE html>
+const swaggerUIHTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -288,7 +285,7 @@ var swaggerUITemplate = template.Must(template.New("swagger-ui").Parse(`<!DOCTYP
   <script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
   <script>
     window.ui = SwaggerUIBundle({
-      url: {{ printf "%q" .OpenAPIURL }},
+      url: '/openapi.json',
       dom_id: '#swagger-ui',
       deepLinking: true,
       displayRequestDuration: true,
@@ -297,4 +294,4 @@ var swaggerUITemplate = template.Must(template.New("swagger-ui").Parse(`<!DOCTYP
     });
   </script>
 </body>
-</html>`))
+</html>`

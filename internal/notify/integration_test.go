@@ -13,11 +13,12 @@ func TestFunctionalRequirementsOfTheMVP(t *testing.T) {
 	swaggerUI := doJSONRequest(t, handler, http.MethodGet, "/swagger", nil)
 	expectStatus(t, swaggerUI, http.StatusOK, "The API should expose a Swagger web UI for exploring the REST endpoints")
 	expectTrue(t, strings.Contains(swaggerUI.Body.String(), "SwaggerUIBundle"), "The Swagger web UI should include the Swagger UI bootstrap script")
+	expectTrue(t, strings.Contains(swaggerUI.Body.String(), "url: '/openapi.json'"), "The Swagger web UI should point directly at the OpenAPI JSON endpoint")
 
 	openAPI := doJSONRequest(t, handler, http.MethodGet, "/openapi.json", nil)
 	expectStatus(t, openAPI, http.StatusOK, "The API should expose an OpenAPI document that powers the Swagger web UI")
 	openAPIBody := decodeBody[map[string]any](t, openAPI)
-	expectEqual(t, openAPIBody["openapi"].(string), "3.1.0", "The OpenAPI document should declare the expected OpenAPI version")
+	expectEqual(t, openAPIBody["openapi"].(string), "3.0.3", "The OpenAPI document should declare the expected OpenAPI version")
 	paths, ok := openAPIBody["paths"].(map[string]any)
 	expectTrue(t, ok, "The OpenAPI document should publish a path map for the REST API")
 	_, hasNotificationsPath := paths["/v1/notifications"]
