@@ -155,3 +155,39 @@ Captures jobs that exceed retry policy and supports replay.
   },
   "idempotency_key": "c8eb3b4c-0a4b-4f0d-a7d5-4a4d3baf4e98"
 }
+```
+
+## Go MVP
+
+The current implementation is a Go HTTP service that provides the documented API surface with:
+
+- in-memory tenant, template, and notification storage
+- idempotent notification submission
+- per-tenant daily quota enforcement
+- replay support that creates new delivery attempts
+- health, readiness, usage, and dead-letter endpoints
+
+### Run Locally
+
+```bash
+go run ./cmd/api
+```
+
+The server listens on `:8080` by default. Set `ADDR` to override the bind address.
+
+Browse the REST API documentation at `http://localhost:8080/swagger`.
+The OpenAPI document is available at `http://localhost:8080/openapi.json`.
+
+### Run Tests
+
+```bash
+go test ./...
+```
+
+Benchmark the submission path with:
+
+```bash
+go test -run '^$' -bench . ./internal/notify
+```
+
+The PostgreSQL schema for the documented persistence model lives at `db/schema.sql`.
