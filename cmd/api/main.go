@@ -14,6 +14,7 @@ import (
 
 	"github.com/richrobertson/notification-platform/internal/config"
 	httpserver "github.com/richrobertson/notification-platform/internal/http"
+	"github.com/richrobertson/notification-platform/internal/queue"
 	"github.com/richrobertson/notification-platform/internal/store"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -61,29 +62,23 @@ func main() {
 		}
 	}()
 
-	router := httpserver.NewRouter(httpserver.RouterDeps{
-		AppName: cfg.AppName,
-		DBPing:  postgres.Ping,
-		Store:   postgres,
-	})
-
-	server := &http.Server{
-		Addr:              ":" + cfg.HTTPPort,
-		Handler:           router,
-		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       10 * time.Second,
-		WriteTimeout:      15 * time.Second,
-		IdleTimeout:       60 * time.Second,
+	redisQueue := queue.NewRedisQueue(cfg.RedisAddr, cfg.RedisPassword, cfg.RedisDB)
+	if err := redisQueue.Ping(startupCtx); err != nil {
+		logger.Error("failed to connect to redis", slog.Any("error", err))
+		os.Exit(1)
 	}
+	defer func() {
+		if err := redisQueue.Close(); err != nil {
+			logger.Error("failed to close redis", slog.Any("error", err))
+		}
+	}()
+
+	router := httpserver.NewRouter(httpserver.RouterDeps{AppName: cfg.AppName, DBPing: postgres.Ping, Store: postgres, Queue: redisQueue})
+	server := &http.Server{Addr: ":" + cfg.HTTPPort, Handler: router, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 15 * time.Second, IdleTimeout: 60 * time.Second}
 
 	errCh := make(chan error, 1)
 	go func() {
-		logger.Info("starting api server",
-			slog.String("addr", server.Addr),
-			slog.String("app_name", cfg.AppName),
-			slog.String("environment", cfg.Environment),
-		)
-
+		logger.Info("starting api server", slog.String("addr", server.Addr), slog.String("app_name", cfg.AppName), slog.String("environment", cfg.Environment), slog.String("redis_addr", cfg.RedisAddr))
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- fmt.Errorf("http server stopped: %w", err)
 		}
@@ -99,12 +94,10 @@ func main() {
 
 	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelShutdown()
-
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		logger.Error("failed to shut down http server", slog.Any("error", err))
 		os.Exit(1)
 	}
-
 	logger.Info("api server stopped")
 }
 
@@ -122,64 +115,35 @@ func newLogger(level string) *slog.Logger {
 	default:
 		slogLevel = slog.LevelInfo
 	}
-
-	return slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slogLevel,
-	}))
+	return slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slogLevel}))
 }
 
 func setupTelemetry(ctx context.Context, cfg config.Config) (func(context.Context) error, error) {
-	res, err := resource.Merge(
-		resource.Default(),
-		resource.NewWithAttributes(
-			semconv.SchemaURL,
-			semconv.ServiceName(cfg.AppName),
-			attribute.String("deployment.environment.name", cfg.Environment),
-		),
-	)
+	res, err := resource.Merge(resource.Default(), resource.NewWithAttributes(semconv.SchemaURL, semconv.ServiceName(cfg.AppName), attribute.String("deployment.environment.name", cfg.Environment)))
 	if err != nil {
 		return nil, fmt.Errorf("build telemetry resource: %w", err)
 	}
-
-	traceExporter, err := otlptracegrpc.New(ctx,
-		otlptracegrpc.WithEndpoint(cfg.OTLPEndpoint),
-		otlptracegrpc.WithInsecure(),
-	)
+	traceExporter, err := otlptracegrpc.New(ctx, otlptracegrpc.WithEndpoint(cfg.OTLPEndpoint), otlptracegrpc.WithInsecure())
 	if err != nil {
 		return nil, fmt.Errorf("create trace exporter: %w", err)
 	}
-
-	metricExporter, err := otlpmetricgrpc.New(ctx,
-		otlpmetricgrpc.WithEndpoint(cfg.OTLPEndpoint),
-		otlpmetricgrpc.WithInsecure(),
-	)
+	metricExporter, err := otlpmetricgrpc.New(ctx, otlpmetricgrpc.WithEndpoint(cfg.OTLPEndpoint), otlpmetricgrpc.WithInsecure())
 	if err != nil {
 		return nil, fmt.Errorf("create metric exporter: %w", err)
 	}
-
-	tracerProvider := sdktrace.NewTracerProvider(
-		sdktrace.WithBatcher(traceExporter),
-		sdktrace.WithResource(res),
-	)
-	meterProvider := metric.NewMeterProvider(
-		metric.WithReader(metric.NewPeriodicReader(metricExporter)),
-		metric.WithResource(res),
-	)
-
+	tracerProvider := sdktrace.NewTracerProvider(sdktrace.WithBatcher(traceExporter), sdktrace.WithResource(res))
+	meterProvider := metric.NewMeterProvider(metric.WithReader(metric.NewPeriodicReader(metricExporter)), metric.WithResource(res))
 	otel.SetTracerProvider(tracerProvider)
 	otel.SetMeterProvider(meterProvider)
 	otel.SetTextMapPropagator(propagation.TraceContext{})
-
 	return func(ctx context.Context) error {
 		var shutdownErr error
-
 		if err := meterProvider.Shutdown(ctx); err != nil {
 			shutdownErr = errors.Join(shutdownErr, fmt.Errorf("shutdown meter provider: %w", err))
 		}
 		if err := tracerProvider.Shutdown(ctx); err != nil {
 			shutdownErr = errors.Join(shutdownErr, fmt.Errorf("shutdown tracer provider: %w", err))
 		}
-
 		return shutdownErr
 	}, nil
 }

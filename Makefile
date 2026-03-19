@@ -4,7 +4,7 @@ APP_NAME := notification-platform
 DB_URL := postgres://notification:notification@localhost:5432/notification_platform?sslmode=disable
 MIGRATIONS_DIR := ./migrations
 
-.PHONY: help dev-up dev-down dev-logs db-shell migrate-up migrate-reset run-api test fmt lint
+.PHONY: help dev-up dev-down dev-logs db-shell migrate-up migrate-reset run-api run-dispatcher test fmt lint
 
 help:
 	@echo "$(APP_NAME) developer workflow"
@@ -18,6 +18,7 @@ help:
 	@echo "  migrate-up         Apply SQL migrations in sorted order"
 	@echo "  migrate-reset      Recreate public schema and reapply migrations"
 	@echo "  run-api            Run the API service"
+	@echo "  run-dispatcher     Run the dispatch router"
 	@echo "  test               Run Go tests"
 	@echo "  fmt                Format Go files"
 	@echo "  lint               Run go vet"
@@ -55,6 +56,9 @@ migrate-reset:
 
 run-api:
 	go run ./cmd/api
+
+run-dispatcher:
+	go run ./cmd/dispatcher
 
 test:
 	go test ./...

@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-`notification_service` is a runnable Go foundation for a multi-tenant notification platform, now with its first synchronous database-backed API path.
+`notification_service` is a runnable Go foundation for a multi-tenant notification platform. Stage 3 adds the first durable async dispatch foundation while intentionally stopping before any real delivery execution.
 
 The service currently provides:
 
@@ -11,35 +11,63 @@ The service currently provides:
 - template creation
 - notification submission
 - PostgreSQL-backed persistence using `database/sql`
+- Redis-backed dispatch queues using Redis lists
+- a standalone dispatcher process that routes generic dispatch jobs to channel-specific queues
 - OpenTelemetry bootstrap wiring for local development
 - Docker Compose infrastructure for Postgres, Redis, Prometheus, Grafana, Jaeger, and the OpenTelemetry Collector
 
-This milestone is intentionally narrow. It focuses on synchronous request handling only and stops before async delivery infrastructure.
+## Stage 3 Status
 
-## Current Implementation Status
-
-Implemented today:
+Implemented in this stage:
 
 - `GET /v1/health`
 - `GET /v1/readiness`
 - `POST /v1/tenants`
 - `POST /v1/templates`
 - `POST /v1/notifications`
-- PostgreSQL persistence using the schema in `migrations/001_init.sql`
+- PostgreSQL persistence for notifications
+- PostgreSQL persistence for the initial `delivery_attempts` row with `attempt_number = 1` and `status = pending`
+- generic dispatch job enqueue to Redis queue `notify:dispatch`
+- dispatcher consumption from `notify:dispatch`
+- dispatcher routing to channel queues:
+  - `notify:dispatch:webhook`
+  - `notify:dispatch:email`
 - request logging and panic recovery middleware
 - idempotent notification submission when `idempotency_key` is provided
 
 Not implemented yet:
 
-- async dispatch
-- workers
+- webhook execution
+- email sending
+- workers that consume channel queues
 - retries
 - DLQ handling
-- auth hardening
 - replay flow
+- scheduling
+- auth hardening
 - usage endpoints
 - dead-letter inspection endpoints
-- delivery attempt processing
+- transactional outbox protection for DB + queue atomicity
+
+## Stage 3 Architecture Summary
+
+Current request flow:
+
+1. Client calls `POST /v1/notifications`
+2. API validates tenant, template, and recipient fields
+3. API persists the notification row in PostgreSQL
+4. API inserts the initial `delivery_attempts` row with `pending`
+5. API enqueues a small JSON dispatch job onto `notify:dispatch`
+6. `cmd/dispatcher` blocks on `notify:dispatch`
+7. Dispatcher republishes the same job to either `notify:dispatch:webhook` or `notify:dispatch:email`
+
+Important honesty notes:
+
+- The API does **not** push directly to channel queues in this stage.
+- No worker consumes the channel-specific queues yet.
+- No delivery execution occurs yet.
+- The design is intentionally simple and demoable for now.
+- PostgreSQL writes and Redis enqueue are **not** yet coordinated with an outbox pattern, so DB/queue atomicity is not yet hardened.
 
 ## Current Endpoints
 
@@ -99,6 +127,29 @@ The required recipient field depends on the template channel:
 - email templates require `recipient_email`
 - webhook templates require `recipient_webhook_url`
 
+Submission now also creates the first delivery attempt and enqueues one generic dispatch job.
+
+## Current Queue Design
+
+Redis list queues used in Stage 3:
+
+- generic dispatch queue:
+  - `notify:dispatch`
+- channel queues:
+  - `notify:dispatch:webhook`
+  - `notify:dispatch:email`
+
+Dispatch job envelope fields:
+
+- `job_id`
+- `notification_id`
+- `attempt_id`
+- `tenant_id`
+- `channel`
+- `created_at`
+
+The job is intentionally small so later workers can load full records from PostgreSQL.
+
 ## Local Development
 
 Start local infrastructure:
@@ -119,10 +170,19 @@ Run the API service:
 make run-api
 ```
 
+Run the dispatcher in a second terminal:
+
+```bash
+make run-dispatcher
+```
+
 Default local configuration:
 
 - HTTP port: `8080`
 - PostgreSQL: `postgres://notification:notification@localhost:5432/notification_platform?sslmode=disable`
+- Redis address: `localhost:6379`
+- Redis password: empty
+- Redis DB: `0`
 - OTLP endpoint: `localhost:4317`
 
 Useful local endpoints:
@@ -159,12 +219,12 @@ curl -X POST http://localhost:8080/v1/tenants \
 curl -X POST http://localhost:8080/v1/templates \
   -H "Content-Type: application/json" \
   -d '{
-    "id": "tpl_password_reset_email_v1",
+    "id": "tpl_password_reset_webhook_v1",
     "tenant_id": "acme",
     "name": "password-reset",
-    "channel": "email",
+    "channel": "webhook",
     "version": 1,
-    "body": "Hello {{.first_name}}, reset here: {{.reset_url}}"
+    "body": "{\"event\":\"password_reset\",\"url\":\"{{.reset_url}}\"}"
   }'
 ```
 
@@ -176,15 +236,21 @@ curl -X POST http://localhost:8080/v1/notifications \
   -d '{
     "id": "notif_001",
     "tenant_id": "acme",
-    "template_id": "tpl_password_reset_email_v1",
+    "template_id": "tpl_password_reset_webhook_v1",
     "idempotency_key": "idem-123",
-    "recipient_email": "user@example.com",
+    "recipient_webhook_url": "https://example.com/hooks/password-reset",
     "variables": {
-      "first_name": "Sam",
       "reset_url": "https://example.com/reset/abc"
     }
   }'
 ```
+
+After submission you should be able to observe:
+
+- a row in `notifications`
+- an initial row in `delivery_attempts` with `attempt_number = 1` and `status = pending`
+- a JSON job pushed to `notify:dispatch`
+- the dispatcher moving that job to `notify:dispatch:webhook`
 
 ## Database Migration
 
@@ -198,28 +264,24 @@ Reset and reapply locally:
 make migrate-reset
 ```
 
-The current service uses the existing `tenants`, `templates`, and `notifications` tables, while the rest of the schema is reserved for later milestones.
+The current service actively uses `tenants`, `templates`, `notifications`, and `delivery_attempts`. Other schema objects remain reserved for later milestones.
 
 ## Current Limitations
 
-This service currently accepts notification requests and stores them, but it does not deliver them yet.
+This service currently accepts notification requests, stores them, creates an initial delivery attempt, and routes dispatch jobs. It still does not perform delivery.
 
 There is no:
 
-- background dispatch
-- channel worker execution
+- webhook execution
+- email sending
+- worker execution on channel queues
 - retry handling
 - dead-letter processing
-- tenant authentication or authorization
+- tenant authentication or authorization hardening
 - replay API
 - usage reporting
+- transactional outbox for DB + queue consistency
 
 ## Next Planned Work
 
-The next milestone should focus on turning stored notifications into delivered work:
-
-1. add delivery attempt creation
-2. introduce dispatcher and worker binaries
-3. connect synchronous submissions to asynchronous processing
-4. add retry and DLQ handling
-5. harden auth and tenant-scoped access control
+The next milestone should focus on adding workers that consume the channel-specific queues and execute delivery while preserving the intentionally small job envelope introduced here.
