@@ -1,193 +1,225 @@
-# Multi-Tenant Notification Platform
+# notification_service
 
-A production-style backend platform for sending notifications across channels with strong reliability, tenant isolation, and observability.
+## Project Overview
 
-## Overview
+`notification_service` is a runnable Go foundation for a multi-tenant notification platform, now with its first synchronous database-backed API path.
 
-This project provides a reusable notification service that allows tenants to:
+The service currently provides:
 
-- manage notification templates
-- submit notification requests
-- deliver messages asynchronously across channels
-- enforce quotas and rate limits
-- track delivery state
-- inspect and replay dead-lettered jobs
-- audit configuration changes
-
-The initial MVP focuses on **email** and **webhook** delivery.
-
-## Goals
-
-- Provide a clean, tenant-scoped API for notification submission
-- Support asynchronous processing for reliable delivery
-- Prevent duplicate sends with idempotency keys
-- Handle transient failures with bounded retries and exponential backoff
-- Route terminal failures to a dead-letter queue
-- Expose strong operational visibility through logs, metrics, and traces
-
-## Non-Goals (MVP)
-
-- Rich UI dashboard
-- Full end-user identity management
-- SMS/push provider integrations
-- Complex scheduling and campaign management
-- Exactly-once delivery guarantees
-
-## Core Requirements
-
-### Functional
-- Create and manage tenants
-- Create and manage templates
-- Submit notifications
-- Deliver through email and webhook channels
-- Track notification and delivery attempt status
-- Replay dead-lettered notifications
-
-### Non-Functional
-- Low-latency submission path
-- At-least-once asynchronous processing
-- Tenant isolation
-- Idempotent request handling
-- Observable request and worker flows
-- Recoverable failure handling
-
-## Architecture
-
-### Components
-
-#### API Service
-Handles:
-- API key authentication
-- tenant-scoped access control
-- template CRUD
+- health and readiness endpoints
+- tenant creation
+- template creation
 - notification submission
-- notification status reads
-- operational endpoints
+- PostgreSQL-backed persistence using `database/sql`
+- OpenTelemetry bootstrap wiring for local development
+- Docker Compose infrastructure for Postgres, Redis, Prometheus, Grafana, Jaeger, and the OpenTelemetry Collector
 
-#### Dispatcher
-Transforms accepted notification requests into channel-specific delivery jobs and places them onto the queue.
+This milestone is intentionally narrow. It focuses on synchronous request handling only and stops before async delivery infrastructure.
 
-#### Channel Workers
-Separate workers process channel jobs:
-- email worker
-- webhook worker
+## Current Implementation Status
 
-Workers:
-- render templates
-- attempt delivery
-- apply retry policy
-- emit logs, metrics, and traces
-- update delivery status
+Implemented today:
 
-#### Rate Limit / Quota Layer
-Enforces:
-- tenant daily quota
-- per-tenant submission rate
-
-#### Dead-Letter Processor
-Captures jobs that exceed retry policy and supports replay.
-
-## High-Level Flow
-
-1. Client submits `POST /v1/notifications`
-2. API authenticates tenant and validates request
-3. API persists the notification intent and idempotency key
-4. Dispatcher creates channel-specific jobs
-5. Workers process deliveries asynchronously
-6. Delivery attempt results are recorded
-7. Terminal failures are moved to the dead-letter queue
-8. Operators can inspect and replay failed jobs
-
-## Status Model
-
-### Notification Status
-- `accepted`
-- `processing`
-- `partially_delivered`
-- `delivered`
-- `failed`
-- `dead_lettered`
-
-### Delivery Attempt Status
-- `pending`
-- `in_progress`
-- `sent`
-- `delivered`
-- `failed`
-- `retry_scheduled`
-- `dead_lettered`
-
-## API Summary
-
-### Tenants
-- `POST /v1/tenants`
-- `GET /v1/tenants/{tenantId}`
-
-### Templates
-- `POST /v1/templates`
-- `GET /v1/templates/{templateId}`
-- `PUT /v1/templates/{templateId}`
-
-### Notifications
-- `POST /v1/notifications`
-- `GET /v1/notifications/{notificationId}`
-- `POST /v1/notifications/{notificationId}/replay`
-
-### Operations
-- `GET /v1/tenants/{tenantId}/usage`
-- `GET /v1/dead-letters`
 - `GET /v1/health`
 - `GET /v1/readiness`
+- `POST /v1/tenants`
+- `POST /v1/templates`
+- `POST /v1/notifications`
+- PostgreSQL persistence using the schema in `migrations/001_init.sql`
+- request logging and panic recovery middleware
+- idempotent notification submission when `idempotency_key` is provided
 
-## Example Notification Request
+Not implemented yet:
 
-```json
-{
-  "tenant_id": "acme",
-  "template_id": "password-reset",
-  "channels": ["email", "webhook"],
-  "recipient": {
-    "email": "user@example.com"
-  },
-  "variables": {
-    "first_name": "Sam",
-    "reset_url": "https://example.com/reset/abc"
-  },
-  "idempotency_key": "c8eb3b4c-0a4b-4f0d-a7d5-4a4d3baf4e98"
-}
-```
+- async dispatch
+- workers
+- retries
+- DLQ handling
+- auth hardening
+- replay flow
+- usage endpoints
+- dead-letter inspection endpoints
+- delivery attempt processing
 
-## Go MVP
+## Current Endpoints
 
-The current implementation is a Go HTTP service that provides the documented API surface with:
+- `GET /v1/health`
+- `GET /v1/readiness`
+- `POST /v1/tenants`
+- `POST /v1/templates`
+- `POST /v1/notifications`
 
-- in-memory tenant, template, and notification storage
-- idempotent notification submission
-- per-tenant daily quota enforcement
-- replay support that creates new delivery attempts
-- health, readiness, usage, and dead-letter endpoints
+### `POST /v1/tenants`
 
-### Run Locally
+Creates a tenant record.
+
+Required fields:
+
+- `id`
+- `name`
+- `daily_quota`
+
+### `POST /v1/templates`
+
+Creates a template for an existing tenant.
+
+Required fields:
+
+- `id`
+- `tenant_id`
+- `name`
+- `channel`
+- `version`
+- `body`
+
+Supported channels:
+
+- `email`
+- `webhook`
+
+### `POST /v1/notifications`
+
+Creates a notification submission for an existing tenant and template.
+
+Required fields:
+
+- `id`
+- `tenant_id`
+- `template_id`
+
+Optional fields:
+
+- `idempotency_key`
+- `recipient_email`
+- `recipient_webhook_url`
+- `variables`
+
+The required recipient field depends on the template channel:
+
+- email templates require `recipient_email`
+- webhook templates require `recipient_webhook_url`
+
+## Local Development
+
+Start local infrastructure:
 
 ```bash
-go run ./cmd/api
+make dev-up
 ```
 
-The server listens on `:8080` by default. Set `ADDR` to override the bind address.
-
-Browse the REST API documentation at `http://localhost:8080/swagger`.
-The OpenAPI document is available at `http://localhost:8080/openapi.json`.
-
-### Run Tests
+Apply the database migration:
 
 ```bash
-go test ./...
+make migrate-up
 ```
 
-Benchmark the submission path with:
+Run the API service:
 
 ```bash
-go test -run '^$' -bench . ./internal/notify
+make run-api
 ```
 
-The PostgreSQL schema for the documented persistence model lives at `db/schema.sql`.
+Default local configuration:
+
+- HTTP port: `8080`
+- PostgreSQL: `postgres://notification:notification@localhost:5432/notification_platform?sslmode=disable`
+- OTLP endpoint: `localhost:4317`
+
+Useful local endpoints:
+
+- API health: `http://localhost:8080/v1/health`
+- API readiness: `http://localhost:8080/v1/readiness`
+- Prometheus: `http://localhost:9090`
+- Grafana: `http://localhost:3000`
+- Jaeger: `http://localhost:16686`
+
+Run checks:
+
+```bash
+make fmt
+make lint
+make test
+```
+
+### Example: Create Tenant
+
+```bash
+curl -X POST http://localhost:8080/v1/tenants \
+  -H "Content-Type: application/json" \
+  -d '{
+    "id": "acme",
+    "name": "Acme Corp",
+    "daily_quota": 1000
+  }'
+```
+
+### Example: Create Template
+
+```bash
+curl -X POST http://localhost:8080/v1/templates \
+  -H "Content-Type: application/json" \
+  -d '{
+    "id": "tpl_password_reset_email_v1",
+    "tenant_id": "acme",
+    "name": "password-reset",
+    "channel": "email",
+    "version": 1,
+    "body": "Hello {{.first_name}}, reset here: {{.reset_url}}"
+  }'
+```
+
+### Example: Submit Notification
+
+```bash
+curl -X POST http://localhost:8080/v1/notifications \
+  -H "Content-Type: application/json" \
+  -d '{
+    "id": "notif_001",
+    "tenant_id": "acme",
+    "template_id": "tpl_password_reset_email_v1",
+    "idempotency_key": "idem-123",
+    "recipient_email": "user@example.com",
+    "variables": {
+      "first_name": "Sam",
+      "reset_url": "https://example.com/reset/abc"
+    }
+  }'
+```
+
+## Database Migration
+
+The active schema is in:
+
+- `migrations/001_init.sql`
+
+Reset and reapply locally:
+
+```bash
+make migrate-reset
+```
+
+The current service uses the existing `tenants`, `templates`, and `notifications` tables, while the rest of the schema is reserved for later milestones.
+
+## Current Limitations
+
+This service currently accepts notification requests and stores them, but it does not deliver them yet.
+
+There is no:
+
+- background dispatch
+- channel worker execution
+- retry handling
+- dead-letter processing
+- tenant authentication or authorization
+- replay API
+- usage reporting
+
+## Next Planned Work
+
+The next milestone should focus on turning stored notifications into delivered work:
+
+1. add delivery attempt creation
+2. introduce dispatcher and worker binaries
+3. connect synchronous submissions to asynchronous processing
+4. add retry and DLQ handling
+5. harden auth and tenant-scoped access control

@@ -64,6 +64,7 @@ func main() {
 	router := httpserver.NewRouter(httpserver.RouterDeps{
 		AppName: cfg.AppName,
 		DBPing:  postgres.Ping,
+		Store:   postgres,
 	})
 
 	server := &http.Server{

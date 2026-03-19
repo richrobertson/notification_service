@@ -8,11 +8,13 @@ import (
 	"time"
 
 	handlers "github.com/richrobertson/notification-platform/internal/http/handlers"
+	"github.com/richrobertson/notification-platform/internal/store"
 )
 
 type RouterDeps struct {
 	AppName string
 	DBPing  func(context.Context) error
+	Store   *store.Postgres
 }
 
 type statusRecorder struct {
@@ -22,8 +24,12 @@ type statusRecorder struct {
 
 func NewRouter(deps RouterDeps) http.Handler {
 	mux := http.NewServeMux()
+	api := handlers.NewAPI(deps.Store)
 	mux.Handle("GET /v1/health", handlers.Health())
 	mux.Handle("GET /v1/readiness", handlers.Readiness(deps.DBPing))
+	mux.Handle("POST /v1/tenants", api.CreateTenant())
+	mux.Handle("POST /v1/templates", api.CreateTemplate())
+	mux.Handle("POST /v1/notifications", api.CreateNotification())
 
 	var handler http.Handler = mux
 	handler = recoveryMiddleware(handler)

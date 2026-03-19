@@ -1,0 +1,258 @@
+package handlers
+
+import (
+	"errors"
+	"fmt"
+	"net/http"
+	"strings"
+
+	"github.com/richrobertson/notification-platform/internal/store"
+)
+
+type API struct {
+	store *store.Postgres
+}
+
+type createTenantRequest struct {
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	DailyQuota int    `json:"daily_quota"`
+}
+
+type createTemplateRequest struct {
+	ID       string `json:"id"`
+	TenantID string `json:"tenant_id"`
+	Name     string `json:"name"`
+	Channel  string `json:"channel"`
+	Version  int    `json:"version"`
+	Body     string `json:"body"`
+}
+
+type createNotificationRequest struct {
+	ID                  string         `json:"id"`
+	TenantID            string         `json:"tenant_id"`
+	TemplateID          string         `json:"template_id"`
+	IdempotencyKey      string         `json:"idempotency_key"`
+	RecipientEmail      string         `json:"recipient_email"`
+	RecipientWebhookURL string         `json:"recipient_webhook_url"`
+	Variables           map[string]any `json:"variables"`
+}
+
+func NewAPI(store *store.Postgres) *API {
+	return &API{store: store}
+}
+
+func (a *API) CreateTenant() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req createTenantRequest
+		if err := decodeJSON(r, &req); err != nil {
+			writeError(w, http.StatusBadRequest, "bad_request", fmt.Sprintf("invalid request body: %v", err))
+			return
+		}
+
+		if strings.TrimSpace(req.ID) == "" {
+			writeError(w, http.StatusBadRequest, "bad_request", "id is required")
+			return
+		}
+		if strings.TrimSpace(req.Name) == "" {
+			writeError(w, http.StatusBadRequest, "bad_request", "name is required")
+			return
+		}
+		if req.DailyQuota <= 0 {
+			writeError(w, http.StatusBadRequest, "bad_request", "daily_quota must be greater than 0")
+			return
+		}
+
+		tenant, err := a.store.CreateTenant(r.Context(), store.CreateTenantParams{
+			ID:         req.ID,
+			Name:       req.Name,
+			DailyQuota: req.DailyQuota,
+		})
+		if err != nil {
+			if store.IsConflict(err) {
+				writeError(w, http.StatusConflict, "conflict", "tenant already exists")
+				return
+			}
+			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
+			return
+		}
+
+		writeJSON(w, http.StatusCreated, tenant)
+	}
+}
+
+func (a *API) CreateTemplate() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req createTemplateRequest
+		if err := decodeJSON(r, &req); err != nil {
+			writeError(w, http.StatusBadRequest, "bad_request", fmt.Sprintf("invalid request body: %v", err))
+			return
+		}
+
+		if strings.TrimSpace(req.ID) == "" {
+			writeError(w, http.StatusBadRequest, "bad_request", "id is required")
+			return
+		}
+		if strings.TrimSpace(req.TenantID) == "" {
+			writeError(w, http.StatusBadRequest, "bad_request", "tenant_id is required")
+			return
+		}
+		if strings.TrimSpace(req.Name) == "" {
+			writeError(w, http.StatusBadRequest, "bad_request", "name is required")
+			return
+		}
+		if req.Channel != "email" && req.Channel != "webhook" {
+			writeError(w, http.StatusBadRequest, "bad_request", "channel must be one of: email, webhook")
+			return
+		}
+		if req.Version <= 0 {
+			writeError(w, http.StatusBadRequest, "bad_request", "version must be greater than 0")
+			return
+		}
+		if strings.TrimSpace(req.Body) == "" {
+			writeError(w, http.StatusBadRequest, "bad_request", "body is required")
+			return
+		}
+
+		if _, err := a.store.GetTenantByID(r.Context(), req.TenantID); err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				writeError(w, http.StatusNotFound, "not_found", "tenant not found")
+				return
+			}
+			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
+			return
+		}
+
+		template, err := a.store.CreateTemplate(r.Context(), store.CreateTemplateParams{
+			ID:       req.ID,
+			TenantID: req.TenantID,
+			Name:     req.Name,
+			Channel:  req.Channel,
+			Version:  req.Version,
+			Body:     req.Body,
+		})
+		if err != nil {
+			if store.IsConflict(err) {
+				writeError(w, http.StatusConflict, "conflict", "template already exists")
+				return
+			}
+			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
+			return
+		}
+
+		writeJSON(w, http.StatusCreated, template)
+	}
+}
+
+func (a *API) CreateNotification() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req createNotificationRequest
+		if err := decodeJSON(r, &req); err != nil {
+			writeError(w, http.StatusBadRequest, "bad_request", fmt.Sprintf("invalid request body: %v", err))
+			return
+		}
+
+		if strings.TrimSpace(req.ID) == "" {
+			writeError(w, http.StatusBadRequest, "bad_request", "id is required")
+			return
+		}
+		if strings.TrimSpace(req.TenantID) == "" {
+			writeError(w, http.StatusBadRequest, "bad_request", "tenant_id is required")
+			return
+		}
+		if strings.TrimSpace(req.TemplateID) == "" {
+			writeError(w, http.StatusBadRequest, "bad_request", "template_id is required")
+			return
+		}
+
+		if req.IdempotencyKey != "" {
+			existing, err := a.store.GetNotificationByTenantAndIdempotencyKey(r.Context(), req.TenantID, req.IdempotencyKey)
+			if err == nil {
+				writeJSON(w, http.StatusOK, existing)
+				return
+			}
+			if !errors.Is(err, store.ErrNotFound) {
+				writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
+				return
+			}
+		}
+
+		if _, err := a.store.GetTenantByID(r.Context(), req.TenantID); err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				writeError(w, http.StatusNotFound, "not_found", "tenant not found")
+				return
+			}
+			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
+			return
+		}
+
+		template, err := a.store.GetTemplateByID(r.Context(), req.TemplateID)
+		if err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				writeError(w, http.StatusNotFound, "not_found", "template not found")
+				return
+			}
+			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
+			return
+		}
+
+		if template.TenantID != req.TenantID {
+			writeError(w, http.StatusBadRequest, "bad_request", "template does not belong to tenant")
+			return
+		}
+
+		recipientEmail := strings.TrimSpace(req.RecipientEmail)
+		recipientWebhookURL := strings.TrimSpace(req.RecipientWebhookURL)
+
+		switch template.Channel {
+		case "email":
+			if recipientEmail == "" {
+				writeError(w, http.StatusBadRequest, "bad_request", "recipient_email is required for email templates")
+				return
+			}
+		case "webhook":
+			if recipientWebhookURL == "" {
+				writeError(w, http.StatusBadRequest, "bad_request", "recipient_webhook_url is required for webhook templates")
+				return
+			}
+		default:
+			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
+			return
+		}
+
+		params := store.CreateNotificationParams{
+			ID:         req.ID,
+			TenantID:   req.TenantID,
+			TemplateID: req.TemplateID,
+			Variables:  req.Variables,
+		}
+		if req.IdempotencyKey != "" {
+			params.IdempotencyKey = &req.IdempotencyKey
+		}
+		if recipientEmail != "" {
+			params.RecipientEmail = &recipientEmail
+		}
+		if recipientWebhookURL != "" {
+			params.RecipientWebhookURL = &recipientWebhookURL
+		}
+
+		notification, err := a.store.CreateNotification(r.Context(), params)
+		if err != nil {
+			if req.IdempotencyKey != "" && store.IsConflict(err) {
+				existing, lookupErr := a.store.GetNotificationByTenantAndIdempotencyKey(r.Context(), req.TenantID, req.IdempotencyKey)
+				if lookupErr == nil {
+					writeJSON(w, http.StatusOK, existing)
+					return
+				}
+			}
+			if store.IsConflict(err) {
+				writeError(w, http.StatusConflict, "conflict", "notification already exists")
+				return
+			}
+			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
+			return
+		}
+
+		writeJSON(w, http.StatusAccepted, notification)
+	}
+}
