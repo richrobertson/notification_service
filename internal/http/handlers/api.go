@@ -1,16 +1,22 @@
 package handlers
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
+	"github.com/richrobertson/notification-platform/internal/queue"
 	"github.com/richrobertson/notification-platform/internal/store"
 )
 
 type API struct {
 	store *store.Postgres
+	queue *queue.RedisQueue
 }
 
 type createTenantRequest struct {
@@ -38,8 +44,8 @@ type createNotificationRequest struct {
 	Variables           map[string]any `json:"variables"`
 }
 
-func NewAPI(store *store.Postgres) *API {
-	return &API{store: store}
+func NewAPI(store *store.Postgres, redisQueue *queue.RedisQueue) *API {
+	return &API{store: store, queue: redisQueue}
 }
 
 func (a *API) CreateTenant() http.HandlerFunc {
@@ -49,7 +55,6 @@ func (a *API) CreateTenant() http.HandlerFunc {
 			writeError(w, http.StatusBadRequest, "bad_request", fmt.Sprintf("invalid request body: %v", err))
 			return
 		}
-
 		if strings.TrimSpace(req.ID) == "" {
 			writeError(w, http.StatusBadRequest, "bad_request", "id is required")
 			return
@@ -62,12 +67,7 @@ func (a *API) CreateTenant() http.HandlerFunc {
 			writeError(w, http.StatusBadRequest, "bad_request", "daily_quota must be greater than 0")
 			return
 		}
-
-		tenant, err := a.store.CreateTenant(r.Context(), store.CreateTenantParams{
-			ID:         req.ID,
-			Name:       req.Name,
-			DailyQuota: req.DailyQuota,
-		})
+		tenant, err := a.store.CreateTenant(r.Context(), store.CreateTenantParams{ID: req.ID, Name: req.Name, DailyQuota: req.DailyQuota})
 		if err != nil {
 			if store.IsConflict(err) {
 				writeError(w, http.StatusConflict, "conflict", "tenant already exists")
@@ -76,7 +76,6 @@ func (a *API) CreateTenant() http.HandlerFunc {
 			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
 			return
 		}
-
 		writeJSON(w, http.StatusCreated, tenant)
 	}
 }
@@ -88,7 +87,6 @@ func (a *API) CreateTemplate() http.HandlerFunc {
 			writeError(w, http.StatusBadRequest, "bad_request", fmt.Sprintf("invalid request body: %v", err))
 			return
 		}
-
 		if strings.TrimSpace(req.ID) == "" {
 			writeError(w, http.StatusBadRequest, "bad_request", "id is required")
 			return
@@ -113,7 +111,6 @@ func (a *API) CreateTemplate() http.HandlerFunc {
 			writeError(w, http.StatusBadRequest, "bad_request", "body is required")
 			return
 		}
-
 		if _, err := a.store.GetTenantByID(r.Context(), req.TenantID); err != nil {
 			if errors.Is(err, store.ErrNotFound) {
 				writeError(w, http.StatusNotFound, "not_found", "tenant not found")
@@ -122,15 +119,7 @@ func (a *API) CreateTemplate() http.HandlerFunc {
 			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
 			return
 		}
-
-		template, err := a.store.CreateTemplate(r.Context(), store.CreateTemplateParams{
-			ID:       req.ID,
-			TenantID: req.TenantID,
-			Name:     req.Name,
-			Channel:  req.Channel,
-			Version:  req.Version,
-			Body:     req.Body,
-		})
+		template, err := a.store.CreateTemplate(r.Context(), store.CreateTemplateParams{ID: req.ID, TenantID: req.TenantID, Name: req.Name, Channel: req.Channel, Version: req.Version, Body: req.Body})
 		if err != nil {
 			if store.IsConflict(err) {
 				writeError(w, http.StatusConflict, "conflict", "template already exists")
@@ -139,7 +128,6 @@ func (a *API) CreateTemplate() http.HandlerFunc {
 			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
 			return
 		}
-
 		writeJSON(w, http.StatusCreated, template)
 	}
 }
@@ -151,7 +139,6 @@ func (a *API) CreateNotification() http.HandlerFunc {
 			writeError(w, http.StatusBadRequest, "bad_request", fmt.Sprintf("invalid request body: %v", err))
 			return
 		}
-
 		if strings.TrimSpace(req.ID) == "" {
 			writeError(w, http.StatusBadRequest, "bad_request", "id is required")
 			return
@@ -164,7 +151,6 @@ func (a *API) CreateNotification() http.HandlerFunc {
 			writeError(w, http.StatusBadRequest, "bad_request", "template_id is required")
 			return
 		}
-
 		if req.IdempotencyKey != "" {
 			existing, err := a.store.GetNotificationByTenantAndIdempotencyKey(r.Context(), req.TenantID, req.IdempotencyKey)
 			if err == nil {
@@ -176,7 +162,6 @@ func (a *API) CreateNotification() http.HandlerFunc {
 				return
 			}
 		}
-
 		if _, err := a.store.GetTenantByID(r.Context(), req.TenantID); err != nil {
 			if errors.Is(err, store.ErrNotFound) {
 				writeError(w, http.StatusNotFound, "not_found", "tenant not found")
@@ -185,7 +170,6 @@ func (a *API) CreateNotification() http.HandlerFunc {
 			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
 			return
 		}
-
 		template, err := a.store.GetTemplateByID(r.Context(), req.TemplateID)
 		if err != nil {
 			if errors.Is(err, store.ErrNotFound) {
@@ -195,15 +179,12 @@ func (a *API) CreateNotification() http.HandlerFunc {
 			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
 			return
 		}
-
 		if template.TenantID != req.TenantID {
 			writeError(w, http.StatusBadRequest, "bad_request", "template does not belong to tenant")
 			return
 		}
-
 		recipientEmail := strings.TrimSpace(req.RecipientEmail)
 		recipientWebhookURL := strings.TrimSpace(req.RecipientWebhookURL)
-
 		switch template.Channel {
 		case "email":
 			if recipientEmail == "" {
@@ -219,13 +200,7 @@ func (a *API) CreateNotification() http.HandlerFunc {
 			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
 			return
 		}
-
-		params := store.CreateNotificationParams{
-			ID:         req.ID,
-			TenantID:   req.TenantID,
-			TemplateID: req.TemplateID,
-			Variables:  req.Variables,
-		}
+		params := store.CreateNotificationParams{ID: req.ID, TenantID: req.TenantID, TemplateID: req.TemplateID, Variables: req.Variables}
 		if req.IdempotencyKey != "" {
 			params.IdempotencyKey = &req.IdempotencyKey
 		}
@@ -235,7 +210,6 @@ func (a *API) CreateNotification() http.HandlerFunc {
 		if recipientWebhookURL != "" {
 			params.RecipientWebhookURL = &recipientWebhookURL
 		}
-
 		notification, err := a.store.CreateNotification(r.Context(), params)
 		if err != nil {
 			if req.IdempotencyKey != "" && store.IsConflict(err) {
@@ -253,6 +227,29 @@ func (a *API) CreateNotification() http.HandlerFunc {
 			return
 		}
 
+		attemptID := generateID("attempt")
+		attempt, err := a.store.CreateDeliveryAttempt(r.Context(), store.CreateDeliveryAttemptParams{ID: attemptID, NotificationID: notification.ID, Channel: template.Channel, AttemptNumber: 1, Status: "pending"})
+		if err != nil {
+			slog.Default().Error("failed to create delivery attempt", slog.Any("error", err), slog.String("notification_id", notification.ID), slog.String("attempt_id", attemptID), slog.String("channel", template.Channel))
+			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
+			return
+		}
+
+		job := queue.DispatchJob{JobID: generateID("job"), NotificationID: notification.ID, AttemptID: attempt.ID, TenantID: notification.TenantID, Channel: template.Channel, CreatedAt: time.Now().UTC()}
+		if err := a.queue.EnqueueDispatch(r.Context(), job); err != nil {
+			slog.Default().Error("failed to enqueue dispatch job", slog.Any("error", err), slog.String("notification_id", notification.ID), slog.String("attempt_id", attempt.ID), slog.String("job_id", job.JobID), slog.String("channel", job.Channel))
+			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
+			return
+		}
+
 		writeJSON(w, http.StatusAccepted, notification)
 	}
+}
+
+func generateID(prefix string) string {
+	buf := make([]byte, 8)
+	if _, err := rand.Read(buf); err != nil {
+		return fmt.Sprintf("%s_%d", prefix, time.Now().UTC().UnixNano())
+	}
+	return fmt.Sprintf("%s_%s", prefix, hex.EncodeToString(buf))
 }

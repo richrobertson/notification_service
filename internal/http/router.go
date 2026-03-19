@@ -8,6 +8,7 @@ import (
 	"time"
 
 	handlers "github.com/richrobertson/notification-platform/internal/http/handlers"
+	"github.com/richrobertson/notification-platform/internal/queue"
 	"github.com/richrobertson/notification-platform/internal/store"
 )
 
@@ -15,6 +16,7 @@ type RouterDeps struct {
 	AppName string
 	DBPing  func(context.Context) error
 	Store   *store.Postgres
+	Queue   *queue.RedisQueue
 }
 
 type statusRecorder struct {
@@ -24,7 +26,7 @@ type statusRecorder struct {
 
 func NewRouter(deps RouterDeps) http.Handler {
 	mux := http.NewServeMux()
-	api := handlers.NewAPI(deps.Store)
+	api := handlers.NewAPI(deps.Store, deps.Queue)
 	mux.Handle("GET /v1/health", handlers.Health())
 	mux.Handle("GET /v1/readiness", handlers.Readiness(deps.DBPing))
 	mux.Handle("POST /v1/tenants", api.CreateTenant())
@@ -48,19 +50,9 @@ func loggingMiddleware(next http.Handler) http.Handler {
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		recorder := &statusRecorder{
-			ResponseWriter: w,
-			statusCode:     http.StatusOK,
-		}
-
+		recorder := &statusRecorder{ResponseWriter: w, statusCode: http.StatusOK}
 		next.ServeHTTP(recorder, r)
-
-		logger.Info("http request",
-			slog.String("method", r.Method),
-			slog.String("path", r.URL.Path),
-			slog.Int("status_code", recorder.statusCode),
-			slog.Duration("duration", time.Since(start)),
-		)
+		logger.Info("http request", slog.String("method", r.Method), slog.String("path", r.URL.Path), slog.Int("status_code", recorder.statusCode), slog.Duration("duration", time.Since(start)))
 	})
 }
 
@@ -70,15 +62,10 @@ func recoveryMiddleware(next http.Handler) http.Handler {
 			if recover() == nil {
 				return
 			}
-
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusInternalServerError)
-			_ = json.NewEncoder(w).Encode(map[string]string{
-				"code":    "internal_error",
-				"message": "internal server error",
-			})
+			_ = json.NewEncoder(w).Encode(map[string]string{"code": "internal_error", "message": "internal server error"})
 		}()
-
 		next.ServeHTTP(w, r)
 	})
 }

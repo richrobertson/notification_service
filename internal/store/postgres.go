@@ -51,6 +51,20 @@ type Notification struct {
 	UpdatedAt           time.Time      `json:"updated_at"`
 }
 
+type DeliveryAttempt struct {
+	ID             string     `json:"id"`
+	NotificationID string     `json:"notification_id"`
+	Channel        string     `json:"channel"`
+	AttemptNumber  int        `json:"attempt_number"`
+	Status         string     `json:"status"`
+	ErrorCode      *string    `json:"error_code"`
+	ErrorMessage   *string    `json:"error_message"`
+	NextRetryAt    *time.Time `json:"next_retry_at"`
+	StartedAt      *time.Time `json:"started_at"`
+	CompletedAt    *time.Time `json:"completed_at"`
+	CreatedAt      time.Time  `json:"created_at"`
+}
+
 type CreateTenantParams struct {
 	ID         string
 	Name       string
@@ -74,6 +88,14 @@ type CreateNotificationParams struct {
 	RecipientEmail      *string
 	RecipientWebhookURL *string
 	Variables           map[string]any
+}
+
+type CreateDeliveryAttemptParams struct {
+	ID             string
+	NotificationID string
+	Channel        string
+	AttemptNumber  int
+	Status         string
 }
 
 func NewPostgres(ctx context.Context, databaseURL string) (*Postgres, error) {
@@ -383,4 +405,57 @@ func unmarshalVariables(raw []byte) (map[string]any, error) {
 	}
 
 	return variables, nil
+}
+
+func (p *Postgres) CreateDeliveryAttempt(ctx context.Context, params CreateDeliveryAttemptParams) (DeliveryAttempt, error) {
+	const query = `
+		INSERT INTO delivery_attempts (
+			id,
+			notification_id,
+			channel,
+			attempt_number,
+			status
+		)
+		VALUES ($1, $2, $3, $4, $5)
+		RETURNING
+			id,
+			notification_id,
+			channel,
+			attempt_number,
+			status,
+			error_code,
+			error_message,
+			next_retry_at,
+			started_at,
+			completed_at,
+			created_at
+	`
+
+	var attempt DeliveryAttempt
+	err := p.DB.QueryRowContext(
+		ctx,
+		query,
+		params.ID,
+		params.NotificationID,
+		params.Channel,
+		params.AttemptNumber,
+		params.Status,
+	).Scan(
+		&attempt.ID,
+		&attempt.NotificationID,
+		&attempt.Channel,
+		&attempt.AttemptNumber,
+		&attempt.Status,
+		&attempt.ErrorCode,
+		&attempt.ErrorMessage,
+		&attempt.NextRetryAt,
+		&attempt.StartedAt,
+		&attempt.CompletedAt,
+		&attempt.CreatedAt,
+	)
+	if err != nil {
+		return DeliveryAttempt{}, wrapStoreError("create delivery attempt", err)
+	}
+
+	return attempt, nil
 }
