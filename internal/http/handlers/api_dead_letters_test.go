@@ -112,6 +112,13 @@ func (f *fakeAPIStore) EnsureInitialAttempt(_ context.Context, notificationID, c
 		params := store.CreateDeliveryAttemptParams{ID: attemptID, NotificationID: notificationID, Channel: channel, AttemptNumber: 1, Status: "pending", EnqueueKind: "initial"}
 		f.createAttemptCalls++
 		f.createdAttempt = &params
+		f.notification.ID = notificationID
+		f.notification.Status = "processing"
+		f.recalculateCalls++
+		f.recalculatedIDs = append(f.recalculatedIDs, notificationID)
+		if f.recalculateErr != nil {
+			return store.DeliveryAttempt{}, f.recalculateErr
+		}
 	}
 	f.initialAttemptMissing = false
 	return f.GetInitialAttemptByNotificationID(context.Background(), notificationID)
@@ -149,6 +156,13 @@ func (f *fakeAPIStore) EnsureReplayAttempt(_ context.Context, id, newAttemptID s
 	attempt.ID = newAttemptID
 	dl.ReplayAttemptID = &attempt.ID
 	f.deadLetters[id] = dl
+	f.notification.ID = dl.NotificationID
+	f.notification.Status = "processing"
+	f.recalculateCalls++
+	f.recalculatedIDs = append(f.recalculatedIDs, dl.NotificationID)
+	if f.recalculateErr != nil {
+		return store.ReplayDeadLetterResult{}, f.recalculateErr
+	}
 	return store.ReplayDeadLetterResult{DeadLetter: dl, Attempt: attempt}, nil
 }
 func (f *fakeAPIStore) FinalizeReplayEnqueue(_ context.Context, id, attemptID string) error {
@@ -208,6 +222,35 @@ func (f *fakeDispatchQueue) EnqueueDispatch(_ context.Context, job queue.Dispatc
 	}
 	f.jobs = append(f.jobs, job)
 	return nil
+}
+
+func assertNotificationInspectionStatus(t *testing.T, api *API, notificationID, wantStatus string) {
+	t.Helper()
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/notifications/"+notificationID, nil)
+	req.SetPathValue("id", notificationID)
+	res := httptest.NewRecorder()
+	api.GetNotification().ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("get status=%d body=%s", res.Code, res.Body.String())
+	}
+	var payload struct {
+		Notification store.Notification `json:"notification"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Notification.Status != wantStatus {
+		t.Fatalf("notification status=%q", payload.Notification.Status)
+	}
+}
+
+func assertStatusRefresh(t *testing.T, st *fakeAPIStore, wantID string) {
+	t.Helper()
+
+	if st.recalculateCalls != 1 || len(st.recalculatedIDs) != 1 || st.recalculatedIDs[0] != wantID {
+		t.Fatalf("recalculateCalls=%d recalculatedIDs=%v", st.recalculateCalls, st.recalculatedIDs)
+	}
 }
 
 func newDeadLetterTestAPI() (*fakeAPIStore, *fakeDispatchQueue, *API) {
@@ -294,6 +337,37 @@ func TestReplayDeadLetterEnqueueFailureLeavesRecoverableAttempt(t *testing.T) {
 	}
 }
 
+func TestCreateNotificationUpdatesInspectionStatusWhenAttemptIsPending(t *testing.T) {
+	_, q, api := newDeadLetterTestAPI()
+	q.err = errors.New("redis down")
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/notifications", bytes.NewReader([]byte(`{"id":"notif-1","tenant_id":"tenant-1","template_id":"tpl-1","recipient_email":"user@example.test","variables":{}}`)))
+	req.Header.Set("Content-Type", "application/json")
+	res := httptest.NewRecorder()
+	api.CreateNotification().ServeHTTP(res, req)
+	if res.Code != http.StatusAccepted {
+		t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
+	}
+
+	assertNotificationInspectionStatus(t, api, "notif-1", "processing")
+}
+
+func TestReplayDeadLetterUpdatesInspectionStatusWhenReplayAttemptIsPending(t *testing.T) {
+	st, q, api := newDeadLetterTestAPI()
+	q.err = errors.New("redis down")
+	st.notification.Status = "dead_lettered"
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/dead-letters/dead-1/replay", bytes.NewReader(nil))
+	req.SetPathValue("id", "dead-1")
+	res := httptest.NewRecorder()
+	api.ReplayDeadLetter().ServeHTTP(res, req)
+	if res.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
+	}
+
+	assertNotificationInspectionStatus(t, api, "notif-1", "processing")
+}
+
 func TestReplayDeadLetterReturns500WhenStatusRefreshFails(t *testing.T) {
 	st, _, api := newDeadLetterTestAPI()
 	st.recalculateErr = errors.New("refresh failed")
@@ -327,6 +401,7 @@ func TestCreateNotificationMarksInitialAttemptEnqueued(t *testing.T) {
 	if st.markEnqueuedCalls != 1 {
 		t.Fatalf("markEnqueuedCalls=%d", st.markEnqueuedCalls)
 	}
+	assertStatusRefresh(t, st, "notif-1")
 	if st.recalculateCalls != 1 || len(st.recalculatedIDs) != 1 || st.recalculatedIDs[0] != "notif-1" {
 		t.Fatalf("recalculateCalls=%d recalculatedIDs=%v", st.recalculateCalls, st.recalculatedIDs)
 	}
@@ -387,6 +462,7 @@ func TestIdempotentRetryRecoversPendingInitialAttempt(t *testing.T) {
 	if st.markEnqueuedCalls != 1 {
 		t.Fatalf("markEnqueuedCalls=%d", st.markEnqueuedCalls)
 	}
+	assertStatusRefresh(t, st, "notif-1")
 	if len(q.jobs) != 1 {
 		t.Fatalf("jobs=%d", len(q.jobs))
 	}
@@ -461,6 +537,7 @@ func TestIdempotentConflictRecoversPendingInitialAttempt(t *testing.T) {
 	if st.markEnqueuedCalls != 1 {
 		t.Fatalf("markEnqueuedCalls=%d", st.markEnqueuedCalls)
 	}
+	assertStatusRefresh(t, st, "notif-1")
 	if len(q.jobs) != 1 {
 		t.Fatalf("jobs=%d", len(q.jobs))
 	}
