@@ -203,7 +203,7 @@ func (s *Service) process(ctx context.Context, job queue.DispatchJob, sender fun
 	if IsRetryable(err) {
 		return s.handleRetryable(ctx, notification, attempt, job.Channel, err)
 	}
-	return s.failTerminal(ctx, attempt.ID, job.Channel, err)
+	return s.failTerminal(ctx, notification.TenantID, attempt.ID, job.Channel, err)
 }
 
 func (s *Service) handleRetryable(ctx context.Context, notification store.Notification, attempt store.DeliveryAttempt, channel string, cause error) (Result, error) {
@@ -228,13 +228,13 @@ func (s *Service) handleRetryable(ctx context.Context, notification store.Notifi
 	return Result{Outcome: OutcomeRetryScheduled, NextRetryAt: &nextRetryAt}, cause
 }
 
-func (s *Service) failTerminal(ctx context.Context, attemptID, channel string, cause error) (Result, error) {
+func (s *Service) failTerminal(ctx context.Context, tenantID, attemptID, channel string, cause error) (Result, error) {
 	if err := s.store.MarkAttemptFailed(ctx, attemptID, cause.Error()); err != nil {
 		return Result{}, err
 	}
 	attempt, attemptErr := s.store.GetDeliveryAttemptByID(ctx, attemptID)
 	if attemptErr == nil {
-		_ = s.store.RecordAuditEvent(ctx, s.policy.IDGenerator(), "", "worker", "attempt_failed", "delivery_attempt", attemptID, map[string]any{"notification_id": attempt.NotificationID, "channel": channel, "error": cause.Error()})
+		_ = s.store.RecordAuditEvent(ctx, s.policy.IDGenerator(), tenantID, "worker", "attempt_failed", "delivery_attempt", attemptID, map[string]any{"notification_id": attempt.NotificationID, "channel": channel, "error": cause.Error()})
 	}
 	s.failCounter.Add(ctx, 1, metric.WithAttributes(attribute.String("channel", channel), attribute.String("final_state", "failed")))
 	return Result{Outcome: OutcomeFailedTerminal}, cause

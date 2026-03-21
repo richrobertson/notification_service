@@ -564,8 +564,16 @@ func (p *Postgres) EnsureInitialAttempt(ctx context.Context, notificationID, cha
 		if err := p.RecalculateNotificationStatus(ctx, notificationID); err != nil {
 			return DeliveryAttempt{}, err
 		}
+	_, err := p.DB.ExecContext(ctx, insertQuery, attemptID, notificationID, channel)
+	if err != nil {
+		return DeliveryAttempt{}, wrapStoreError("ensure initial attempt", err)
+	}
+	if err := p.RecalculateNotificationStatus(ctx, notificationID); err != nil {
+		return DeliveryAttempt{}, err
 	}
 	const selectQuery = `
+		SELECT id, notification_id, channel, attempt_number, status, error_code, error_message, provider_message_id, last_error, next_retry_at, started_at, completed_at, sent_at, failed_at, dispatch_enqueued_at, enqueue_kind, created_at, updated_at
+		FROM delivery_attempts
 		SELECT id, notification_id, channel, attempt_number, status, error_code, error_message, provider_message_id, last_error, next_retry_at, started_at, completed_at, sent_at, failed_at, dispatch_enqueued_at, enqueue_kind, created_at, updated_at
 		FROM delivery_attempts
 		WHERE notification_id = $1 AND channel = $2 AND attempt_number = 1
@@ -740,6 +748,13 @@ func (p *Postgres) ListDeliveryAttemptsByNotificationID(ctx context.Context, not
 		return nil, fmt.Errorf("list delivery attempts: %w", err)
 	}
 	return attempts, nil
+}
+
+func (p *Postgres) recalculateNotificationStatusAfterInsert(ctx context.Context, notificationID string, inserted bool) error {
+	if !inserted {
+		return nil
+	}
+	return p.RecalculateNotificationStatus(ctx, notificationID)
 }
 
 func (p *Postgres) RecalculateNotificationStatus(ctx context.Context, notificationID string) error {
@@ -1232,6 +1247,8 @@ func (p *Postgres) EnsureReplayAttempt(ctx context.Context, deadLetterID, newAtt
 		if err := p.RecalculateNotificationStatus(ctx, dl.NotificationID); err != nil {
 			return ReplayDeadLetterResult{}, err
 		}
+	if err := p.recalculateNotificationStatusAfterInsert(ctx, dl.NotificationID, createdReplayAttempt); err != nil {
+		return ReplayDeadLetterResult{}, err
 	}
 	return ReplayDeadLetterResult{DeadLetter: dl, Attempt: attempt}, nil
 }
