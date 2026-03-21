@@ -87,6 +87,8 @@ CREATE TABLE delivery_attempts (
     completed_at TIMESTAMPTZ,
     sent_at TIMESTAMPTZ,
     failed_at TIMESTAMPTZ,
+    dispatch_enqueued_at TIMESTAMPTZ,
+    enqueue_kind TEXT NOT NULL DEFAULT 'initial',
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE (notification_id, channel, attempt_number)
@@ -99,13 +101,18 @@ CREATE INDEX delivery_attempts_retry_idx
     ON delivery_attempts (status, next_retry_at)
     WHERE status = 'retry_scheduled';
 
+CREATE INDEX delivery_attempts_dispatch_pending_idx
+    ON delivery_attempts (status, created_at)
+    WHERE dispatch_enqueued_at IS NULL AND enqueue_kind IN ('initial', 'retry', 'replay');
+
 CREATE TABLE dead_letters (
     id UUID PRIMARY KEY,
     notification_id UUID NOT NULL REFERENCES notifications(id) ON DELETE CASCADE,
     channel channel_type NOT NULL,
     final_error TEXT NOT NULL,
     dead_lettered_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    replayed_at TIMESTAMPTZ
+    replayed_at TIMESTAMPTZ,
+    replay_attempt_id TEXT
 );
 
 CREATE INDEX dead_letters_notification_idx
@@ -114,6 +121,10 @@ CREATE INDEX dead_letters_notification_idx
 CREATE INDEX dead_letters_open_idx
     ON dead_letters (dead_lettered_at DESC)
     WHERE replayed_at IS NULL;
+
+CREATE UNIQUE INDEX dead_letters_replay_attempt_id_idx
+    ON dead_letters (replay_attempt_id)
+    WHERE replay_attempt_id IS NOT NULL;
 
 CREATE TABLE audit_events (
     id UUID PRIMARY KEY,

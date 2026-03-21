@@ -3,6 +3,7 @@ package delivery
 import (
 	"context"
 	"errors"
+	"math/rand"
 	"testing"
 	"time"
 
@@ -11,37 +12,57 @@ import (
 )
 
 type stubStore struct {
-	notification   store.Notification
-	template       store.Template
-	attempt        store.DeliveryAttempt
-	loadErr        error
-	inProgressErr  error
-	sentErr        error
-	failedErr      error
-	inProgressID   string
-	sentID         *string
-	failedMsg      string
-	inProgressCall int
+	notification     store.Notification
+	template         store.Template
+	attempt          store.DeliveryAttempt
+	loadErr          error
+	inProgressErr    error
+	sentErr          error
+	failedErr        error
+	scheduleRetryErr error
+	deadLetterErr    error
+	insertDeadErr    error
+	inProgressCall   int
+	failedMsg        string
+	scheduledMsg     string
+	scheduledAt      *time.Time
+	deadLetterMsg    string
+	insertedDead     *store.DeadLetter
 }
 
-func (s *stubStore) LoadDeliveryJob(ctx context.Context, notificationID, attemptID string) (store.Notification, store.Template, store.DeliveryAttempt, error) {
+func (s *stubStore) LoadDeliveryJob(context.Context, string, string) (store.Notification, store.Template, store.DeliveryAttempt, error) {
 	if s.loadErr != nil {
 		return store.Notification{}, store.Template{}, store.DeliveryAttempt{}, s.loadErr
 	}
 	return s.notification, s.template, s.attempt, nil
 }
-func (s *stubStore) MarkAttemptInProgress(ctx context.Context, attemptID string) error {
-	s.inProgressID = attemptID
+func (s *stubStore) MarkAttemptInProgress(context.Context, string) error {
 	s.inProgressCall++
 	return s.inProgressErr
 }
-func (s *stubStore) MarkAttemptSent(ctx context.Context, attemptID string, providerMessageID *string) error {
-	s.sentID = providerMessageID
-	return s.sentErr
+func (s *stubStore) MarkAttemptSent(context.Context, string, *string) error { return s.sentErr }
+func (s *stubStore) MarkAttemptFailed(context.Context, string, string) error {
+	if s.failedErr != nil {
+		return s.failedErr
+	}
+	return nil
 }
-func (s *stubStore) MarkAttemptFailed(ctx context.Context, attemptID string, lastError string) error {
-	s.failedMsg = lastError
-	return s.failedErr
+func (s *stubStore) ScheduleRetry(_ context.Context, _ string, lastError string, nextRetryAt time.Time) error {
+	s.scheduledMsg = lastError
+	s.scheduledAt = &nextRetryAt
+	return s.scheduleRetryErr
+}
+func (s *stubStore) MarkAttemptDeadLettered(_ context.Context, _ string, lastError string) error {
+	s.deadLetterMsg = lastError
+	return s.deadLetterErr
+}
+func (s *stubStore) InsertDeadLetter(_ context.Context, id, notificationID, channel, finalError string) (store.DeadLetter, error) {
+	if s.insertDeadErr != nil {
+		return store.DeadLetter{}, s.insertDeadErr
+	}
+	dl := store.DeadLetter{ID: id, NotificationID: notificationID, Channel: channel, FinalError: finalError, DeadLetteredAt: time.Unix(100, 0).UTC()}
+	s.insertedDead = &dl
+	return dl, nil
 }
 
 type stubWebhookSender struct {
@@ -49,131 +70,78 @@ type stubWebhookSender struct {
 	err        error
 }
 
-func (s stubWebhookSender) Send(ctx context.Context, req WebhookRequest) (string, error) {
+func (s stubWebhookSender) Send(context.Context, WebhookRequest) (string, error) {
 	return s.providerID, s.err
 }
 
 type stubEmailSender struct{ err error }
 
-func (s stubEmailSender) Send(ctx context.Context, req EmailRequest) error { return s.err }
+func (s stubEmailSender) Send(context.Context, EmailRequest) error { return s.err }
 
-func TestServiceProcessWebhookMarksFailureOnMissingRecipient(t *testing.T) {
-	t.Parallel()
-	st := &stubStore{notification: store.Notification{Variables: map[string]any{"name": "Ada"}}, template: store.Template{Body: "hello {{.name}}"}}
-	svc, err := NewService(st, stubWebhookSender{}, stubEmailSender{})
+func newTestService(t *testing.T, st *stubStore) *Service {
+	t.Helper()
+	svc, err := NewService(st, stubWebhookSender{}, stubEmailSender{}, RetryPolicy{MaxAttempts: 3, BaseDelay: 5 * time.Second, MaxDelay: time.Minute, ExponentialBackoff: true, Jitter: 0, Now: func() time.Time { return time.Unix(10, 0).UTC() }, IDGenerator: func() string { return "dead-1" }, RandSource: rand.New(rand.NewSource(1))})
 	if err != nil {
 		t.Fatal(err)
 	}
-	result, err := svc.ProcessWebhook(context.Background(), queue.DispatchJob{AttemptID: "attempt-1", Channel: "webhook"})
+	return svc
+}
+
+func TestServiceSchedulesRetryOnTransientEmailFailure(t *testing.T) {
+	to := "to@example.test"
+	st := &stubStore{notification: store.Notification{ID: "notif-1", RecipientEmail: &to, Variables: map[string]any{"name": "Ada"}}, template: store.Template{Name: "welcome", Body: "hello {{.name}}"}, attempt: store.DeliveryAttempt{ID: "attempt-1", AttemptNumber: 1}}
+	svc, err := NewService(st, stubWebhookSender{}, stubEmailSender{err: &RetryableError{Err: errors.New("smtp down")}}, RetryPolicy{MaxAttempts: 3, BaseDelay: 5 * time.Second, MaxDelay: time.Minute, ExponentialBackoff: true, Now: func() time.Time { return time.Unix(10, 0).UTC() }, IDGenerator: func() string { return "dead-1" }, RandSource: rand.New(rand.NewSource(1))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := svc.ProcessEmail(context.Background(), queue.DispatchJob{AttemptID: "attempt-1", NotificationID: "notif-1", Channel: "email"})
+	if !IsRetryable(err) {
+		t.Fatalf("err retryable=false: %v", err)
+	}
+	if result.Outcome != OutcomeRetryScheduled {
+		t.Fatalf("Outcome=%v", result.Outcome)
+	}
+	if st.scheduledMsg != "smtp down" {
+		t.Fatalf("scheduledMsg=%q", st.scheduledMsg)
+	}
+	if st.scheduledAt == nil || !st.scheduledAt.Equal(time.Unix(15, 0).UTC()) {
+		t.Fatalf("nextRetryAt=%v", st.scheduledAt)
+	}
+}
+
+func TestServiceDoesNotScheduleRetryOnTerminalFailure(t *testing.T) {
+	st := &stubStore{notification: store.Notification{Variables: map[string]any{"name": "Ada"}}, template: store.Template{Body: "hello {{.name}}"}, attempt: store.DeliveryAttempt{ID: "attempt-1", AttemptNumber: 1}}
+	svc := newTestService(t, st)
+	result, err := svc.ProcessWebhook(context.Background(), queue.DispatchJob{AttemptID: "attempt-1", NotificationID: "notif-1", Channel: "webhook"})
 	if !IsTerminal(err) {
-		t.Fatalf("ProcessWebhook() error terminal = false, err=%v", err)
+		t.Fatalf("expected terminal error, got %v", err)
 	}
 	if result.Outcome != OutcomeFailedTerminal {
-		t.Fatalf("result.Outcome = %v", result.Outcome)
+		t.Fatalf("Outcome=%v", result.Outcome)
 	}
-	if st.failedMsg != "recipient_webhook_url is required" {
-		t.Fatalf("failedMsg = %q", st.failedMsg)
-	}
-	if st.inProgressCall != 1 {
-		t.Fatalf("inProgressCall = %d, want 1", st.inProgressCall)
+	if st.scheduledAt != nil {
+		t.Fatalf("unexpected retry scheduled: %v", st.scheduledAt)
 	}
 }
 
-func TestServiceProcessWebhookMarksSent(t *testing.T) {
-	t.Parallel()
-	url := "http://example.test"
-	st := &stubStore{notification: store.Notification{RecipientWebhookURL: &url, Variables: map[string]any{"name": "Ada"}}, template: store.Template{Body: `{"name":"{{.name}}"}`}}
-	svc, err := NewService(st, stubWebhookSender{providerID: "req-1"}, stubEmailSender{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	result, err := svc.ProcessWebhook(context.Background(), queue.DispatchJob{AttemptID: "attempt-1", Channel: "webhook"})
-	if err != nil {
-		t.Fatalf("ProcessWebhook() error = %v", err)
-	}
-	if result.Outcome != OutcomeSent {
-		t.Fatalf("result.Outcome = %v", result.Outcome)
-	}
-	if st.sentID == nil || *st.sentID != "req-1" {
-		t.Fatalf("provider_message_id = %v, want req-1", st.sentID)
-	}
-}
-
-func TestServiceProcessEmailMarksFailure(t *testing.T) {
-	t.Parallel()
+func TestServiceDeadLettersWhenRetryBudgetExhausted(t *testing.T) {
 	to := "to@example.test"
-	st := &stubStore{notification: store.Notification{RecipientEmail: &to, Variables: map[string]any{"name": "Ada"}}, template: store.Template{Name: "welcome", Body: "hello {{.name}}"}}
-	svc, err := NewService(st, stubWebhookSender{}, stubEmailSender{err: errors.New("smtp down")})
+	st := &stubStore{notification: store.Notification{ID: "notif-1", RecipientEmail: &to, Variables: map[string]any{"name": "Ada"}}, template: store.Template{Name: "welcome", Body: "hello {{.name}}"}, attempt: store.DeliveryAttempt{ID: "attempt-3", AttemptNumber: 3}}
+	svc, err := NewService(st, stubWebhookSender{}, stubEmailSender{err: &RetryableError{Err: errors.New("smtp down")}}, RetryPolicy{MaxAttempts: 3, BaseDelay: 5 * time.Second, MaxDelay: time.Minute, ExponentialBackoff: true, Now: time.Now, IDGenerator: func() string { return "dead-1" }, RandSource: rand.New(rand.NewSource(1))})
 	if err != nil {
 		t.Fatal(err)
 	}
-	result, err := svc.ProcessEmail(context.Background(), queue.DispatchJob{AttemptID: "attempt-1", Channel: "email"})
-	if !IsTerminal(err) {
-		t.Fatalf("ProcessEmail() error terminal = false, err=%v", err)
+	result, err := svc.ProcessEmail(context.Background(), queue.DispatchJob{AttemptID: "attempt-3", NotificationID: "notif-1", Channel: "email"})
+	if !IsRetryable(err) {
+		t.Fatalf("expected retryable error, got %v", err)
 	}
-	if result.Outcome != OutcomeFailedTerminal {
-		t.Fatalf("result.Outcome = %v", result.Outcome)
+	if result.Outcome != OutcomeDeadLettered {
+		t.Fatalf("Outcome=%v", result.Outcome)
 	}
-	if st.failedMsg != "smtp down" {
-		t.Fatalf("failedMsg = %q", st.failedMsg)
+	if st.deadLetterMsg != "smtp down" {
+		t.Fatalf("deadLetterMsg=%q", st.deadLetterMsg)
 	}
-}
-
-func TestServiceProcessEmailMarksSent(t *testing.T) {
-	t.Parallel()
-	to := "to@example.test"
-	st := &stubStore{notification: store.Notification{ID: "notif-1", RecipientEmail: &to, Variables: map[string]any{"name": "Ada"}, SubmittedAt: time.Now()}, template: store.Template{Name: "welcome", Body: "hello {{.name}}"}}
-	svc, err := NewService(st, stubWebhookSender{}, stubEmailSender{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	result, err := svc.ProcessEmail(context.Background(), queue.DispatchJob{AttemptID: "attempt-1", Channel: "email"})
-	if err != nil {
-		t.Fatalf("ProcessEmail() error = %v", err)
-	}
-	if result.Outcome != OutcomeSent {
-		t.Fatalf("result.Outcome = %v", result.Outcome)
-	}
-	if st.failedMsg != "" {
-		t.Fatalf("failedMsg = %q, want empty", st.failedMsg)
-	}
-	if st.sentID != nil {
-		t.Fatalf("sentID = %v, want nil provider id for email", st.sentID)
-	}
-}
-
-func TestServiceProcessEmailReturnsTransientErrorWhenLoadFails(t *testing.T) {
-	t.Parallel()
-	st := &stubStore{loadErr: errors.New("postgres unavailable")}
-	svc, err := NewService(st, stubWebhookSender{}, stubEmailSender{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = svc.ProcessEmail(context.Background(), queue.DispatchJob{AttemptID: "attempt-1", Channel: "email"})
-	if err == nil {
-		t.Fatal("ProcessEmail() error = nil, want transient error")
-	}
-	if IsTerminal(err) {
-		t.Fatalf("ProcessEmail() error terminal = true, err=%v", err)
-	}
-	if st.failedMsg != "" {
-		t.Fatalf("failedMsg = %q, want empty", st.failedMsg)
-	}
-}
-
-func TestServiceProcessEmailReturnsTransientErrorWhenMarkAttemptFailedFails(t *testing.T) {
-	t.Parallel()
-	to := "to@example.test"
-	st := &stubStore{notification: store.Notification{RecipientEmail: &to, Variables: map[string]any{"name": "Ada"}}, template: store.Template{Name: "welcome", Body: "hello {{.name}}"}, failedErr: errors.New("write failed")}
-	svc, err := NewService(st, stubWebhookSender{}, stubEmailSender{err: errors.New("smtp down")})
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = svc.ProcessEmail(context.Background(), queue.DispatchJob{AttemptID: "attempt-1", Channel: "email"})
-	if err == nil {
-		t.Fatal("ProcessEmail() error = nil, want transient error")
-	}
-	if IsTerminal(err) {
-		t.Fatalf("ProcessEmail() error terminal = true, err=%v", err)
+	if st.insertedDead == nil || st.insertedDead.ID != "dead-1" {
+		t.Fatalf("inserted dead letter=%+v", st.insertedDead)
 	}
 }

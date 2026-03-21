@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -14,9 +15,31 @@ import (
 	"github.com/richrobertson/notification-platform/internal/store"
 )
 
+type apiStore interface {
+	CreateTenant(ctx context.Context, params store.CreateTenantParams) (store.Tenant, error)
+	GetTenantByID(ctx context.Context, id string) (store.Tenant, error)
+	CreateTemplate(ctx context.Context, params store.CreateTemplateParams) (store.Template, error)
+	GetTemplateByID(ctx context.Context, id string) (store.Template, error)
+	GetNotificationByTenantAndIdempotencyKey(ctx context.Context, tenantID, idempotencyKey string) (store.Notification, error)
+	GetInitialAttemptByNotificationID(ctx context.Context, notificationID string) (store.DeliveryAttempt, error)
+	EnsureInitialAttempt(ctx context.Context, notificationID, channel, attemptID string) (store.DeliveryAttempt, error)
+	CreateNotification(ctx context.Context, params store.CreateNotificationParams) (store.Notification, error)
+	CreateDeliveryAttempt(ctx context.Context, params store.CreateDeliveryAttemptParams) (store.DeliveryAttempt, error)
+	MarkAttemptEnqueued(ctx context.Context, attemptID string) error
+	ListDeadLetters(ctx context.Context, limit int) ([]store.DeadLetter, error)
+	GetDeadLetterByID(ctx context.Context, id string) (store.DeadLetter, error)
+	EnsureReplayAttempt(ctx context.Context, deadLetterID, newAttemptID string) (store.ReplayDeadLetterResult, error)
+	FinalizeReplayEnqueue(ctx context.Context, deadLetterID, attemptID string) error
+	GetNotificationByID(ctx context.Context, id string) (store.Notification, error)
+}
+
+type dispatchQueue interface {
+	EnqueueDispatch(ctx context.Context, job queue.DispatchJob) error
+}
+
 type API struct {
-	store *store.Postgres
-	queue *queue.RedisQueue
+	store apiStore
+	queue dispatchQueue
 }
 
 type createTenantRequest struct {
@@ -44,8 +67,47 @@ type createNotificationRequest struct {
 	Variables           map[string]any `json:"variables"`
 }
 
-func NewAPI(store *store.Postgres, redisQueue *queue.RedisQueue) *API {
+func NewAPI(store apiStore, redisQueue dispatchQueue) *API {
 	return &API{store: store, queue: redisQueue}
+}
+
+func (a *API) ensureAndEnqueueInitialAttempt(ctx context.Context, w http.ResponseWriter, existing store.Notification) {
+	template, err := a.store.GetTemplateByID(ctx, existing.TemplateID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
+		return
+	}
+	slog.Default().Info("idempotent retry recovering existing notification using stored template channel", slog.String("notification_id", existing.ID), slog.String("template_id", existing.TemplateID), slog.String("channel", template.Channel))
+	attempt, attemptErr := a.store.GetInitialAttemptByNotificationID(ctx, existing.ID)
+	if attemptErr != nil {
+		if errors.Is(attemptErr, store.ErrNotFound) {
+			slog.Default().Warn("existing notification found without initial attempt; creating missing initial attempt from stored template", slog.String("notification_id", existing.ID), slog.String("template_id", existing.TemplateID), slog.String("channel", template.Channel))
+			attempt, attemptErr = a.store.EnsureInitialAttempt(ctx, existing.ID, template.Channel, generateID("attempt"))
+			if attemptErr != nil {
+				writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
+				return
+			}
+		} else {
+			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
+			return
+		}
+	}
+	if attempt.DispatchEnqueuedAt != nil {
+		writeJSON(w, http.StatusOK, existing)
+		return
+	}
+	slog.Default().Warn("idempotent retry found existing notification with pending initial enqueue", slog.String("notification_id", existing.ID), slog.String("attempt_id", attempt.ID), slog.String("channel", attempt.Channel))
+	job := queue.DispatchJob{JobID: generateID("job"), NotificationID: existing.ID, AttemptID: attempt.ID, TenantID: existing.TenantID, Channel: attempt.Channel, CreatedAt: time.Now().UTC()}
+	if enqueueErr := a.queue.EnqueueDispatch(ctx, job); enqueueErr != nil {
+		slog.Default().Error("initial attempt enqueue failed; attempt remains recoverable in postgres", slog.Any("error", enqueueErr), slog.String("notification_id", existing.ID), slog.String("attempt_id", attempt.ID), slog.String("channel", attempt.Channel))
+		writeJSON(w, http.StatusAccepted, existing)
+		return
+	}
+	if markErr := a.store.MarkAttemptEnqueued(ctx, attempt.ID); markErr != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
+		return
+	}
+	writeJSON(w, http.StatusAccepted, existing)
 }
 
 func (a *API) CreateTenant() http.HandlerFunc {
@@ -151,17 +213,6 @@ func (a *API) CreateNotification() http.HandlerFunc {
 			writeError(w, http.StatusBadRequest, "bad_request", "template_id is required")
 			return
 		}
-		if req.IdempotencyKey != "" {
-			existing, err := a.store.GetNotificationByTenantAndIdempotencyKey(r.Context(), req.TenantID, req.IdempotencyKey)
-			if err == nil {
-				writeJSON(w, http.StatusOK, existing)
-				return
-			}
-			if !errors.Is(err, store.ErrNotFound) {
-				writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
-				return
-			}
-		}
 		if _, err := a.store.GetTenantByID(r.Context(), req.TenantID); err != nil {
 			if errors.Is(err, store.ErrNotFound) {
 				writeError(w, http.StatusNotFound, "not_found", "tenant not found")
@@ -200,6 +251,17 @@ func (a *API) CreateNotification() http.HandlerFunc {
 			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
 			return
 		}
+		if req.IdempotencyKey != "" {
+			existing, err := a.store.GetNotificationByTenantAndIdempotencyKey(r.Context(), req.TenantID, req.IdempotencyKey)
+			if err == nil {
+				a.ensureAndEnqueueInitialAttempt(r.Context(), w, existing)
+				return
+			}
+			if !errors.Is(err, store.ErrNotFound) {
+				writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
+				return
+			}
+		}
 		params := store.CreateNotificationParams{ID: req.ID, TenantID: req.TenantID, TemplateID: req.TemplateID, Variables: req.Variables}
 		if req.IdempotencyKey != "" {
 			params.IdempotencyKey = &req.IdempotencyKey
@@ -215,7 +277,7 @@ func (a *API) CreateNotification() http.HandlerFunc {
 			if req.IdempotencyKey != "" && store.IsConflict(err) {
 				existing, lookupErr := a.store.GetNotificationByTenantAndIdempotencyKey(r.Context(), req.TenantID, req.IdempotencyKey)
 				if lookupErr == nil {
-					writeJSON(w, http.StatusOK, existing)
+					a.ensureAndEnqueueInitialAttempt(r.Context(), w, existing)
 					return
 				}
 			}
@@ -227,17 +289,21 @@ func (a *API) CreateNotification() http.HandlerFunc {
 			return
 		}
 
-		attemptID := generateID("attempt")
-		attempt, err := a.store.CreateDeliveryAttempt(r.Context(), store.CreateDeliveryAttemptParams{ID: attemptID, NotificationID: notification.ID, Channel: template.Channel, AttemptNumber: 1, Status: "pending"})
+		attempt, err := a.store.EnsureInitialAttempt(r.Context(), notification.ID, template.Channel, generateID("attempt"))
 		if err != nil {
-			slog.Default().Error("failed to create delivery attempt", slog.Any("error", err), slog.String("notification_id", notification.ID), slog.String("attempt_id", attemptID), slog.String("channel", template.Channel))
+			slog.Default().Error("failed to ensure initial delivery attempt", slog.Any("error", err), slog.String("notification_id", notification.ID), slog.String("channel", template.Channel))
 			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
 			return
 		}
 
 		job := queue.DispatchJob{JobID: generateID("job"), NotificationID: notification.ID, AttemptID: attempt.ID, TenantID: notification.TenantID, Channel: template.Channel, CreatedAt: time.Now().UTC()}
 		if err := a.queue.EnqueueDispatch(r.Context(), job); err != nil {
-			slog.Default().Error("failed to enqueue dispatch job", slog.Any("error", err), slog.String("notification_id", notification.ID), slog.String("attempt_id", attempt.ID), slog.String("job_id", job.JobID), slog.String("channel", job.Channel))
+			slog.Default().Error("initial attempt enqueue failed; attempt remains recoverable in postgres", slog.Any("error", err), slog.String("notification_id", notification.ID), slog.String("attempt_id", attempt.ID), slog.String("job_id", job.JobID), slog.String("channel", job.Channel))
+			writeJSON(w, http.StatusAccepted, notification)
+			return
+		}
+
+		if err := a.store.MarkAttemptEnqueued(r.Context(), attempt.ID); err != nil {
 			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
 			return
 		}
@@ -252,4 +318,91 @@ func generateID(prefix string) string {
 		return fmt.Sprintf("%s_%d", prefix, time.Now().UTC().UnixNano())
 	}
 	return fmt.Sprintf("%s_%s", prefix, hex.EncodeToString(buf))
+}
+
+func (a *API) ListDeadLetters() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		deadLetters, err := a.store.ListDeadLetters(r.Context(), 100)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
+			return
+		}
+		writeJSON(w, http.StatusOK, deadLetters)
+	}
+}
+
+func (a *API) GetDeadLetter() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		deadLetter, err := a.store.GetDeadLetterByID(r.Context(), r.PathValue("id"))
+		if err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				writeError(w, http.StatusNotFound, "not_found", "dead letter not found")
+				return
+			}
+			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
+			return
+		}
+		writeJSON(w, http.StatusOK, deadLetter)
+	}
+}
+
+func (a *API) ReplayDeadLetter() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		deadLetterID := r.PathValue("id")
+		deadLetter, err := a.store.GetDeadLetterByID(r.Context(), deadLetterID)
+		if err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				writeError(w, http.StatusNotFound, "not_found", "dead letter not found")
+				return
+			}
+			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
+			return
+		}
+		if deadLetter.ReplayedAt != nil {
+			writeError(w, http.StatusConflict, "conflict", "dead letter already replayed")
+			return
+		}
+		notification, err := a.store.GetNotificationByID(r.Context(), deadLetter.NotificationID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
+			return
+		}
+		attemptID := replayAttemptID(deadLetterID)
+		result, err := a.store.EnsureReplayAttempt(r.Context(), deadLetterID, attemptID)
+		if err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				writeError(w, http.StatusNotFound, "not_found", "dead letter not found")
+				return
+			}
+			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
+			return
+		}
+		job := queue.DispatchJob{JobID: generateID("job"), NotificationID: result.Attempt.NotificationID, AttemptID: result.Attempt.ID, TenantID: notification.TenantID, Channel: result.Attempt.Channel, CreatedAt: time.Now().UTC()}
+		if err := a.queue.EnqueueDispatch(r.Context(), job); err != nil {
+			slog.Default().Error("replay enqueue failed; attempt remains recoverable in postgres", slog.Any("error", err), slog.String("dead_letter_id", deadLetterID), slog.String("attempt_id", result.Attempt.ID), slog.String("channel", result.Attempt.Channel))
+			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
+			return
+		}
+		if err := a.store.FinalizeReplayEnqueue(r.Context(), deadLetterID, result.Attempt.ID); err != nil {
+			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
+			return
+		}
+		if err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				writeError(w, http.StatusNotFound, "not_found", "dead letter not found")
+				return
+			}
+			if errors.Is(err, store.ErrConflict) {
+				writeError(w, http.StatusConflict, "conflict", "dead letter already replayed")
+				return
+			}
+			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
+			return
+		}
+		writeJSON(w, http.StatusAccepted, result.Attempt)
+	}
+}
+
+func replayAttemptID(deadLetterID string) string {
+	return fmt.Sprintf("replay_%s", deadLetterID)
 }
