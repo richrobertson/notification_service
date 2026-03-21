@@ -8,6 +8,7 @@ import (
 
 	"github.com/richrobertson/notification-platform/internal/delivery"
 	"github.com/richrobertson/notification-platform/internal/queue"
+	"github.com/richrobertson/notification-platform/internal/store"
 )
 
 type Processor func(context.Context, queue.DispatchJob) (delivery.Result, error)
@@ -58,6 +59,14 @@ func RunChannelWorker(ctx context.Context, logger *slog.Logger, redisQueue *queu
 		job := reserved.Job
 		result, processErr := processor(ctx, job)
 		if processErr != nil {
+			if errors.Is(processErr, store.ErrNotFound) {
+				if ackErr := redisQueue.AckReserved(ctx, reserved); ackErr != nil {
+					logger.Error("orphan worker job could not be acked; job remains in processing queue until recovery", slog.Any("error", ackErr), slog.String("job_id", job.JobID), slog.String("attempt_id", job.AttemptID), slog.String("queue", queueName))
+					continue
+				}
+				logger.Error("worker received orphan job for nonexistent attempt; acking and dropping", slog.Any("error", processErr), slog.String("job_id", job.JobID), slog.String("attempt_id", job.AttemptID), slog.String("queue", queueName))
+				continue
+			}
 			if ackErr := redisQueue.AckReserved(ctx, reserved); ackErr != nil {
 				logger.Error("worker completion state recorded but ack failed; job remains in processing queue until recovery", slog.Any("error", ackErr), slog.String("job_id", job.JobID), slog.String("attempt_id", job.AttemptID), slog.String("queue", queueName))
 				continue

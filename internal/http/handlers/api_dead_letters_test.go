@@ -15,13 +15,14 @@ import (
 )
 
 type fakeAPIStore struct {
-	deadLetters          map[string]store.DeadLetter
-	attempt              store.DeliveryAttempt
-	notification         store.Notification
-	finalizeErr          error
-	finalizeCalls        int
-	finalizedAttemptID   string
-	getNotificationError error
+	deadLetters        map[string]store.DeadLetter
+	attempt            store.DeliveryAttempt
+	notification       store.Notification
+	ensureCalls        int
+	finalizeCalls      int
+	finalizedAttemptID string
+	ensureErr          error
+	finalizeErr        error
 }
 
 func (f *fakeAPIStore) CreateTenant(context.Context, store.CreateTenantParams) (store.Tenant, error) {
@@ -57,24 +58,31 @@ func (f *fakeAPIStore) GetDeadLetterByID(_ context.Context, id string) (store.De
 	}
 	return dl, nil
 }
-func (f *fakeAPIStore) FinalizeDeadLetterReplay(_ context.Context, id, newAttemptID string) (store.ReplayDeadLetterResult, error) {
+func (f *fakeAPIStore) EnsureReplayAttempt(_ context.Context, id, newAttemptID string) (store.ReplayDeadLetterResult, error) {
+	f.ensureCalls++
+	if f.ensureErr != nil {
+		return store.ReplayDeadLetterResult{}, f.ensureErr
+	}
+	dl := f.deadLetters[id]
+	attempt := f.attempt
+	attempt.ID = newAttemptID
+	dl.ReplayAttemptID = &attempt.ID
+	f.deadLetters[id] = dl
+	return store.ReplayDeadLetterResult{DeadLetter: dl, Attempt: attempt}, nil
+}
+func (f *fakeAPIStore) FinalizeReplayEnqueue(_ context.Context, id, attemptID string) error {
 	f.finalizeCalls++
-	f.finalizedAttemptID = newAttemptID
+	f.finalizedAttemptID = attemptID
 	if f.finalizeErr != nil {
-		return store.ReplayDeadLetterResult{}, f.finalizeErr
+		return f.finalizeErr
 	}
 	dl := f.deadLetters[id]
 	now := time.Unix(200, 0).UTC()
 	dl.ReplayedAt = &now
 	f.deadLetters[id] = dl
-	attempt := f.attempt
-	attempt.ID = newAttemptID
-	return store.ReplayDeadLetterResult{DeadLetter: dl, Attempt: attempt}, nil
+	return nil
 }
 func (f *fakeAPIStore) GetNotificationByID(context.Context, string) (store.Notification, error) {
-	if f.getNotificationError != nil {
-		return store.Notification{}, f.getNotificationError
-	}
 	return f.notification, nil
 }
 
@@ -99,7 +107,6 @@ func newDeadLetterTestAPI() (*fakeAPIStore, *fakeDispatchQueue, *API) {
 
 func TestDeadLetterHandlersListGetReplay(t *testing.T) {
 	st, q, api := newDeadLetterTestAPI()
-
 	t.Run("list", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/v1/dead-letters", nil)
 		res := httptest.NewRecorder()
@@ -115,7 +122,6 @@ func TestDeadLetterHandlersListGetReplay(t *testing.T) {
 			t.Fatalf("items=%+v", items)
 		}
 	})
-
 	t.Run("get", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/v1/dead-letters/dead-1", nil)
 		req.SetPathValue("id", "dead-1")
@@ -125,7 +131,6 @@ func TestDeadLetterHandlersListGetReplay(t *testing.T) {
 			t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
 		}
 	})
-
 	t.Run("replay_success", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodPost, "/v1/dead-letters/dead-1/replay", bytes.NewReader(nil))
 		req.SetPathValue("id", "dead-1")
@@ -134,19 +139,16 @@ func TestDeadLetterHandlersListGetReplay(t *testing.T) {
 		if res.Code != http.StatusAccepted {
 			t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
 		}
-		if len(q.jobs) != 1 || q.jobs[0].NotificationID != "notif-1" {
+		if len(q.jobs) != 1 || q.jobs[0].AttemptID != replayAttemptID("dead-1") {
 			t.Fatalf("jobs=%+v", q.jobs)
 		}
-		if st.finalizeCalls != 1 {
-			t.Fatalf("finalizeCalls=%d", st.finalizeCalls)
-		}
-		if st.finalizedAttemptID != replayAttemptID("dead-1") {
-			t.Fatalf("attemptID=%q", st.finalizedAttemptID)
+		if st.ensureCalls != 1 || st.finalizeCalls != 1 {
+			t.Fatalf("ensure=%d finalize=%d", st.ensureCalls, st.finalizeCalls)
 		}
 	})
 }
 
-func TestReplayDeadLetterEnqueueFailureDoesNotMutateStore(t *testing.T) {
+func TestReplayDeadLetterEnqueueFailureLeavesRecoverableAttempt(t *testing.T) {
 	st, q, api := newDeadLetterTestAPI()
 	q.err = errors.New("redis down")
 	req := httptest.NewRequest(http.MethodPost, "/v1/dead-letters/dead-1/replay", bytes.NewReader(nil))
@@ -156,10 +158,13 @@ func TestReplayDeadLetterEnqueueFailureDoesNotMutateStore(t *testing.T) {
 	if res.Code != http.StatusInternalServerError {
 		t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
 	}
-	if st.finalizeCalls != 0 {
-		t.Fatalf("finalizeCalls=%d, want 0", st.finalizeCalls)
+	if st.ensureCalls != 1 || st.finalizeCalls != 0 {
+		t.Fatalf("ensure=%d finalize=%d", st.ensureCalls, st.finalizeCalls)
 	}
 	if st.deadLetters["dead-1"].ReplayedAt != nil {
-		t.Fatalf("dead letter replayed_at should remain nil")
+		t.Fatal("replayed_at should remain nil")
+	}
+	if st.deadLetters["dead-1"].ReplayAttemptID == nil {
+		t.Fatal("replay attempt should remain durable and recoverable")
 	}
 }

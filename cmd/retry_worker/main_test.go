@@ -6,33 +6,38 @@ import (
 	"io"
 	"log/slog"
 	"testing"
-	"time"
 
 	"github.com/richrobertson/notification-platform/internal/queue"
 	"github.com/richrobertson/notification-platform/internal/store"
 )
 
 type fakeRetryStore struct {
-	items         []store.RetryDueAttempt
-	finalized     []string
-	finalizeCalls int
+	due             []store.RetryDueAttempt
+	pending         []store.PendingEnqueueAttempt
+	ensured         []string
+	enqueued        []string
+	finalizedReplay []string
 }
 
 func (f *fakeRetryStore) ListDueRetryAttempts(context.Context, int) ([]store.RetryDueAttempt, error) {
-	return f.items, nil
+	return f.due, nil
 }
-func (f *fakeRetryStore) FinalizeRetryDispatch(_ context.Context, scheduledAttemptID, newAttemptID string) (store.RetryDueAttempt, error) {
-	f.finalizeCalls++
-	f.finalized = append(f.finalized, scheduledAttemptID+"->"+newAttemptID)
-	for _, item := range f.items {
-		if item.Attempt.ID == scheduledAttemptID {
-			item.Attempt.ID = newAttemptID
-			item.Attempt.AttemptNumber++
-			item.Attempt.Status = "pending"
-			return item, nil
-		}
-	}
-	return store.RetryDueAttempt{}, store.ErrNotFound
+func (f *fakeRetryStore) EnsureRetryAttempt(_ context.Context, scheduledAttemptID, newAttemptID string) (store.RetryDueAttempt, error) {
+	f.ensured = append(f.ensured, scheduledAttemptID+"->"+newAttemptID)
+	attempt := store.DeliveryAttempt{ID: newAttemptID, NotificationID: "notif-1", Channel: "email", AttemptNumber: 2, Status: "pending"}
+	f.pending = append(f.pending, store.PendingEnqueueAttempt{Attempt: attempt, TenantID: "tenant-1"})
+	return store.RetryDueAttempt{Attempt: attempt, TenantID: "tenant-1"}, nil
+}
+func (f *fakeRetryStore) ListAttemptsPendingEnqueue(context.Context, int) ([]store.PendingEnqueueAttempt, error) {
+	return f.pending, nil
+}
+func (f *fakeRetryStore) MarkAttemptEnqueued(_ context.Context, attemptID string) error {
+	f.enqueued = append(f.enqueued, attemptID)
+	return nil
+}
+func (f *fakeRetryStore) FinalizeReplayEnqueue(_ context.Context, deadLetterID, attemptID string) error {
+	f.finalizedReplay = append(f.finalizedReplay, deadLetterID+"->"+attemptID)
+	return nil
 }
 
 type fakeRetryQueue struct {
@@ -50,41 +55,48 @@ func (f *fakeRetryQueue) EnqueueDispatch(_ context.Context, job queue.DispatchJo
 
 func testLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
 
-func TestRunOnceRetryEnqueueFailureLeavesAttemptScheduled(t *testing.T) {
-	st := &fakeRetryStore{items: []store.RetryDueAttempt{{Attempt: store.DeliveryAttempt{ID: "attempt-1", NotificationID: "notif-1", Channel: "email", AttemptNumber: 1, Status: "retry_scheduled", NextRetryAt: ptr(time.Now())}, TenantID: "tenant-1"}}}
+func TestRunOnceRetryEnqueueFailureLeavesDurableAttemptPending(t *testing.T) {
+	st := &fakeRetryStore{due: []store.RetryDueAttempt{{Attempt: store.DeliveryAttempt{ID: "attempt-1", NotificationID: "notif-1", Channel: "email", AttemptNumber: 1, Status: "retry_scheduled"}, TenantID: "tenant-1"}}}
 	q := &fakeRetryQueue{err: errors.New("redis down")}
 	if err := runOnce(context.Background(), testLogger(), st, q); err != nil {
 		t.Fatal(err)
 	}
-	if len(q.jobs) != 0 {
-		t.Fatalf("jobs=%d, want 0", len(q.jobs))
+	if len(st.ensured) != 1 {
+		t.Fatalf("ensured=%v", st.ensured)
 	}
-	if st.finalizeCalls != 0 {
-		t.Fatalf("finalizeCalls=%d, want 0", st.finalizeCalls)
+	if len(st.pending) != 1 {
+		t.Fatalf("pending=%d", len(st.pending))
+	}
+	if len(st.enqueued) != 0 {
+		t.Fatalf("enqueued=%v", st.enqueued)
+	}
+	if len(q.jobs) != 0 {
+		t.Fatalf("jobs=%d", len(q.jobs))
 	}
 }
 
-func TestRunOnceEnqueuesThenFinalizesRetry(t *testing.T) {
-	st := &fakeRetryStore{items: []store.RetryDueAttempt{{Attempt: store.DeliveryAttempt{ID: "attempt-1", NotificationID: "notif-1", Channel: "email", AttemptNumber: 1, Status: "retry_scheduled", NextRetryAt: ptr(time.Now())}, TenantID: "tenant-1"}}}
+func TestRunOnceOnlyEnqueuesExistingAttempts(t *testing.T) {
+	st := &fakeRetryStore{pending: []store.PendingEnqueueAttempt{{Attempt: store.DeliveryAttempt{ID: "attempt-2", NotificationID: "notif-1", Channel: "email", AttemptNumber: 2, Status: "pending"}, TenantID: "tenant-1"}}}
 	q := &fakeRetryQueue{}
 	if err := runOnce(context.Background(), testLogger(), st, q); err != nil {
 		t.Fatal(err)
 	}
-	if len(q.jobs) != 1 {
-		t.Fatalf("jobs=%d", len(q.jobs))
+	if len(q.jobs) != 1 || q.jobs[0].AttemptID != "attempt-2" {
+		t.Fatalf("jobs=%+v", q.jobs)
 	}
-	if got, want := q.jobs[0].AttemptID, retryAttemptID("attempt-1"); got != want {
-		t.Fatalf("AttemptID=%q want %q", got, want)
-	}
-	if st.finalizeCalls != 1 {
-		t.Fatalf("finalizeCalls=%d", st.finalizeCalls)
+	if len(st.enqueued) != 1 || st.enqueued[0] != "attempt-2" {
+		t.Fatalf("enqueued=%v", st.enqueued)
 	}
 }
 
-func TestRetryAttemptIDIsDeterministic(t *testing.T) {
-	if got, want := retryAttemptID("attempt-1"), retryAttemptID("attempt-1"); got != want {
-		t.Fatalf("retryAttemptID not deterministic: %q != %q", got, want)
+func TestRunOnceFinalizesReplayAfterSuccessfulEnqueue(t *testing.T) {
+	dl := "dead-1"
+	st := &fakeRetryStore{pending: []store.PendingEnqueueAttempt{{Attempt: store.DeliveryAttempt{ID: "replay_" + dl, NotificationID: "notif-1", Channel: "email", AttemptNumber: 4, Status: "pending"}, TenantID: "tenant-1", DeadLetterID: &dl}}}
+	q := &fakeRetryQueue{}
+	if err := runOnce(context.Background(), testLogger(), st, q); err != nil {
+		t.Fatal(err)
+	}
+	if len(st.finalizedReplay) != 1 {
+		t.Fatalf("finalizedReplay=%v", st.finalizedReplay)
 	}
 }
-
-func ptr[T any](v T) *T { return &v }

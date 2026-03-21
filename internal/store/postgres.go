@@ -56,22 +56,23 @@ type Notification struct {
 }
 
 type DeliveryAttempt struct {
-	ID                string     `json:"id"`
-	NotificationID    string     `json:"notification_id"`
-	Channel           string     `json:"channel"`
-	AttemptNumber     int        `json:"attempt_number"`
-	Status            string     `json:"status"`
-	ErrorCode         *string    `json:"error_code"`
-	ErrorMessage      *string    `json:"error_message"`
-	ProviderMessageID *string    `json:"provider_message_id"`
-	LastError         *string    `json:"last_error"`
-	NextRetryAt       *time.Time `json:"next_retry_at"`
-	StartedAt         *time.Time `json:"started_at"`
-	CompletedAt       *time.Time `json:"completed_at"`
-	SentAt            *time.Time `json:"sent_at"`
-	FailedAt          *time.Time `json:"failed_at"`
-	CreatedAt         time.Time  `json:"created_at"`
-	UpdatedAt         time.Time  `json:"updated_at"`
+	ID                 string     `json:"id"`
+	NotificationID     string     `json:"notification_id"`
+	Channel            string     `json:"channel"`
+	AttemptNumber      int        `json:"attempt_number"`
+	Status             string     `json:"status"`
+	ErrorCode          *string    `json:"error_code"`
+	ErrorMessage       *string    `json:"error_message"`
+	ProviderMessageID  *string    `json:"provider_message_id"`
+	LastError          *string    `json:"last_error"`
+	NextRetryAt        *time.Time `json:"next_retry_at"`
+	StartedAt          *time.Time `json:"started_at"`
+	CompletedAt        *time.Time `json:"completed_at"`
+	SentAt             *time.Time `json:"sent_at"`
+	FailedAt           *time.Time `json:"failed_at"`
+	DispatchEnqueuedAt *time.Time `json:"dispatch_enqueued_at"`
+	CreatedAt          time.Time  `json:"created_at"`
+	UpdatedAt          time.Time  `json:"updated_at"`
 }
 
 type CreateTenantParams struct {
@@ -100,22 +101,24 @@ type CreateNotificationParams struct {
 }
 
 type CreateDeliveryAttemptParams struct {
-	ID             string
-	NotificationID string
-	Channel        string
-	AttemptNumber  int
-	Status         string
-	NextRetryAt    *time.Time
-	LastError      *string
+	ID                 string
+	NotificationID     string
+	Channel            string
+	AttemptNumber      int
+	Status             string
+	NextRetryAt        *time.Time
+	LastError          *string
+	DispatchEnqueuedAt *time.Time
 }
 
 type DeadLetter struct {
-	ID             string     `json:"id"`
-	NotificationID string     `json:"notification_id"`
-	Channel        string     `json:"channel"`
-	FinalError     string     `json:"final_error"`
-	DeadLetteredAt time.Time  `json:"dead_lettered_at"`
-	ReplayedAt     *time.Time `json:"replayed_at"`
+	ID              string     `json:"id"`
+	NotificationID  string     `json:"notification_id"`
+	Channel         string     `json:"channel"`
+	FinalError      string     `json:"final_error"`
+	DeadLetteredAt  time.Time  `json:"dead_lettered_at"`
+	ReplayedAt      *time.Time `json:"replayed_at"`
+	ReplayAttemptID *string    `json:"replay_attempt_id"`
 }
 
 type RetryDueAttempt struct {
@@ -442,9 +445,10 @@ func (p *Postgres) CreateDeliveryAttempt(ctx context.Context, params CreateDeliv
 			attempt_number,
 			status,
 			next_retry_at,
-			last_error
+			last_error,
+			dispatch_enqueued_at
 		)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		RETURNING
 			id,
 			notification_id,
@@ -460,6 +464,7 @@ func (p *Postgres) CreateDeliveryAttempt(ctx context.Context, params CreateDeliv
 			completed_at,
 			sent_at,
 			failed_at,
+			dispatch_enqueued_at,
 			created_at,
 			updated_at
 	`
@@ -475,6 +480,7 @@ func (p *Postgres) CreateDeliveryAttempt(ctx context.Context, params CreateDeliv
 		params.Status,
 		params.NextRetryAt,
 		params.LastError,
+		params.DispatchEnqueuedAt,
 	).Scan(
 		&attempt.ID,
 		&attempt.NotificationID,
@@ -490,6 +496,7 @@ func (p *Postgres) CreateDeliveryAttempt(ctx context.Context, params CreateDeliv
 		&attempt.CompletedAt,
 		&attempt.SentAt,
 		&attempt.FailedAt,
+		&attempt.DispatchEnqueuedAt,
 		&attempt.CreatedAt,
 		&attempt.UpdatedAt,
 	)
@@ -543,12 +550,12 @@ func (p *Postgres) GetNotificationByID(ctx context.Context, id string) (Notifica
 
 func (p *Postgres) GetDeliveryAttemptByID(ctx context.Context, id string) (DeliveryAttempt, error) {
 	const query = `
-		SELECT id, notification_id, channel, attempt_number, status, error_code, error_message, provider_message_id, last_error, next_retry_at, started_at, completed_at, sent_at, failed_at, created_at, updated_at
+		SELECT id, notification_id, channel, attempt_number, status, error_code, error_message, provider_message_id, last_error, next_retry_at, started_at, completed_at, sent_at, failed_at, dispatch_enqueued_at, created_at, updated_at
 		FROM delivery_attempts
 		WHERE id = $1
 	`
 	var attempt DeliveryAttempt
-	err := p.DB.QueryRowContext(ctx, query, id).Scan(&attempt.ID, &attempt.NotificationID, &attempt.Channel, &attempt.AttemptNumber, &attempt.Status, &attempt.ErrorCode, &attempt.ErrorMessage, &attempt.ProviderMessageID, &attempt.LastError, &attempt.NextRetryAt, &attempt.StartedAt, &attempt.CompletedAt, &attempt.SentAt, &attempt.FailedAt, &attempt.CreatedAt, &attempt.UpdatedAt)
+	err := p.DB.QueryRowContext(ctx, query, id).Scan(&attempt.ID, &attempt.NotificationID, &attempt.Channel, &attempt.AttemptNumber, &attempt.Status, &attempt.ErrorCode, &attempt.ErrorMessage, &attempt.ProviderMessageID, &attempt.LastError, &attempt.NextRetryAt, &attempt.StartedAt, &attempt.CompletedAt, &attempt.SentAt, &attempt.FailedAt, &attempt.DispatchEnqueuedAt, &attempt.CreatedAt, &attempt.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return DeliveryAttempt{}, fmt.Errorf("get delivery attempt: %w", ErrNotFound)
@@ -667,7 +674,7 @@ func (p *Postgres) InsertDeadLetter(ctx context.Context, id, notificationID, cha
 	const query = `
 		INSERT INTO dead_letters (id, notification_id, channel, final_error)
 		VALUES ($1, $2, $3, $4)
-		RETURNING id, notification_id, channel, final_error, dead_lettered_at, replayed_at
+		RETURNING id, notification_id, channel, final_error, dead_lettered_at, replayed_at, replay_attempt_id
 	`
 	var deadLetter DeadLetter
 	if err := p.DB.QueryRowContext(ctx, query, id, notificationID, channel, finalError).Scan(
@@ -677,6 +684,7 @@ func (p *Postgres) InsertDeadLetter(ctx context.Context, id, notificationID, cha
 		&deadLetter.FinalError,
 		&deadLetter.DeadLetteredAt,
 		&deadLetter.ReplayedAt,
+		&deadLetter.ReplayAttemptID,
 	); err != nil {
 		return DeadLetter{}, wrapStoreError("insert dead letter", err)
 	}
@@ -688,7 +696,7 @@ func (p *Postgres) ListDeadLetters(ctx context.Context, limit int) ([]DeadLetter
 		limit = 100
 	}
 	const query = `
-		SELECT id, notification_id, channel, final_error, dead_lettered_at, replayed_at
+		SELECT id, notification_id, channel, final_error, dead_lettered_at, replayed_at, replay_attempt_id
 		FROM dead_letters
 		ORDER BY dead_lettered_at DESC
 		LIMIT $1
@@ -701,7 +709,7 @@ func (p *Postgres) ListDeadLetters(ctx context.Context, limit int) ([]DeadLetter
 	var deadLetters []DeadLetter
 	for rows.Next() {
 		var dl DeadLetter
-		if err := rows.Scan(&dl.ID, &dl.NotificationID, &dl.Channel, &dl.FinalError, &dl.DeadLetteredAt, &dl.ReplayedAt); err != nil {
+		if err := rows.Scan(&dl.ID, &dl.NotificationID, &dl.Channel, &dl.FinalError, &dl.DeadLetteredAt, &dl.ReplayedAt, &dl.ReplayAttemptID); err != nil {
 			return nil, fmt.Errorf("list dead letters: %w", err)
 		}
 		deadLetters = append(deadLetters, dl)
@@ -714,12 +722,12 @@ func (p *Postgres) ListDeadLetters(ctx context.Context, limit int) ([]DeadLetter
 
 func (p *Postgres) GetDeadLetterByID(ctx context.Context, id string) (DeadLetter, error) {
 	const query = `
-		SELECT id, notification_id, channel, final_error, dead_lettered_at, replayed_at
+		SELECT id, notification_id, channel, final_error, dead_lettered_at, replayed_at, replay_attempt_id
 		FROM dead_letters
 		WHERE id = $1
 	`
 	var dl DeadLetter
-	if err := p.DB.QueryRowContext(ctx, query, id).Scan(&dl.ID, &dl.NotificationID, &dl.Channel, &dl.FinalError, &dl.DeadLetteredAt, &dl.ReplayedAt); err != nil {
+	if err := p.DB.QueryRowContext(ctx, query, id).Scan(&dl.ID, &dl.NotificationID, &dl.Channel, &dl.FinalError, &dl.DeadLetteredAt, &dl.ReplayedAt, &dl.ReplayAttemptID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return DeadLetter{}, fmt.Errorf("get dead letter: %w", ErrNotFound)
 		}
@@ -736,13 +744,13 @@ func (p *Postgres) FinalizeDeadLetterReplay(ctx context.Context, deadLetterID, n
 	defer tx.Rollback()
 
 	const lockQuery = `
-		SELECT id, notification_id, channel, final_error, dead_lettered_at, replayed_at
+		SELECT id, notification_id, channel, final_error, dead_lettered_at, replayed_at, replay_attempt_id
 		FROM dead_letters
 		WHERE id = $1
 		FOR UPDATE
 	`
 	var dl DeadLetter
-	if err := tx.QueryRowContext(ctx, lockQuery, deadLetterID).Scan(&dl.ID, &dl.NotificationID, &dl.Channel, &dl.FinalError, &dl.DeadLetteredAt, &dl.ReplayedAt); err != nil {
+	if err := tx.QueryRowContext(ctx, lockQuery, deadLetterID).Scan(&dl.ID, &dl.NotificationID, &dl.Channel, &dl.FinalError, &dl.DeadLetteredAt, &dl.ReplayedAt, &dl.ReplayAttemptID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return ReplayDeadLetterResult{}, fmt.Errorf("finalize dead letter replay: %w", ErrNotFound)
 		}
@@ -763,7 +771,7 @@ func (p *Postgres) FinalizeDeadLetterReplay(ctx context.Context, deadLetterID, n
 			VALUES ($1, $2, $3, $4, 'pending')
 			RETURNING id, notification_id, channel, attempt_number, status, error_code, error_message, provider_message_id, last_error, next_retry_at, started_at, completed_at, sent_at, failed_at, created_at, updated_at
 		`, newAttemptID, dl.NotificationID, dl.Channel, attemptNumber).Scan(
-			&attempt.ID, &attempt.NotificationID, &attempt.Channel, &attempt.AttemptNumber, &attempt.Status, &attempt.ErrorCode, &attempt.ErrorMessage, &attempt.ProviderMessageID, &attempt.LastError, &attempt.NextRetryAt, &attempt.StartedAt, &attempt.CompletedAt, &attempt.SentAt, &attempt.FailedAt, &attempt.CreatedAt, &attempt.UpdatedAt,
+			&attempt.ID, &attempt.NotificationID, &attempt.Channel, &attempt.AttemptNumber, &attempt.Status, &attempt.ErrorCode, &attempt.ErrorMessage, &attempt.ProviderMessageID, &attempt.LastError, &attempt.NextRetryAt, &attempt.StartedAt, &attempt.CompletedAt, &attempt.SentAt, &attempt.FailedAt, &attempt.DispatchEnqueuedAt, &attempt.CreatedAt, &attempt.UpdatedAt,
 		); err != nil {
 			return ReplayDeadLetterResult{}, wrapStoreError("finalize dead letter replay", err)
 		}
@@ -845,7 +853,7 @@ func (p *Postgres) FinalizeRetryDispatch(ctx context.Context, scheduledAttemptID
 			VALUES ($1, $2, $3, $4, 'pending')
 			RETURNING id, notification_id, channel, attempt_number, status, error_code, error_message, provider_message_id, last_error, next_retry_at, started_at, completed_at, sent_at, failed_at, created_at, updated_at
 		`, newAttemptID, item.Attempt.NotificationID, item.Attempt.Channel, item.Attempt.AttemptNumber+1).Scan(
-			&attempt.ID, &attempt.NotificationID, &attempt.Channel, &attempt.AttemptNumber, &attempt.Status, &attempt.ErrorCode, &attempt.ErrorMessage, &attempt.ProviderMessageID, &attempt.LastError, &attempt.NextRetryAt, &attempt.StartedAt, &attempt.CompletedAt, &attempt.SentAt, &attempt.FailedAt, &attempt.CreatedAt, &attempt.UpdatedAt,
+			&attempt.ID, &attempt.NotificationID, &attempt.Channel, &attempt.AttemptNumber, &attempt.Status, &attempt.ErrorCode, &attempt.ErrorMessage, &attempt.ProviderMessageID, &attempt.LastError, &attempt.NextRetryAt, &attempt.StartedAt, &attempt.CompletedAt, &attempt.SentAt, &attempt.FailedAt, &attempt.DispatchEnqueuedAt, &attempt.CreatedAt, &attempt.UpdatedAt,
 		); err != nil {
 			return RetryDueAttempt{}, wrapStoreError("finalize retry dispatch", err)
 		}
@@ -865,14 +873,190 @@ func (p *Postgres) FinalizeRetryDispatch(ctx context.Context, scheduledAttemptID
 func getAttemptByIDTx(ctx context.Context, tx *sql.Tx, id string) (DeliveryAttempt, error) {
 	var attempt DeliveryAttempt
 	if err := tx.QueryRowContext(ctx, `
-		SELECT id, notification_id, channel, attempt_number, status, error_code, error_message, provider_message_id, last_error, next_retry_at, started_at, completed_at, sent_at, failed_at, created_at, updated_at
+		SELECT id, notification_id, channel, attempt_number, status, error_code, error_message, provider_message_id, last_error, next_retry_at, started_at, completed_at, sent_at, failed_at, dispatch_enqueued_at, created_at, updated_at
 		FROM delivery_attempts
 		WHERE id = $1
-	`, id).Scan(&attempt.ID, &attempt.NotificationID, &attempt.Channel, &attempt.AttemptNumber, &attempt.Status, &attempt.ErrorCode, &attempt.ErrorMessage, &attempt.ProviderMessageID, &attempt.LastError, &attempt.NextRetryAt, &attempt.StartedAt, &attempt.CompletedAt, &attempt.SentAt, &attempt.FailedAt, &attempt.CreatedAt, &attempt.UpdatedAt); err != nil {
+	`, id).Scan(&attempt.ID, &attempt.NotificationID, &attempt.Channel, &attempt.AttemptNumber, &attempt.Status, &attempt.ErrorCode, &attempt.ErrorMessage, &attempt.ProviderMessageID, &attempt.LastError, &attempt.NextRetryAt, &attempt.StartedAt, &attempt.CompletedAt, &attempt.SentAt, &attempt.FailedAt, &attempt.DispatchEnqueuedAt, &attempt.CreatedAt, &attempt.UpdatedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return DeliveryAttempt{}, ErrNotFound
 		}
 		return DeliveryAttempt{}, err
 	}
 	return attempt, nil
+}
+
+type PendingEnqueueAttempt struct {
+	Attempt      DeliveryAttempt
+	TenantID     string
+	DeadLetterID *string
+}
+
+func (p *Postgres) EnsureRetryAttempt(ctx context.Context, scheduledAttemptID, newAttemptID string) (RetryDueAttempt, error) {
+	tx, err := p.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return RetryDueAttempt{}, fmt.Errorf("ensure retry attempt: begin tx: %w", err)
+	}
+	defer tx.Rollback()
+	var item RetryDueAttempt
+	if err := tx.QueryRowContext(ctx, `
+		SELECT da.id, da.notification_id, da.channel, da.attempt_number, da.status, da.error_code, da.error_message, da.provider_message_id, da.last_error, da.next_retry_at, da.started_at, da.completed_at, da.sent_at, da.failed_at, da.dispatch_enqueued_at, da.created_at, da.updated_at, n.tenant_id
+		FROM delivery_attempts da
+		JOIN notifications n ON n.id = da.notification_id
+		WHERE da.id = $1
+		FOR UPDATE
+	`, scheduledAttemptID).Scan(&item.Attempt.ID, &item.Attempt.NotificationID, &item.Attempt.Channel, &item.Attempt.AttemptNumber, &item.Attempt.Status, &item.Attempt.ErrorCode, &item.Attempt.ErrorMessage, &item.Attempt.ProviderMessageID, &item.Attempt.LastError, &item.Attempt.NextRetryAt, &item.Attempt.StartedAt, &item.Attempt.CompletedAt, &item.Attempt.SentAt, &item.Attempt.FailedAt, &item.Attempt.DispatchEnqueuedAt, &item.Attempt.CreatedAt, &item.Attempt.UpdatedAt, &item.TenantID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return RetryDueAttempt{}, fmt.Errorf("ensure retry attempt: %w", ErrNotFound)
+		}
+		return RetryDueAttempt{}, fmt.Errorf("ensure retry attempt: %w", err)
+	}
+	item.NotificationID = item.Attempt.NotificationID
+	attempt, err := getAttemptByIDTx(ctx, tx, newAttemptID)
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		return RetryDueAttempt{}, fmt.Errorf("ensure retry attempt: get child: %w", err)
+	}
+	if errors.Is(err, ErrNotFound) {
+		if item.Attempt.Status != "retry_scheduled" || item.Attempt.NextRetryAt == nil || item.Attempt.NextRetryAt.After(time.Now().UTC()) {
+			return RetryDueAttempt{}, fmt.Errorf("ensure retry attempt: %w", ErrNotFound)
+		}
+		if err := tx.QueryRowContext(ctx, `
+			INSERT INTO delivery_attempts (id, notification_id, channel, attempt_number, status, dispatch_enqueued_at)
+			VALUES ($1, $2, $3, $4, 'pending', NULL)
+			RETURNING id, notification_id, channel, attempt_number, status, error_code, error_message, provider_message_id, last_error, next_retry_at, started_at, completed_at, sent_at, failed_at, dispatch_enqueued_at, created_at, updated_at
+		`, newAttemptID, item.Attempt.NotificationID, item.Attempt.Channel, item.Attempt.AttemptNumber+1).Scan(&attempt.ID, &attempt.NotificationID, &attempt.Channel, &attempt.AttemptNumber, &attempt.Status, &attempt.ErrorCode, &attempt.ErrorMessage, &attempt.ProviderMessageID, &attempt.LastError, &attempt.NextRetryAt, &attempt.StartedAt, &attempt.CompletedAt, &attempt.SentAt, &attempt.FailedAt, &attempt.DispatchEnqueuedAt, &attempt.CreatedAt, &attempt.UpdatedAt); err != nil {
+			return RetryDueAttempt{}, wrapStoreError("ensure retry attempt", err)
+		}
+	}
+	if item.Attempt.Status == "retry_scheduled" {
+		if _, err := tx.ExecContext(ctx, `UPDATE delivery_attempts SET status = 'failed', next_retry_at = NULL, updated_at = NOW() WHERE id = $1 AND status = 'retry_scheduled'`, scheduledAttemptID); err != nil {
+			return RetryDueAttempt{}, fmt.Errorf("ensure retry attempt: mark prior failed: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return RetryDueAttempt{}, fmt.Errorf("ensure retry attempt: commit: %w", err)
+	}
+	item.Attempt = attempt
+	return item, nil
+}
+
+func (p *Postgres) EnsureReplayAttempt(ctx context.Context, deadLetterID, newAttemptID string) (ReplayDeadLetterResult, error) {
+	tx, err := p.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return ReplayDeadLetterResult{}, fmt.Errorf("ensure replay attempt: begin tx: %w", err)
+	}
+	defer tx.Rollback()
+	var dl DeadLetter
+	if err := tx.QueryRowContext(ctx, `
+		SELECT id, notification_id, channel, final_error, dead_lettered_at, replayed_at, replay_attempt_id
+		FROM dead_letters
+		WHERE id = $1
+		FOR UPDATE
+	`, deadLetterID).Scan(&dl.ID, &dl.NotificationID, &dl.Channel, &dl.FinalError, &dl.DeadLetteredAt, &dl.ReplayedAt, &dl.ReplayAttemptID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ReplayDeadLetterResult{}, fmt.Errorf("ensure replay attempt: %w", ErrNotFound)
+		}
+		return ReplayDeadLetterResult{}, fmt.Errorf("ensure replay attempt: %w", err)
+	}
+	if dl.ReplayedAt != nil && dl.ReplayAttemptID != nil {
+		attempt, err := getAttemptByIDTx(ctx, tx, *dl.ReplayAttemptID)
+		if err != nil {
+			return ReplayDeadLetterResult{}, fmt.Errorf("ensure replay attempt: existing replay attempt: %w", err)
+		}
+		return ReplayDeadLetterResult{DeadLetter: dl, Attempt: attempt}, nil
+	}
+	attemptID := newAttemptID
+	if dl.ReplayAttemptID != nil {
+		attemptID = *dl.ReplayAttemptID
+	}
+	attempt, err := getAttemptByIDTx(ctx, tx, attemptID)
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		return ReplayDeadLetterResult{}, fmt.Errorf("ensure replay attempt: get attempt: %w", err)
+	}
+	if errors.Is(err, ErrNotFound) {
+		var attemptNumber int
+		if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(attempt_number), 0) + 1 FROM delivery_attempts WHERE notification_id = $1 AND channel = $2`, dl.NotificationID, dl.Channel).Scan(&attemptNumber); err != nil {
+			return ReplayDeadLetterResult{}, fmt.Errorf("ensure replay attempt: next attempt number: %w", err)
+		}
+		if err := tx.QueryRowContext(ctx, `
+			INSERT INTO delivery_attempts (id, notification_id, channel, attempt_number, status, dispatch_enqueued_at)
+			VALUES ($1, $2, $3, $4, 'pending', NULL)
+			RETURNING id, notification_id, channel, attempt_number, status, error_code, error_message, provider_message_id, last_error, next_retry_at, started_at, completed_at, sent_at, failed_at, dispatch_enqueued_at, created_at, updated_at
+		`, attemptID, dl.NotificationID, dl.Channel, attemptNumber).Scan(&attempt.ID, &attempt.NotificationID, &attempt.Channel, &attempt.AttemptNumber, &attempt.Status, &attempt.ErrorCode, &attempt.ErrorMessage, &attempt.ProviderMessageID, &attempt.LastError, &attempt.NextRetryAt, &attempt.StartedAt, &attempt.CompletedAt, &attempt.SentAt, &attempt.FailedAt, &attempt.DispatchEnqueuedAt, &attempt.CreatedAt, &attempt.UpdatedAt); err != nil {
+			return ReplayDeadLetterResult{}, wrapStoreError("ensure replay attempt", err)
+		}
+	}
+	if dl.ReplayAttemptID == nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE dead_letters SET replay_attempt_id = $2 WHERE id = $1 AND replay_attempt_id IS NULL`, deadLetterID, attempt.ID); err != nil {
+			return ReplayDeadLetterResult{}, fmt.Errorf("ensure replay attempt: set replay attempt id: %w", err)
+		}
+		dl.ReplayAttemptID = &attempt.ID
+	}
+	if err := tx.Commit(); err != nil {
+		return ReplayDeadLetterResult{}, fmt.Errorf("ensure replay attempt: commit: %w", err)
+	}
+	return ReplayDeadLetterResult{DeadLetter: dl, Attempt: attempt}, nil
+}
+
+func (p *Postgres) ListAttemptsPendingEnqueue(ctx context.Context, limit int) ([]PendingEnqueueAttempt, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := p.DB.QueryContext(ctx, `
+		SELECT da.id, da.notification_id, da.channel, da.attempt_number, da.status, da.error_code, da.error_message, da.provider_message_id, da.last_error, da.next_retry_at, da.started_at, da.completed_at, da.sent_at, da.failed_at, da.dispatch_enqueued_at, da.created_at, da.updated_at, n.tenant_id, dl.id
+		FROM delivery_attempts da
+		JOIN notifications n ON n.id = da.notification_id
+		LEFT JOIN dead_letters dl ON dl.replay_attempt_id = da.id
+		WHERE da.status = 'pending' AND da.dispatch_enqueued_at IS NULL
+		ORDER BY da.created_at ASC
+		LIMIT $1
+	`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list attempts pending enqueue: %w", err)
+	}
+	defer rows.Close()
+	var items []PendingEnqueueAttempt
+	for rows.Next() {
+		var item PendingEnqueueAttempt
+		if err := rows.Scan(&item.Attempt.ID, &item.Attempt.NotificationID, &item.Attempt.Channel, &item.Attempt.AttemptNumber, &item.Attempt.Status, &item.Attempt.ErrorCode, &item.Attempt.ErrorMessage, &item.Attempt.ProviderMessageID, &item.Attempt.LastError, &item.Attempt.NextRetryAt, &item.Attempt.StartedAt, &item.Attempt.CompletedAt, &item.Attempt.SentAt, &item.Attempt.FailedAt, &item.Attempt.DispatchEnqueuedAt, &item.Attempt.CreatedAt, &item.Attempt.UpdatedAt, &item.TenantID, &item.DeadLetterID); err != nil {
+			return nil, fmt.Errorf("list attempts pending enqueue: %w", err)
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list attempts pending enqueue: %w", err)
+	}
+	return items, nil
+}
+
+func (p *Postgres) MarkAttemptEnqueued(ctx context.Context, attemptID string) error {
+	result, err := p.DB.ExecContext(ctx, `UPDATE delivery_attempts SET dispatch_enqueued_at = COALESCE(dispatch_enqueued_at, NOW()), updated_at = NOW() WHERE id = $1`, attemptID)
+	if err != nil {
+		return fmt.Errorf("mark attempt enqueued: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("mark attempt enqueued: rows affected: %w", err)
+	}
+	if rows == 0 {
+		return fmt.Errorf("mark attempt enqueued: %w", ErrNotFound)
+	}
+	return nil
+}
+
+func (p *Postgres) FinalizeReplayEnqueue(ctx context.Context, deadLetterID, attemptID string) error {
+	tx, err := p.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("finalize replay enqueue: begin tx: %w", err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `UPDATE delivery_attempts SET dispatch_enqueued_at = COALESCE(dispatch_enqueued_at, NOW()), updated_at = NOW() WHERE id = $1`, attemptID); err != nil {
+		return fmt.Errorf("finalize replay enqueue: mark attempt enqueued: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE dead_letters SET replayed_at = COALESCE(replayed_at, NOW()) WHERE id = $1 AND replay_attempt_id = $2`, deadLetterID, attemptID); err != nil {
+		return fmt.Errorf("finalize replay enqueue: mark dead letter replayed: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("finalize replay enqueue: commit: %w", err)
+	}
+	return nil
 }

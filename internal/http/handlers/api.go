@@ -25,7 +25,8 @@ type apiStore interface {
 	CreateDeliveryAttempt(ctx context.Context, params store.CreateDeliveryAttemptParams) (store.DeliveryAttempt, error)
 	ListDeadLetters(ctx context.Context, limit int) ([]store.DeadLetter, error)
 	GetDeadLetterByID(ctx context.Context, id string) (store.DeadLetter, error)
-	FinalizeDeadLetterReplay(ctx context.Context, deadLetterID, newAttemptID string) (store.ReplayDeadLetterResult, error)
+	EnsureReplayAttempt(ctx context.Context, deadLetterID, newAttemptID string) (store.ReplayDeadLetterResult, error)
+	FinalizeReplayEnqueue(ctx context.Context, deadLetterID, attemptID string) error
 	GetNotificationByID(ctx context.Context, id string) (store.Notification, error)
 }
 
@@ -321,13 +322,25 @@ func (a *API) ReplayDeadLetter() http.HandlerFunc {
 			return
 		}
 		attemptID := replayAttemptID(deadLetterID)
-		job := queue.DispatchJob{JobID: generateID("job"), NotificationID: deadLetter.NotificationID, AttemptID: attemptID, TenantID: notification.TenantID, Channel: deadLetter.Channel, CreatedAt: time.Now().UTC()}
-		if err := a.queue.EnqueueDispatch(r.Context(), job); err != nil {
-			slog.Default().Error("replay enqueue failed; dead letter not marked replayed", slog.Any("error", err), slog.String("dead_letter_id", deadLetterID), slog.String("attempt_id", attemptID), slog.String("channel", deadLetter.Channel))
+		result, err := a.store.EnsureReplayAttempt(r.Context(), deadLetterID, attemptID)
+		if err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				writeError(w, http.StatusNotFound, "not_found", "dead letter not found")
+				return
+			}
 			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
 			return
 		}
-		result, err := a.store.FinalizeDeadLetterReplay(r.Context(), deadLetterID, attemptID)
+		job := queue.DispatchJob{JobID: generateID("job"), NotificationID: result.Attempt.NotificationID, AttemptID: result.Attempt.ID, TenantID: notification.TenantID, Channel: result.Attempt.Channel, CreatedAt: time.Now().UTC()}
+		if err := a.queue.EnqueueDispatch(r.Context(), job); err != nil {
+			slog.Default().Error("replay enqueue failed; attempt remains recoverable in postgres", slog.Any("error", err), slog.String("dead_letter_id", deadLetterID), slog.String("attempt_id", result.Attempt.ID), slog.String("channel", result.Attempt.Channel))
+			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
+			return
+		}
+		if err := a.store.FinalizeReplayEnqueue(r.Context(), deadLetterID, result.Attempt.ID); err != nil {
+			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
+			return
+		}
 		if err != nil {
 			if errors.Is(err, store.ErrNotFound) {
 				writeError(w, http.StatusNotFound, "not_found", "dead letter not found")

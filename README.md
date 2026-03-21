@@ -71,11 +71,12 @@ The current retry model is:
 1. the active attempt starts as `pending`
 2. a worker marks it `in_progress`
 3. on transient failure, the same attempt is marked `retry_scheduled` with `next_retry_at`
-4. the retry worker later converts that scheduled row into a historical failed attempt and creates a fresh `pending` attempt with `attempt_number + 1`
-5. the retry worker republishes a new dispatch job for the fresh attempt
-6. once the retry budget is exhausted, the final attempt is marked `dead_lettered` and a `dead_letters` row is inserted
+4. when the retry worker picks up a due retry, it first creates the next attempt durably in PostgreSQL with enqueue still pending
+5. the retry worker then enqueues Redis work only for that already-durable attempt and marks it enqueued after success
+6. if Redis is unavailable, the attempt remains pending enqueue in PostgreSQL and is retried later
+7. once the retry budget is exhausted, the final attempt is marked `dead_lettered` and a `dead_letters` row is inserted
 
-This keeps the history inspectable without introducing a full outbox or lease framework.
+Replay uses the same model: the replay attempt is created durably first, the dead letter is only marked replayed after enqueue succeeds, and failed enqueue work remains recoverable from PostgreSQL. This keeps the history inspectable without introducing a full generalized outbox or lease framework.
 
 ## Queue Recovery Behavior
 
