@@ -19,6 +19,7 @@ type fakeAPIStore struct {
 	attempt               store.DeliveryAttempt
 	notification          store.Notification
 	ensureCalls           int
+	ensureInitialCalls    int
 	markEnqueuedCalls     int
 	createAttemptCalls    int
 	createNotifyCalls     int
@@ -33,6 +34,8 @@ type fakeAPIStore struct {
 	fallbackExisting      *store.Notification
 	lookupCalls           int
 	fallbackAfterLookup   int
+	initialAttemptMissing bool
+	ensureInitialErr      error
 }
 
 func (f *fakeAPIStore) CreateTenant(context.Context, store.CreateTenantParams) (store.Tenant, error) {
@@ -76,6 +79,9 @@ func (f *fakeAPIStore) CreateNotification(_ context.Context, params store.Create
 }
 
 func (f *fakeAPIStore) GetInitialAttemptByNotificationID(_ context.Context, notificationID string) (store.DeliveryAttempt, error) {
+	if f.initialAttemptMissing {
+		return store.DeliveryAttempt{}, store.ErrNotFound
+	}
 	if f.createdAttempt != nil && f.createdAttempt.NotificationID == notificationID {
 		attempt := store.DeliveryAttempt{ID: f.createdAttempt.ID, NotificationID: notificationID, Channel: f.createdAttempt.Channel, AttemptNumber: f.createdAttempt.AttemptNumber, Status: f.createdAttempt.Status, EnqueueKind: f.createdAttempt.EnqueueKind}
 		if f.markEnqueuedCalls > 0 {
@@ -85,6 +91,20 @@ func (f *fakeAPIStore) GetInitialAttemptByNotificationID(_ context.Context, noti
 		return attempt, nil
 	}
 	return store.DeliveryAttempt{}, store.ErrNotFound
+}
+
+func (f *fakeAPIStore) EnsureInitialAttempt(_ context.Context, notificationID, channel, attemptID string) (store.DeliveryAttempt, error) {
+	f.ensureInitialCalls++
+	if f.ensureInitialErr != nil {
+		return store.DeliveryAttempt{}, f.ensureInitialErr
+	}
+	if f.createdAttempt == nil || f.createdAttempt.NotificationID != notificationID {
+		params := store.CreateDeliveryAttemptParams{ID: attemptID, NotificationID: notificationID, Channel: channel, AttemptNumber: 1, Status: "pending", EnqueueKind: "initial"}
+		f.createAttemptCalls++
+		f.createdAttempt = &params
+	}
+	f.initialAttemptMissing = false
+	return f.GetInitialAttemptByNotificationID(context.Background(), notificationID)
 }
 func (f *fakeAPIStore) CreateDeliveryAttempt(_ context.Context, params store.CreateDeliveryAttemptParams) (store.DeliveryAttempt, error) {
 	f.createAttemptCalls++
@@ -232,6 +252,9 @@ func TestCreateNotificationMarksInitialAttemptEnqueued(t *testing.T) {
 	if st.createdAttempt == nil || st.createdAttempt.EnqueueKind != "initial" {
 		t.Fatalf("createdAttempt=%+v", st.createdAttempt)
 	}
+	if st.ensureInitialCalls != 1 {
+		t.Fatalf("ensureInitialCalls=%d", st.ensureInitialCalls)
+	}
 	if st.markEnqueuedCalls != 1 {
 		t.Fatalf("markEnqueuedCalls=%d", st.markEnqueuedCalls)
 	}
@@ -271,6 +294,9 @@ func TestIdempotentRetryRecoversPendingInitialAttempt(t *testing.T) {
 	if st.createAttemptCalls != 1 {
 		t.Fatalf("createAttemptCalls=%d", st.createAttemptCalls)
 	}
+	if st.ensureInitialCalls != 1 {
+		t.Fatalf("ensureInitialCalls=%d", st.ensureInitialCalls)
+	}
 	if st.markEnqueuedCalls != 1 {
 		t.Fatalf("markEnqueuedCalls=%d", st.markEnqueuedCalls)
 	}
@@ -309,8 +335,109 @@ func TestIdempotentConflictRecoversPendingInitialAttempt(t *testing.T) {
 	if st.createAttemptCalls != 1 {
 		t.Fatalf("createAttemptCalls=%d", st.createAttemptCalls)
 	}
+	if st.ensureInitialCalls != 1 {
+		t.Fatalf("ensureInitialCalls=%d", st.ensureInitialCalls)
+	}
 	if st.markEnqueuedCalls != 1 {
 		t.Fatalf("markEnqueuedCalls=%d", st.markEnqueuedCalls)
+	}
+	if len(q.jobs) != 1 {
+		t.Fatalf("jobs=%d", len(q.jobs))
+	}
+}
+
+func TestIdempotentRetryRepairsMissingInitialAttempt(t *testing.T) {
+	st, q, api := newDeadLetterTestAPI()
+	key := "stable-key"
+	existing := store.Notification{ID: "notif-1", TenantID: "tenant-1", TemplateID: "tpl-1"}
+	st.existingByKey = map[string]store.Notification{"tenant-1/" + key: existing}
+	st.initialAttemptMissing = true
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/notifications", bytes.NewReader([]byte(`{"id":"notif-2","tenant_id":"tenant-1","template_id":"tpl-1","recipient_email":"user@example.test","variables":{},"idempotency_key":"`+key+`"}`)))
+	req.Header.Set("Content-Type", "application/json")
+	res := httptest.NewRecorder()
+	api.CreateNotification().ServeHTTP(res, req)
+	if res.Code != http.StatusAccepted {
+		t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
+	}
+	if st.createNotifyCalls != 0 {
+		t.Fatalf("createNotifyCalls=%d", st.createNotifyCalls)
+	}
+	if st.ensureInitialCalls != 1 {
+		t.Fatalf("ensureInitialCalls=%d", st.ensureInitialCalls)
+	}
+	if st.createAttemptCalls != 1 {
+		t.Fatalf("createAttemptCalls=%d", st.createAttemptCalls)
+	}
+	if st.createdAttempt == nil || st.createdAttempt.NotificationID != "notif-1" {
+		t.Fatalf("createdAttempt=%+v", st.createdAttempt)
+	}
+	if len(q.jobs) != 1 || q.jobs[0].AttemptID != st.createdAttempt.ID {
+		t.Fatalf("jobs=%+v createdAttempt=%+v", q.jobs, st.createdAttempt)
+	}
+}
+
+func TestIdempotentRetryReturnsExistingNotificationWhenInitialAlreadyEnqueued(t *testing.T) {
+	st, q, api := newDeadLetterTestAPI()
+	key := "stable-key"
+	existing := store.Notification{ID: "notif-1", TenantID: "tenant-1", TemplateID: "tpl-1"}
+	st.existingByKey = map[string]store.Notification{"tenant-1/" + key: existing}
+	st.createdAttempt = &store.CreateDeliveryAttemptParams{ID: "attempt-1", NotificationID: "notif-1", Channel: "email", AttemptNumber: 1, Status: "pending", EnqueueKind: "initial"}
+	st.markEnqueuedCalls = 1
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/notifications", bytes.NewReader([]byte(`{"id":"notif-2","tenant_id":"tenant-1","template_id":"tpl-1","recipient_email":"user@example.test","variables":{},"idempotency_key":"`+key+`"}`)))
+	req.Header.Set("Content-Type", "application/json")
+	res := httptest.NewRecorder()
+	api.CreateNotification().ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
+	}
+	if st.ensureInitialCalls != 0 {
+		t.Fatalf("ensureInitialCalls=%d", st.ensureInitialCalls)
+	}
+	if st.createNotifyCalls != 0 {
+		t.Fatalf("createNotifyCalls=%d", st.createNotifyCalls)
+	}
+	if len(q.jobs) != 0 {
+		t.Fatalf("jobs=%d", len(q.jobs))
+	}
+}
+
+func TestSecondIdempotentRequestRepairsMissingInitialAttemptAfterEnsureFailure(t *testing.T) {
+	st, q, api := newDeadLetterTestAPI()
+	key := "stable-key"
+	st.ensureInitialErr = errors.New("db blip")
+	first := httptest.NewRequest(http.MethodPost, "/v1/notifications", bytes.NewReader([]byte(`{"id":"notif-1","tenant_id":"tenant-1","template_id":"tpl-1","recipient_email":"user@example.test","variables":{},"idempotency_key":"`+key+`"}`)))
+	first.Header.Set("Content-Type", "application/json")
+	firstRes := httptest.NewRecorder()
+	api.CreateNotification().ServeHTTP(firstRes, first)
+	if firstRes.Code != http.StatusInternalServerError {
+		t.Fatalf("first status=%d body=%s", firstRes.Code, firstRes.Body.String())
+	}
+	if st.createNotifyCalls != 1 {
+		t.Fatalf("createNotifyCalls=%d", st.createNotifyCalls)
+	}
+	if st.createAttemptCalls != 0 {
+		t.Fatalf("createAttemptCalls=%d", st.createAttemptCalls)
+	}
+
+	st.ensureInitialErr = nil
+	st.initialAttemptMissing = true
+	second := httptest.NewRequest(http.MethodPost, "/v1/notifications", bytes.NewReader([]byte(`{"id":"notif-2","tenant_id":"tenant-1","template_id":"tpl-1","recipient_email":"user@example.test","variables":{},"idempotency_key":"`+key+`"}`)))
+	second.Header.Set("Content-Type", "application/json")
+	secondRes := httptest.NewRecorder()
+	api.CreateNotification().ServeHTTP(secondRes, second)
+	if secondRes.Code != http.StatusAccepted {
+		t.Fatalf("second status=%d body=%s", secondRes.Code, secondRes.Body.String())
+	}
+	if st.createNotifyCalls != 1 {
+		t.Fatalf("createNotifyCalls=%d", st.createNotifyCalls)
+	}
+	if st.ensureInitialCalls != 2 {
+		t.Fatalf("ensureInitialCalls=%d", st.ensureInitialCalls)
+	}
+	if st.createAttemptCalls != 1 {
+		t.Fatalf("createAttemptCalls=%d", st.createAttemptCalls)
 	}
 	if len(q.jobs) != 1 {
 		t.Fatalf("jobs=%d", len(q.jobs))

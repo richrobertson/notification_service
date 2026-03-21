@@ -22,6 +22,7 @@ type apiStore interface {
 	GetTemplateByID(ctx context.Context, id string) (store.Template, error)
 	GetNotificationByTenantAndIdempotencyKey(ctx context.Context, tenantID, idempotencyKey string) (store.Notification, error)
 	GetInitialAttemptByNotificationID(ctx context.Context, notificationID string) (store.DeliveryAttempt, error)
+	EnsureInitialAttempt(ctx context.Context, notificationID, channel, attemptID string) (store.DeliveryAttempt, error)
 	CreateNotification(ctx context.Context, params store.CreateNotificationParams) (store.Notification, error)
 	CreateDeliveryAttempt(ctx context.Context, params store.CreateDeliveryAttemptParams) (store.DeliveryAttempt, error)
 	MarkAttemptEnqueued(ctx context.Context, attemptID string) error
@@ -70,15 +71,20 @@ func NewAPI(store apiStore, redisQueue dispatchQueue) *API {
 	return &API{store: store, queue: redisQueue}
 }
 
-func (a *API) recoverPendingInitialAttempt(ctx context.Context, w http.ResponseWriter, existing store.Notification) {
+func (a *API) ensureAndEnqueueInitialAttempt(ctx context.Context, w http.ResponseWriter, existing store.Notification, channel string) {
 	attempt, attemptErr := a.store.GetInitialAttemptByNotificationID(ctx, existing.ID)
 	if attemptErr != nil {
 		if errors.Is(attemptErr, store.ErrNotFound) {
-			writeJSON(w, http.StatusOK, existing)
+			slog.Default().Warn("existing notification found without initial attempt; creating missing initial attempt", slog.String("notification_id", existing.ID), slog.String("channel", channel))
+			attempt, attemptErr = a.store.EnsureInitialAttempt(ctx, existing.ID, channel, generateID("attempt"))
+			if attemptErr != nil {
+				writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
+				return
+			}
+		} else {
+			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
 			return
 		}
-		writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
-		return
 	}
 	if attempt.DispatchEnqueuedAt != nil {
 		writeJSON(w, http.StatusOK, existing)
@@ -201,17 +207,6 @@ func (a *API) CreateNotification() http.HandlerFunc {
 			writeError(w, http.StatusBadRequest, "bad_request", "template_id is required")
 			return
 		}
-		if req.IdempotencyKey != "" {
-			existing, err := a.store.GetNotificationByTenantAndIdempotencyKey(r.Context(), req.TenantID, req.IdempotencyKey)
-			if err == nil {
-				a.recoverPendingInitialAttempt(r.Context(), w, existing)
-				return
-			}
-			if !errors.Is(err, store.ErrNotFound) {
-				writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
-				return
-			}
-		}
 		if _, err := a.store.GetTenantByID(r.Context(), req.TenantID); err != nil {
 			if errors.Is(err, store.ErrNotFound) {
 				writeError(w, http.StatusNotFound, "not_found", "tenant not found")
@@ -250,6 +245,17 @@ func (a *API) CreateNotification() http.HandlerFunc {
 			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
 			return
 		}
+		if req.IdempotencyKey != "" {
+			existing, err := a.store.GetNotificationByTenantAndIdempotencyKey(r.Context(), req.TenantID, req.IdempotencyKey)
+			if err == nil {
+				a.ensureAndEnqueueInitialAttempt(r.Context(), w, existing, template.Channel)
+				return
+			}
+			if !errors.Is(err, store.ErrNotFound) {
+				writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
+				return
+			}
+		}
 		params := store.CreateNotificationParams{ID: req.ID, TenantID: req.TenantID, TemplateID: req.TemplateID, Variables: req.Variables}
 		if req.IdempotencyKey != "" {
 			params.IdempotencyKey = &req.IdempotencyKey
@@ -265,7 +271,7 @@ func (a *API) CreateNotification() http.HandlerFunc {
 			if req.IdempotencyKey != "" && store.IsConflict(err) {
 				existing, lookupErr := a.store.GetNotificationByTenantAndIdempotencyKey(r.Context(), req.TenantID, req.IdempotencyKey)
 				if lookupErr == nil {
-					a.recoverPendingInitialAttempt(r.Context(), w, existing)
+					a.ensureAndEnqueueInitialAttempt(r.Context(), w, existing, template.Channel)
 					return
 				}
 			}
@@ -277,10 +283,9 @@ func (a *API) CreateNotification() http.HandlerFunc {
 			return
 		}
 
-		attemptID := generateID("attempt")
-		attempt, err := a.store.CreateDeliveryAttempt(r.Context(), store.CreateDeliveryAttemptParams{ID: attemptID, NotificationID: notification.ID, Channel: template.Channel, AttemptNumber: 1, Status: "pending", EnqueueKind: "initial"})
+		attempt, err := a.store.EnsureInitialAttempt(r.Context(), notification.ID, template.Channel, generateID("attempt"))
 		if err != nil {
-			slog.Default().Error("failed to create delivery attempt", slog.Any("error", err), slog.String("notification_id", notification.ID), slog.String("attempt_id", attemptID), slog.String("channel", template.Channel))
+			slog.Default().Error("failed to ensure initial delivery attempt", slog.Any("error", err), slog.String("notification_id", notification.ID), slog.String("channel", template.Channel))
 			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
 			return
 		}

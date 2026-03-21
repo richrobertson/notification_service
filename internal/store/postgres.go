@@ -456,6 +456,39 @@ func (p *Postgres) GetInitialAttemptByNotificationID(ctx context.Context, notifi
 	return attempt, nil
 }
 
+func (p *Postgres) EnsureInitialAttempt(ctx context.Context, notificationID, channel, attemptID string) (DeliveryAttempt, error) {
+	const insertQuery = `
+		INSERT INTO delivery_attempts (
+			id,
+			notification_id,
+			channel,
+			attempt_number,
+			status,
+			dispatch_enqueued_at,
+			enqueue_kind
+		)
+		VALUES ($1, $2, $3, 1, 'pending', NULL, 'initial')
+		ON CONFLICT (notification_id, channel, attempt_number) DO NOTHING
+	`
+	if _, err := p.DB.ExecContext(ctx, insertQuery, attemptID, notificationID, channel); err != nil {
+		return DeliveryAttempt{}, wrapStoreError("ensure initial attempt", err)
+	}
+	const selectQuery = `
+		SELECT id, notification_id, channel, attempt_number, status, error_code, error_message, provider_message_id, last_error, next_retry_at, started_at, completed_at, sent_at, failed_at, dispatch_enqueued_at, enqueue_kind, created_at, updated_at
+		FROM delivery_attempts
+		WHERE notification_id = $1 AND channel = $2 AND attempt_number = 1
+		LIMIT 1
+	`
+	var attempt DeliveryAttempt
+	if err := p.DB.QueryRowContext(ctx, selectQuery, notificationID, channel).Scan(&attempt.ID, &attempt.NotificationID, &attempt.Channel, &attempt.AttemptNumber, &attempt.Status, &attempt.ErrorCode, &attempt.ErrorMessage, &attempt.ProviderMessageID, &attempt.LastError, &attempt.NextRetryAt, &attempt.StartedAt, &attempt.CompletedAt, &attempt.SentAt, &attempt.FailedAt, &attempt.DispatchEnqueuedAt, &attempt.EnqueueKind, &attempt.CreatedAt, &attempt.UpdatedAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return DeliveryAttempt{}, fmt.Errorf("ensure initial attempt: %w", ErrNotFound)
+		}
+		return DeliveryAttempt{}, fmt.Errorf("ensure initial attempt: %w", err)
+	}
+	return attempt, nil
+}
+
 func (p *Postgres) CreateDeliveryAttempt(ctx context.Context, params CreateDeliveryAttemptParams) (DeliveryAttempt, error) {
 	const query = `
 		INSERT INTO delivery_attempts (
