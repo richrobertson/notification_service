@@ -86,10 +86,6 @@ func (a *API) recordAudit(ctx context.Context, tenantID, actor, action, resource
 	}
 }
 
-func (a *API) refreshNotificationStatus(ctx context.Context, notificationID string) error {
-	return a.store.RecalculateNotificationStatus(ctx, notificationID)
-}
-
 func (a *API) ensureAndEnqueueInitialAttempt(ctx context.Context, w http.ResponseWriter, existing store.Notification) {
 	template, err := a.store.GetTemplateByID(ctx, existing.TemplateID)
 	if err != nil {
@@ -317,11 +313,6 @@ func (a *API) CreateNotification() http.HandlerFunc {
 			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
 			return
 		}
-		if err := a.refreshNotificationStatus(r.Context(), notification.ID); err != nil {
-			slog.Default().Error("failed to recalculate notification status after ensuring initial attempt", slog.Any("error", err), slog.String("notification_id", notification.ID), slog.String("attempt_id", attempt.ID))
-			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
-			return
-		}
 
 		job := queue.DispatchJob{JobID: generateID("job"), NotificationID: notification.ID, AttemptID: attempt.ID, TenantID: notification.TenantID, Channel: template.Channel, CreatedAt: time.Now().UTC()}
 		if err := a.queue.EnqueueDispatch(r.Context(), job); err != nil {
@@ -403,11 +394,6 @@ func (a *API) ReplayDeadLetter() http.HandlerFunc {
 				writeError(w, http.StatusNotFound, "not_found", "dead letter not found")
 				return
 			}
-			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
-			return
-		}
-		if err := a.refreshNotificationStatus(r.Context(), result.Attempt.NotificationID); err != nil {
-			slog.Default().Error("failed to recalculate notification status after ensuring replay attempt", slog.Any("error", err), slog.String("notification_id", result.Attempt.NotificationID), slog.String("attempt_id", result.Attempt.ID), slog.String("dead_letter_id", deadLetterID))
 			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
 			return
 		}

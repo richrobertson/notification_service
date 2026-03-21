@@ -114,11 +114,11 @@ func (f *fakeAPIStore) EnsureInitialAttempt(_ context.Context, notificationID, c
 		f.createdAttempt = &params
 		f.notification.ID = notificationID
 		f.notification.Status = "processing"
-		f.recalculateCalls++
-		f.recalculatedIDs = append(f.recalculatedIDs, notificationID)
-		if f.recalculateErr != nil {
-			return store.DeliveryAttempt{}, f.recalculateErr
-		}
+	}
+	f.recalculateCalls++
+	f.recalculatedIDs = append(f.recalculatedIDs, notificationID)
+	if f.recalculateErr != nil {
+		return store.DeliveryAttempt{}, f.recalculateErr
 	}
 	f.initialAttemptMissing = false
 	return f.GetInitialAttemptByNotificationID(context.Background(), notificationID)
@@ -396,6 +396,7 @@ func TestReplayDeadLetterUpdatesInspectionStatusWhenReplayAttemptIsPending(t *te
 	}
 	if payload.Notification.Status != "processing" {
 		t.Fatalf("notification status=%q", payload.Notification.Status)
+	}
 	assertNotificationInspectionStatus(t, api, "notif-1", "processing")
 }
 
@@ -433,9 +434,6 @@ func TestCreateNotificationMarksInitialAttemptEnqueued(t *testing.T) {
 		t.Fatalf("markEnqueuedCalls=%d", st.markEnqueuedCalls)
 	}
 	assertStatusRefresh(t, st, "notif-1")
-	if st.recalculateCalls != 1 || len(st.recalculatedIDs) != 1 || st.recalculatedIDs[0] != "notif-1" {
-		t.Fatalf("recalculateCalls=%d recalculatedIDs=%v", st.recalculateCalls, st.recalculatedIDs)
-	}
 	if len(q.jobs) != 1 {
 		t.Fatalf("jobs=%d", len(q.jobs))
 	}
