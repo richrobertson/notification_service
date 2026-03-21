@@ -58,28 +58,45 @@ func run(appName, queueName string, svcFactory func(config.Config, *store.Postgr
 		logger.Error("failed to initialize delivery service", slog.Any("error", err))
 		os.Exit(1)
 	}
-	logger.Info("starting worker", slog.String("queue", queueName))
+	logger.Info("starting worker", slog.String("queue", queueName), slog.String("processing_queue", queue.ProcessingQueueName(queueName)))
 	for {
-		job, err := redisQueue.ConsumeChannel(ctx, queueName, int(cfg.QueueBlockTimeout/time.Second))
+		reserved, err := redisQueue.ReserveChannel(ctx, queueName, int(cfg.QueueBlockTimeout/time.Second))
 		if err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
 				logger.Info("worker shutdown complete", slog.String("queue", queueName))
 				return
 			}
-			logger.Error("failed to consume worker job", slog.Any("error", err), slog.String("queue", queueName))
+			logger.Error("failed to reserve worker job", slog.Any("error", err), slog.String("queue", queueName))
 			time.Sleep(time.Second)
 			continue
 		}
+		job := reserved.Job
 		logger.Info("received worker job", slog.String("job_id", job.JobID), slog.String("notification_id", job.NotificationID), slog.String("attempt_id", job.AttemptID), slog.String("channel", job.Channel), slog.String("queue", queueName))
 		var processErr error
 		switch queueName {
 		case queue.DispatchWebhookQueueName:
-			processErr = svc.ProcessWebhook(ctx, job)
+			_, processErr = svc.ProcessWebhook(ctx, job)
 		default:
 			processErr = errors.New("unsupported worker queue")
 		}
 		if processErr != nil {
-			logger.Error("worker job failed", slog.Any("error", processErr), slog.String("job_id", job.JobID), slog.String("notification_id", job.NotificationID), slog.String("attempt_id", job.AttemptID), slog.String("channel", job.Channel), slog.String("queue", queueName))
+			if delivery.IsTerminal(processErr) {
+				if ackErr := redisQueue.AckReserved(ctx, reserved); ackErr != nil {
+					logger.Error("worker terminal failure but ack failed; preserving job for retry", slog.Any("error", ackErr), slog.String("job_id", job.JobID), slog.String("attempt_id", job.AttemptID), slog.String("queue", queueName))
+					continue
+				}
+				logger.Warn("worker job reached terminal failed state", slog.Any("error", processErr), slog.String("job_id", job.JobID), slog.String("notification_id", job.NotificationID), slog.String("attempt_id", job.AttemptID), slog.String("channel", job.Channel), slog.String("queue", queueName))
+				continue
+			}
+			if requeueErr := redisQueue.RequeueReserved(ctx, reserved); requeueErr != nil {
+				logger.Error("worker transient failure and requeue failed; job left in processing queue", slog.Any("error", requeueErr), slog.String("job_id", job.JobID), slog.String("attempt_id", job.AttemptID), slog.String("queue", queueName))
+				continue
+			}
+			logger.Error("worker job failed transiently and was requeued", slog.Any("error", processErr), slog.String("job_id", job.JobID), slog.String("notification_id", job.NotificationID), slog.String("attempt_id", job.AttemptID), slog.String("channel", job.Channel), slog.String("queue", queueName))
+			continue
+		}
+		if err := redisQueue.AckReserved(ctx, reserved); err != nil {
+			logger.Error("worker job completed but ack failed; preserving job for retry", slog.Any("error", err), slog.String("job_id", job.JobID), slog.String("attempt_id", job.AttemptID), slog.String("queue", queueName))
 			continue
 		}
 		logger.Info("worker job completed", slog.String("job_id", job.JobID), slog.String("notification_id", job.NotificationID), slog.String("attempt_id", job.AttemptID), slog.String("channel", job.Channel), slog.String("queue", queueName))

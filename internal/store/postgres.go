@@ -20,6 +20,10 @@ type Postgres struct {
 	DB *sql.DB
 }
 
+func touchUpdatedAtSetClause() string {
+	return "updated_at = NOW()"
+}
+
 type Tenant struct {
 	ID         string    `json:"id"`
 	Name       string    `json:"name"`
@@ -533,10 +537,30 @@ func (p *Postgres) GetDeliveryAttemptByID(ctx context.Context, id string) (Deliv
 	return attempt, nil
 }
 
+func (p *Postgres) MarkAttemptInProgress(ctx context.Context, attemptID string) error {
+	const query = `
+		UPDATE delivery_attempts
+		SET status = 'in_progress', started_at = COALESCE(started_at, NOW()), completed_at = NULL, updated_at = NOW()
+		WHERE id = $1 AND status IN ('pending', 'in_progress')
+	`
+	result, err := p.DB.ExecContext(ctx, query, attemptID)
+	if err != nil {
+		return fmt.Errorf("mark attempt in progress: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("mark attempt in progress: rows affected: %w", err)
+	}
+	if rows == 0 {
+		return fmt.Errorf("mark attempt in progress: %w", ErrNotFound)
+	}
+	return nil
+}
+
 func (p *Postgres) MarkAttemptSent(ctx context.Context, attemptID string, providerMessageID *string) error {
 	const query = `
 		UPDATE delivery_attempts
-		SET status = 'sent', provider_message_id = $2, last_error = NULL, error_message = NULL, sent_at = NOW(), failed_at = NULL, completed_at = NOW()
+		SET status = 'sent', provider_message_id = $2, last_error = NULL, error_message = NULL, sent_at = NOW(), failed_at = NULL, completed_at = NOW(), updated_at = NOW()
 		WHERE id = $1
 	`
 	result, err := p.DB.ExecContext(ctx, query, attemptID, providerMessageID)
@@ -556,7 +580,7 @@ func (p *Postgres) MarkAttemptSent(ctx context.Context, attemptID string, provid
 func (p *Postgres) MarkAttemptFailed(ctx context.Context, attemptID string, lastError string) error {
 	const query = `
 		UPDATE delivery_attempts
-		SET status = 'failed', last_error = $2, error_message = $2, provider_message_id = NULL, failed_at = NOW(), completed_at = NOW()
+		SET status = 'failed', last_error = $2, error_message = $2, provider_message_id = NULL, failed_at = NOW(), completed_at = NOW(), updated_at = NOW()
 		WHERE id = $1
 	`
 	result, err := p.DB.ExecContext(ctx, query, attemptID, lastError)

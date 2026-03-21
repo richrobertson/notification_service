@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-`notification_service` is a runnable Go foundation for a multi-tenant notification platform. Stage 4 adds real channel delivery workers while deliberately keeping delivery guarantees simple and limited.
+`notification_service` is a runnable Go foundation for a multi-tenant notification platform. Stage 4 adds real channel delivery workers while deliberately keeping delivery guarantees simple and limited. This hardening patch makes the current worker flow more operationally honest without expanding into Stage 5 retry or replay features.
 
 The service currently provides:
 
@@ -35,10 +35,10 @@ Implemented in this stage:
 - dispatcher routing to channel queues:
   - `notify:dispatch:webhook`
   - `notify:dispatch:email`
-- webhook worker consumption from `notify:dispatch:webhook`
-- email worker consumption from `notify:dispatch:email`
+- webhook worker consumption from `notify:dispatch:webhook` with reserve/ack via `notify:dispatch:webhook:processing`
+- email worker consumption from `notify:dispatch:email` with reserve/ack via `notify:dispatch:email:processing`
 - template rendering with deterministic missing-variable failures
-- delivery attempt finalization to `sent` or `failed`
+- delivery attempt lifecycle transitions from `pending` to `in_progress` to terminal `sent` or `failed`
 - storage of delivery timestamps, provider message id, and concise delivery errors
 - request logging and panic recovery middleware
 - idempotent notification submission when `idempotency_key` is provided
@@ -68,15 +68,40 @@ Current request flow:
 7. Dispatcher republishes the same job to either `notify:dispatch:webhook` or `notify:dispatch:email`
 8. A channel worker loads the notification, template, and delivery attempt from PostgreSQL
 9. The worker renders the outbound payload and performs real delivery
-10. The worker updates `delivery_attempts` to `sent` or `failed`
+10. The worker marks the attempt `in_progress` once work begins
+11. On durable success the worker ACKs the reserved Redis job and marks `delivery_attempts` as `sent`
+12. On durable terminal failure the worker ACKs the reserved Redis job and marks `delivery_attempts` as `failed`
+13. On transient persistence or processing interruption the worker requeues the reserved job instead of silently losing it
 
 Important honesty notes:
 
 - The API still does **not** push directly to channel queues.
 - Workers currently process one job at a time in a simple loop.
-- Malformed queue jobs are logged and skipped; there is no retry or dead-letter path yet.
+- Workers now reserve jobs into per-channel processing queues before attempting delivery so transient DB/update failures do not silently drop work.
+- Malformed queue jobs can still strand a reserved entry in the processing queue and require operator cleanup; there is no automated recovery sweeper yet.
 - PostgreSQL writes and Redis enqueue are **not** yet coordinated with an outbox pattern, so DB/queue atomicity is not yet hardened.
+- Reserved in-flight jobs are safer than destructive pops, but a worker crash can still leave a job sitting in `*:processing` until an operator or a future recovery loop moves it back.
 - Delivery completion is tracked on `delivery_attempts`; broader notification rollup state is intentionally still simple.
+
+
+## Stage 4 Hardening Guarantees
+
+What Stage 4 now guarantees:
+
+- a worker does not remove a channel job from Redis until it has durably recorded either `sent` or terminal `failed`, or explicitly requeued the job after a transient processing failure
+- attempts move to `in_progress` when a worker begins meaningful work
+- terminal failures such as missing recipients, template rendering errors, webhook failures, and SMTP delivery failures are recorded as `failed`
+- transient infrastructure failures such as PostgreSQL load/update failures cause the job to remain recoverable instead of being silently lost
+- fresh database migration from scratch does not rely on an externally pre-created `set_updated_at()` helper
+
+What Stage 4 still does **not** guarantee:
+
+- no retries, retry scheduling, DLQ routing, replay APIs, or provider failover yet
+- no automated recovery of jobs left behind in `*:processing` after a worker crash
+- no outbox-style atomicity between PostgreSQL writes and Redis enqueue
+- no exactly-once delivery semantics
+
+These remain future Stage 5 concerns.
 
 ## Current Endpoints
 
@@ -95,6 +120,9 @@ Redis list queues used in Stage 4:
 - channel queues:
   - `notify:dispatch:webhook`
   - `notify:dispatch:email`
+- processing queues used by workers while a job is reserved:
+  - `notify:dispatch:webhook:processing`
+  - `notify:dispatch:email:processing`
 
 Dispatch job envelope fields:
 
