@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -14,9 +15,27 @@ import (
 	"github.com/richrobertson/notification-platform/internal/store"
 )
 
+type apiStore interface {
+	CreateTenant(ctx context.Context, params store.CreateTenantParams) (store.Tenant, error)
+	GetTenantByID(ctx context.Context, id string) (store.Tenant, error)
+	CreateTemplate(ctx context.Context, params store.CreateTemplateParams) (store.Template, error)
+	GetTemplateByID(ctx context.Context, id string) (store.Template, error)
+	GetNotificationByTenantAndIdempotencyKey(ctx context.Context, tenantID, idempotencyKey string) (store.Notification, error)
+	CreateNotification(ctx context.Context, params store.CreateNotificationParams) (store.Notification, error)
+	CreateDeliveryAttempt(ctx context.Context, params store.CreateDeliveryAttemptParams) (store.DeliveryAttempt, error)
+	ListDeadLetters(ctx context.Context, limit int) ([]store.DeadLetter, error)
+	GetDeadLetterByID(ctx context.Context, id string) (store.DeadLetter, error)
+	ReplayDeadLetter(ctx context.Context, deadLetterID, newAttemptID string) (store.ReplayDeadLetterResult, error)
+	GetNotificationByID(ctx context.Context, id string) (store.Notification, error)
+}
+
+type dispatchQueue interface {
+	EnqueueDispatch(ctx context.Context, job queue.DispatchJob) error
+}
+
 type API struct {
-	store *store.Postgres
-	queue *queue.RedisQueue
+	store apiStore
+	queue dispatchQueue
 }
 
 type createTenantRequest struct {
@@ -44,7 +63,7 @@ type createNotificationRequest struct {
 	Variables           map[string]any `json:"variables"`
 }
 
-func NewAPI(store *store.Postgres, redisQueue *queue.RedisQueue) *API {
+func NewAPI(store apiStore, redisQueue dispatchQueue) *API {
 	return &API{store: store, queue: redisQueue}
 }
 
@@ -252,4 +271,59 @@ func generateID(prefix string) string {
 		return fmt.Sprintf("%s_%d", prefix, time.Now().UTC().UnixNano())
 	}
 	return fmt.Sprintf("%s_%s", prefix, hex.EncodeToString(buf))
+}
+
+func (a *API) ListDeadLetters() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		deadLetters, err := a.store.ListDeadLetters(r.Context(), 100)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
+			return
+		}
+		writeJSON(w, http.StatusOK, deadLetters)
+	}
+}
+
+func (a *API) GetDeadLetter() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		deadLetter, err := a.store.GetDeadLetterByID(r.Context(), r.PathValue("id"))
+		if err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				writeError(w, http.StatusNotFound, "not_found", "dead letter not found")
+				return
+			}
+			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
+			return
+		}
+		writeJSON(w, http.StatusOK, deadLetter)
+	}
+}
+
+func (a *API) ReplayDeadLetter() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		result, err := a.store.ReplayDeadLetter(r.Context(), r.PathValue("id"), generateID("attempt"))
+		if err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				writeError(w, http.StatusNotFound, "not_found", "dead letter not found")
+				return
+			}
+			if errors.Is(err, store.ErrConflict) {
+				writeError(w, http.StatusConflict, "conflict", "dead letter already replayed")
+				return
+			}
+			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
+			return
+		}
+		notification, err := a.store.GetNotificationByID(r.Context(), result.Attempt.NotificationID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
+			return
+		}
+		job := queue.DispatchJob{JobID: generateID("job"), NotificationID: result.Attempt.NotificationID, AttemptID: result.Attempt.ID, TenantID: notification.TenantID, Channel: result.Attempt.Channel, CreatedAt: time.Now().UTC()}
+		if err := a.queue.EnqueueDispatch(r.Context(), job); err != nil {
+			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
+			return
+		}
+		writeJSON(w, http.StatusAccepted, result.Attempt)
+	}
 }

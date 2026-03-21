@@ -133,7 +133,7 @@ func (s *fakeRedisServer) execCommand(cmd []string) (respValue, error) {
 		key, value := cmd[1], cmd[2]
 		s.lists[key] = append([]string{value}, s.lists[key]...)
 		return respInteger(len(s.lists[key])), nil
-	case "BRPOPLPUSH":
+	case "BRPOPLPUSH", "RPOPLPUSH":
 		source, dest := cmd[1], cmd[2]
 		items := s.lists[source]
 		if len(items) == 0 {
@@ -401,5 +401,40 @@ func TestReserveChannelReturnsUnmarshalErrorWithoutAcknowledging(t *testing.T) {
 	defer server.mu.Unlock()
 	if got := len(server.lists[ProcessingQueueName(DispatchWebhookQueueName)]); got != 1 {
 		t.Fatalf("processing queue length = %d, want 1", got)
+	}
+}
+
+func TestRecoverProcessingQueueMovesReservedJobsBack(t *testing.T) {
+	t.Parallel()
+	server := newFakeRedisServer(t)
+	defer server.close()
+	q := NewRedisQueue(server.addr(), "", 0)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	job := DispatchJob{JobID: "job-1", NotificationID: "notif-1", AttemptID: "attempt-1", Channel: "email", CreatedAt: time.Now().UTC()}
+	if err := q.EnqueueChannel(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	reserved, err := q.ReserveChannel(ctx, DispatchEmailQueueName, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reserved.Job.JobID != job.JobID {
+		t.Fatalf("reserved=%+v", reserved.Job)
+	}
+	recovered, err := q.RecoverProcessingQueue(ctx, DispatchEmailQueueName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered != 1 {
+		t.Fatalf("recovered=%d", recovered)
+	}
+	server.mu.Lock()
+	defer server.mu.Unlock()
+	if got := len(server.lists[DispatchEmailQueueName]); got != 1 {
+		t.Fatalf("queue len=%d", got)
+	}
+	if got := len(server.lists[ProcessingQueueName(DispatchEmailQueueName)]); got != 0 {
+		t.Fatalf("processing len=%d", got)
 	}
 }

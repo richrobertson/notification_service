@@ -180,6 +180,35 @@ func (q *RedisQueue) RequeueReserved(ctx context.Context, reserved ReservedJob) 
 	return nil
 }
 
+func (q *RedisQueue) RecoverProcessingQueue(ctx context.Context, queueName string) (int, error) {
+	processingQueue := ProcessingQueueName(queueName)
+	recovered := 0
+	for {
+		payload, err := q.rpoplpush(ctx, processingQueue, queueName)
+		if err != nil {
+			if errors.Is(err, errRedisNil) {
+				return recovered, nil
+			}
+			return recovered, err
+		}
+		recovered++
+		_ = payload
+	}
+}
+
+func (q *RedisQueue) RecoverKnownProcessingQueues(ctx context.Context) (map[string]int, error) {
+	queues := []string{DispatchQueueName, DispatchWebhookQueueName, DispatchEmailQueueName}
+	results := make(map[string]int, len(queues))
+	for _, queueName := range queues {
+		recovered, err := q.RecoverProcessingQueue(ctx, queueName)
+		if err != nil {
+			return results, err
+		}
+		results[queueName] = recovered
+	}
+	return results, nil
+}
+
 func ProcessingQueueName(queueName string) string {
 	return queueName + ":processing"
 }
@@ -235,6 +264,30 @@ func (q *RedisQueue) brpoplpush(ctx context.Context, sourceQueue, destinationQue
 	payload, ok := response.(string)
 	if !ok {
 		return "", fmt.Errorf("reserve dispatch job: unexpected response %#v", response)
+	}
+	return payload, nil
+}
+
+func (q *RedisQueue) rpoplpush(ctx context.Context, sourceQueue, destinationQueue string) (string, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if err := q.ensureConnLocked(ctx); err != nil {
+		return "", err
+	}
+	if err := q.writeCommandLocked("RPOPLPUSH", sourceQueue, destinationQueue); err != nil {
+		return "", err
+	}
+	response, err := q.readResponseLocked()
+	if err != nil {
+		q.resetConnLocked()
+		return "", fmt.Errorf("recover processing job: %w", err)
+	}
+	if response == nil {
+		return "", errRedisNil
+	}
+	payload, ok := response.(string)
+	if !ok {
+		return "", fmt.Errorf("recover processing job: unexpected response %#v", response)
 	}
 	return payload, nil
 }

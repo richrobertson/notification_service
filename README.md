@@ -2,9 +2,9 @@
 
 ## Project Overview
 
-`notification_service` is a runnable Go foundation for a multi-tenant notification platform. Stage 4 adds real channel delivery workers while deliberately keeping delivery guarantees simple and limited. This hardening patch makes the current worker flow more operationally honest without expanding into Stage 5 retry or replay features.
+`notification_service` is a runnable Go notification platform foundation. Stage 5 keeps the Stage 4 Redis-list + PostgreSQL architecture, and adds bounded retries, durable dead-letter persistence, operator replay, and best-effort recovery of stranded reserved jobs.
 
-The service currently provides:
+The service now provides:
 
 - health and readiness endpoints
 - tenant creation
@@ -14,12 +14,15 @@ The service currently provides:
 - Redis-backed dispatch queues using Redis lists
 - a standalone dispatcher process that routes generic dispatch jobs to channel-specific queues
 - standalone webhook and email workers that consume channel-specific queues
+- a standalone retry worker that polls PostgreSQL for due retries and republishes them to the dispatch queue
 - real webhook HTTP POST delivery
 - real SMTP-based email delivery
-- OpenTelemetry bootstrap wiring for local development
-- Docker Compose infrastructure for Postgres, Redis, Prometheus, Grafana, Jaeger, the OpenTelemetry Collector, and Mailpit for local SMTP capture
+- bounded retry scheduling for transient delivery failures
+- durable PostgreSQL dead-letter persistence after retry exhaustion
+- dead-letter list/get/replay API endpoints
+- automated best-effort recovery that drains stranded `*:processing` queues back to their source queues
 
-## Stage 4 Status
+## Stage 5 Status
 
 Implemented in this stage:
 
@@ -28,115 +31,61 @@ Implemented in this stage:
 - `POST /v1/tenants`
 - `POST /v1/templates`
 - `POST /v1/notifications`
-- PostgreSQL persistence for notifications
-- PostgreSQL persistence for the initial `delivery_attempts` row with `attempt_number = 1` and `status = pending`
-- generic dispatch job enqueue to Redis queue `notify:dispatch`
-- dispatcher consumption from `notify:dispatch`
-- dispatcher routing to channel queues:
-  - `notify:dispatch:webhook`
-  - `notify:dispatch:email`
-- webhook worker consumption from `notify:dispatch:webhook` with reserve/ack via `notify:dispatch:webhook:processing`
-- email worker consumption from `notify:dispatch:email` with reserve/ack via `notify:dispatch:email:processing`
-- template rendering with deterministic missing-variable failures
-- delivery attempt lifecycle transitions from `pending` to `in_progress` to terminal `sent` or `failed`
-- storage of delivery timestamps, provider message id, and concise delivery errors
-- request logging and panic recovery middleware
-- idempotent notification submission when `idempotency_key` is provided
-
-Not implemented yet:
-
-- retries
-- DLQ handling
-- replay flow
-- scheduling
-- auth hardening
-- usage endpoints
-- dead-letter inspection endpoints
-- transactional outbox protection for DB + queue atomicity
-- production-grade delivery guarantees such as retries, exactly-once execution, or provider failover
-
-## Stage 4 Architecture Summary
-
-Current request flow:
-
-1. Client calls `POST /v1/notifications`
-2. API validates tenant, template, and recipient fields
-3. API persists the notification row in PostgreSQL
-4. API inserts the initial `delivery_attempts` row with `pending`
-5. API enqueues a small JSON dispatch job onto `notify:dispatch`
-6. `cmd/dispatcher` reserves a job from `notify:dispatch` into `notify:dispatch:processing`
-7. Dispatcher republishes the same job to either `notify:dispatch:webhook` or `notify:dispatch:email`
-8. Dispatcher ACKs the reserved dispatch job only after the channel enqueue succeeds; otherwise it requeues the job back to `notify:dispatch`
-9. A channel worker reserves the channel job into its own `*:processing` queue, loads the notification, template, and delivery attempt from PostgreSQL
-10. The worker renders the outbound payload and performs real delivery
-11. The worker marks the attempt `in_progress` once work begins
-12. On durable success the worker ACKs the reserved Redis job and marks `delivery_attempts` as `sent`
-13. On durable terminal failure the worker ACKs the reserved Redis job and marks `delivery_attempts` as `failed`
-14. On transient persistence or processing interruption the worker requeues the reserved job instead of silently losing it
-
-Important honesty notes:
-
-- The API still does **not** push directly to channel queues.
-- Workers currently process one job at a time in a simple loop.
-- The dispatcher and channel workers now reserve jobs into processing queues before acknowledging them, so transient routing or DB/update failures do not silently drop work.
-- Malformed queue jobs can still strand a reserved entry in the processing queue and require operator cleanup; there is no automated recovery sweeper yet.
-- PostgreSQL writes and Redis enqueue are **not** yet coordinated with an outbox pattern, so DB/queue atomicity is not yet hardened.
-- Reserved in-flight jobs are safer than destructive pops, but a worker crash can still leave a job sitting in `*:processing`. Current workers do not automatically recover or replay those reserved jobs; manual recovery or a future recovery loop is still required.
-- Delivery completion is tracked on `delivery_attempts`; broader notification rollup state is intentionally still simple.
-
-
-## Stage 4 Hardening Guarantees
-
-What Stage 4 now guarantees:
-
-- the dispatcher does not remove a dispatch job from Redis until channel republish succeeds or the dispatch job has been requeued back to `notify:dispatch`
-- a channel worker does not remove a channel job from Redis until it has durably recorded either `sent` or terminal `failed`, or explicitly requeued the job after a transient processing failure
-- attempts move to `in_progress` when a worker begins meaningful work
-- terminal failures such as missing recipients, template rendering errors, webhook failures, and SMTP delivery failures are recorded as `failed`
-- transient infrastructure failures such as PostgreSQL load/update failures cause the job to remain recoverable instead of being silently lost
-- fresh database migration from scratch does not rely on an externally pre-created `set_updated_at()` helper
-
-What Stage 4 still does **not** guarantee:
-
-- no retries, retry scheduling, DLQ routing, replay APIs, or provider failover yet
-- no automated recovery or replay of jobs left behind in `*:processing` after a dispatcher or worker crash
-- no outbox-style atomicity between PostgreSQL writes and Redis enqueue
-- no exactly-once delivery semantics
-
-These remain future Stage 5 concerns.
-
-## Current Endpoints
-
-- `GET /v1/health`
-- `GET /v1/readiness`
-- `POST /v1/tenants`
-- `POST /v1/templates`
-- `POST /v1/notifications`
-
-## Current Queue Design
-
-Redis list queues used in Stage 4:
-
-- generic dispatch queue:
-  - `notify:dispatch`
-- channel queues:
-  - `notify:dispatch:webhook`
-  - `notify:dispatch:email`
-- processing queues used while a job is reserved:
+- `GET /v1/dead-letters`
+- `GET /v1/dead-letters/{id}`
+- `POST /v1/dead-letters/{id}/replay`
+- PostgreSQL persistence for notifications, delivery attempts, and dead letters
+- Redis-backed dispatch queue `notify:dispatch`
+- dispatcher routing to `notify:dispatch:webhook` and `notify:dispatch:email`
+- channel worker reserve/ack flow using per-channel `*:processing` queues
+- retry scheduling using `delivery_attempts.status = retry_scheduled` plus `next_retry_at`
+- retry execution via `cmd/retry_worker`
+- durable dead-lettering using the existing `dead_letters` table
+- operator replay that creates a fresh attempt row and republishes a new dispatch job
+- startup and periodic recovery of stranded jobs in:
   - `notify:dispatch:processing`
   - `notify:dispatch:webhook:processing`
   - `notify:dispatch:email:processing`
 
-Dispatch job envelope fields:
+## Stage 5 Delivery Semantics
 
-- `job_id`
-- `notification_id`
-- `attempt_id`
-- `tenant_id`
-- `channel`
-- `created_at`
+The delivery service now uses a small explicit error model:
 
-The job is intentionally small so workers load the full records from PostgreSQL.
+- success: mark attempt `sent`
+- terminal failure: mark attempt `failed`
+- transient retryable failure before retry exhaustion: mark attempt `retry_scheduled` and set `next_retry_at`
+- transient retryable failure after retry exhaustion: mark attempt `dead_lettered` and insert a durable dead-letter record
+
+Retry policy is intentionally simple and configurable:
+
+- `RETRY_MAX_ATTEMPTS`
+- `RETRY_BASE_DELAY`
+- `RETRY_MAX_DELAY`
+- `RETRY_EXPONENTIAL_BACKOFF`
+- `RETRY_JITTER`
+- `RETRY_WORKER_POLL_INTERVAL`
+- `PROCESSING_RECOVERY_INTERVAL`
+
+The current retry model is:
+
+1. the active attempt starts as `pending`
+2. a worker marks it `in_progress`
+3. on transient failure, the same attempt is marked `retry_scheduled` with `next_retry_at`
+4. the retry worker later converts that scheduled row into a historical failed attempt and creates a fresh `pending` attempt with `attempt_number + 1`
+5. the retry worker republishes a new dispatch job for the fresh attempt
+6. once the retry budget is exhausted, the final attempt is marked `dead_lettered` and a `dead_letters` row is inserted
+
+This keeps the history inspectable without introducing a full outbox or lease framework.
+
+## Queue Recovery Behavior
+
+Stage 5 adds bounded automated recovery for stranded reserved jobs.
+
+At dispatcher/worker startup, and periodically afterward, the process drains each known Redis processing queue back into its source queue using best-effort `RPOPLPUSH` recovery. This is operationally honest but intentionally limited:
+
+- recovery is best-effort, not exactly-once
+- duplicate delivery is still possible if a process crashes after an external provider call but before durable state/ack cleanup
+- recovery is FIFO/LIFO-consistent-enough for Redis list queues, not a strict ordering guarantee
 
 ## Local Development
 
@@ -158,37 +107,46 @@ Run the API service:
 make run-api
 ```
 
-Run the dispatcher in a second terminal:
+Run the dispatcher:
 
 ```bash
 make run-dispatcher
 ```
 
-Run the webhook worker in a third terminal:
+Run the webhook worker:
 
 ```bash
 make run-webhook-worker
 ```
 
-Run the email worker in a fourth terminal:
+Run the email worker:
 
 ```bash
 make run-email-worker
 ```
 
-Default local configuration:
+Run the retry worker:
+
+```bash
+go run ./cmd/retry_worker
+```
+
+## Default Local Configuration
 
 - HTTP port: `8080`
 - PostgreSQL: `postgres://notification:notification@localhost:5432/notification_platform?sslmode=disable`
 - Redis address: `localhost:6379`
-- Redis password: empty
-- Redis DB: `0`
-- OTLP endpoint: `localhost:4317`
 - webhook timeout: `5s`
+- retry max attempts: `3`
+- retry base delay: `5s`
+- retry max delay: `1m`
+- retry worker poll interval: `2s`
+- processing recovery interval: `30s`
 - Mailpit SMTP host/port: `localhost:1025`
-- Mailpit UI: `http://localhost:8025`
 
-New environment variables:
+## Environment Variables
+
+Existing:
 
 - `WEBHOOK_TIMEOUT`
 - `QUEUE_BLOCK_TIMEOUT`
@@ -201,78 +159,26 @@ New environment variables:
 - `SMTP_STARTTLS`
 - `SMTP_INSECURE_SKIP_VERIFY`
 
-Useful local endpoints:
+New in Stage 5:
 
-- API health: `http://localhost:8080/v1/health`
-- API readiness: `http://localhost:8080/v1/readiness`
-- Prometheus: `http://localhost:9090`
-- Grafana: `http://localhost:3000`
-- Jaeger: `http://localhost:16686`
-- Mailpit UI: `http://localhost:8025`
+- `RETRY_MAX_ATTEMPTS`
+- `RETRY_BASE_DELAY`
+- `RETRY_MAX_DELAY`
+- `RETRY_EXPONENTIAL_BACKOFF`
+- `RETRY_JITTER`
+- `RETRY_WORKER_POLL_INTERVAL`
+- `PROCESSING_RECOVERY_INTERVAL`
 
-Run checks:
+## Remaining Intentional Limitations After Stage 5
 
-```bash
-make fmt
-make lint
-make test
-```
+Stage 5 is deliberately modest. The service still does **not** provide:
 
-### Example: Create Webhook Template
+- a transactional outbox pattern for PostgreSQL + Redis atomicity
+- exactly-once delivery semantics
+- provider failover
+- advanced scheduling beyond bounded retry delays
+- rate limiting / quota enforcement beyond whatever already exists in the broader codebase
+- an operator UI
+- distributed coordination or leader election for recovery/retry workers
 
-```bash
-curl -X POST http://localhost:8080/v1/templates   -H "Content-Type: application/json"   -d '{
-    "id": "tpl_password_reset_webhook_v1",
-    "tenant_id": "acme",
-    "name": "password-reset",
-    "channel": "webhook",
-    "version": 1,
-    "body": "{"event":"password_reset","url":"{{.reset_url}}"}"
-  }'
-```
-
-### Example: Test Webhook Delivery Locally
-
-Start a simple local receiver:
-
-```bash
-python -m http.server 18080
-```
-
-Then submit a webhook notification pointing at a real POST-capable endpoint you control locally, for example a request bin or a small mock server. If you use a custom local handler, the webhook worker will mark the attempt `sent` on any `2xx` response and `failed` on non-`2xx` or network errors.
-
-### Example: Create Email Template
-
-```bash
-curl -X POST http://localhost:8080/v1/templates   -H "Content-Type: application/json"   -d '{
-    "id": "tpl_welcome_email_v1",
-    "tenant_id": "acme",
-    "name": "welcome-email",
-    "channel": "email",
-    "version": 1,
-    "body": "Hello {{.first_name}}, welcome to Acme."
-  }'
-```
-
-### Example: Submit Email Notification
-
-```bash
-curl -X POST http://localhost:8080/v1/notifications   -H "Content-Type: application/json"   -d '{
-    "id": "notif_email_001",
-    "tenant_id": "acme",
-    "template_id": "tpl_welcome_email_v1",
-    "recipient_email": "user@example.test",
-    "variables": {
-      "first_name": "Ada"
-    }
-  }'
-```
-
-Mailpit will capture local emails so you can inspect them at `http://localhost:8025`.
-
-## Database Migrations
-
-Active migrations:
-
-- `migrations/001_init.sql`
-- `migrations/002_stage4_delivery_attempts.sql`
+Those remain future milestones.

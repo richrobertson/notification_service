@@ -32,6 +32,9 @@ func NewRouter(deps RouterDeps) http.Handler {
 	mux.Handle("POST /v1/tenants", api.CreateTenant())
 	mux.Handle("POST /v1/templates", api.CreateTemplate())
 	mux.Handle("POST /v1/notifications", api.CreateNotification())
+	mux.Handle("GET /v1/dead-letters", api.ListDeadLetters())
+	mux.Handle("GET /v1/dead-letters/{id}", api.GetDeadLetter())
+	mux.Handle("POST /v1/dead-letters/{id}/replay", api.ReplayDeadLetter())
 
 	var handler http.Handler = mux
 	handler = recoveryMiddleware(handler)
