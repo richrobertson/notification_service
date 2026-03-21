@@ -23,6 +23,13 @@ type RedisQueue struct {
 	rw   *bufio.ReadWriter
 }
 
+type ReservedJob struct {
+	Job             DispatchJob
+	queueName       string
+	processingQueue string
+	payload         string
+}
+
 func NewRedisQueue(addr, password string, db int) *RedisQueue {
 	return &RedisQueue{addr: addr, password: password, db: db}
 }
@@ -74,31 +81,107 @@ func (q *RedisQueue) EnqueueChannel(ctx context.Context, job DispatchJob) error 
 	return q.enqueue(ctx, queueName, job)
 }
 
+func (q *RedisQueue) ReserveDispatch(ctx context.Context, timeoutSeconds int) (ReservedJob, error) {
+	return q.ReserveChannel(ctx, DispatchQueueName, timeoutSeconds)
+}
+
 func (q *RedisQueue) ConsumeDispatch(ctx context.Context) (DispatchJob, error) {
 	return q.ConsumeChannel(ctx, DispatchQueueName, 1)
 }
 
 func (q *RedisQueue) ConsumeChannel(ctx context.Context, queueName string, timeoutSeconds int) (DispatchJob, error) {
+	reserved, err := q.ReserveChannel(ctx, queueName, timeoutSeconds)
+	if err != nil {
+		return DispatchJob{}, err
+	}
+	if err := q.AckReserved(ctx, reserved); err != nil {
+		return DispatchJob{}, err
+	}
+	return reserved.Job, nil
+}
+
+func (q *RedisQueue) ReserveChannel(ctx context.Context, queueName string, timeoutSeconds int) (ReservedJob, error) {
 	if timeoutSeconds <= 0 {
 		timeoutSeconds = 1
 	}
+	processingQueue := ProcessingQueueName(queueName)
 	for {
 		if err := ctx.Err(); err != nil {
-			return DispatchJob{}, err
+			return ReservedJob{}, err
 		}
-		payload, err := q.blpop(ctx, queueName, timeoutSeconds)
+		payload, err := q.brpoplpush(ctx, queueName, processingQueue, timeoutSeconds)
 		if err != nil {
 			if errors.Is(err, errRedisNil) {
 				continue
 			}
-			return DispatchJob{}, err
+			return ReservedJob{}, err
 		}
 		var job DispatchJob
 		if err := json.Unmarshal([]byte(payload), &job); err != nil {
-			return DispatchJob{}, fmt.Errorf("consume %s job: unmarshal job: %w", queueName, err)
+			return ReservedJob{}, fmt.Errorf("reserve %s job: unmarshal job: %w", queueName, err)
 		}
-		return job, nil
+		return ReservedJob{Job: job, queueName: queueName, processingQueue: processingQueue, payload: payload}, nil
 	}
+}
+
+func (q *RedisQueue) AckReserved(ctx context.Context, reserved ReservedJob) error {
+	return q.lrem(ctx, reserved.processingQueue, 1, reserved.payload)
+}
+
+func (q *RedisQueue) RequeueReserved(ctx context.Context, reserved ReservedJob) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if err := q.ensureConnLocked(ctx); err != nil {
+		return err
+	}
+	if err := q.writeCommandLocked("MULTI"); err != nil {
+		return err
+	}
+	if _, err := q.readResponseLocked(); err != nil {
+		q.resetConnLocked()
+		return fmt.Errorf("requeue reserved job: start transaction: %w", err)
+	}
+	if err := q.writeCommandLocked("LREM", reserved.processingQueue, "1", reserved.payload); err != nil {
+		return err
+	}
+	if _, err := q.readResponseLocked(); err != nil {
+		q.resetConnLocked()
+		return fmt.Errorf("requeue reserved job: queue lrem: %w", err)
+	}
+	if err := q.writeCommandLocked("LPUSH", reserved.queueName, reserved.payload); err != nil {
+		return err
+	}
+	if _, err := q.readResponseLocked(); err != nil {
+		q.resetConnLocked()
+		return fmt.Errorf("requeue reserved job: queue lpush: %w", err)
+	}
+	if err := q.writeCommandLocked("EXEC"); err != nil {
+		return err
+	}
+	response, err := q.readResponseLocked()
+	if err != nil {
+		q.resetConnLocked()
+		return fmt.Errorf("requeue reserved job: exec: %w", err)
+	}
+	values, ok := response.([]any)
+	if !ok || len(values) != 2 {
+		return fmt.Errorf("requeue reserved job: unexpected exec response %#v", response)
+	}
+	removed, ok := values[0].(int64)
+	if !ok {
+		return fmt.Errorf("requeue reserved job: unexpected lrem result %#v", values[0])
+	}
+	if removed == 0 {
+		return fmt.Errorf("requeue reserved job: reserved payload missing from processing queue")
+	}
+	if _, ok := values[1].(int64); !ok {
+		return fmt.Errorf("requeue reserved job: unexpected lpush result %#v", values[1])
+	}
+	return nil
+}
+
+func ProcessingQueueName(queueName string) string {
+	return queueName + ":processing"
 }
 
 func QueueNameForChannel(channel string) (string, error) {
@@ -132,28 +215,52 @@ func (q *RedisQueue) enqueue(ctx context.Context, queueName string, job Dispatch
 	return nil
 }
 
-func (q *RedisQueue) blpop(ctx context.Context, queueName string, timeoutSeconds int) (string, error) {
+func (q *RedisQueue) brpoplpush(ctx context.Context, sourceQueue, destinationQueue string, timeoutSeconds int) (string, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if err := q.ensureConnLocked(ctx); err != nil {
 		return "", err
 	}
-	if err := q.writeCommandLocked("BLPOP", queueName, strconv.Itoa(timeoutSeconds)); err != nil {
+	if err := q.writeCommandLocked("BRPOPLPUSH", sourceQueue, destinationQueue, strconv.Itoa(timeoutSeconds)); err != nil {
 		return "", err
 	}
 	response, err := q.readResponseLocked()
 	if err != nil {
 		q.resetConnLocked()
-		return "", fmt.Errorf("consume dispatch job: %w", err)
+		return "", fmt.Errorf("reserve dispatch job: %w", err)
 	}
 	if response == nil {
 		return "", errRedisNil
 	}
-	values, ok := response.([]string)
-	if !ok || len(values) != 2 {
-		return "", fmt.Errorf("consume dispatch job: unexpected response %#v", response)
+	payload, ok := response.(string)
+	if !ok {
+		return "", fmt.Errorf("reserve dispatch job: unexpected response %#v", response)
 	}
-	return values[1], nil
+	return payload, nil
+}
+
+func (q *RedisQueue) lrem(ctx context.Context, queueName string, count int, payload string) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if err := q.ensureConnLocked(ctx); err != nil {
+		return err
+	}
+	if err := q.writeCommandLocked("LREM", queueName, strconv.Itoa(count), payload); err != nil {
+		return err
+	}
+	response, err := q.readResponseLocked()
+	if err != nil {
+		q.resetConnLocked()
+		return fmt.Errorf("remove reserved job from %s: %w", queueName, err)
+	}
+	removed, ok := response.(int64)
+	if !ok {
+		return fmt.Errorf("remove reserved job from %s: unexpected response %#v", queueName, response)
+	}
+	if removed == 0 {
+		return fmt.Errorf("remove reserved job from %s: job not found", queueName)
+	}
+	return nil
 }
 
 func (q *RedisQueue) ensureConnLocked(ctx context.Context) error {
@@ -266,17 +373,13 @@ func (q *RedisQueue) readResponseLocked() (any, error) {
 		if count < 0 {
 			return nil, nil
 		}
-		values := make([]string, 0, count)
+		values := make([]any, 0, count)
 		for i := 0; i < count; i++ {
 			item, err := q.readResponseLocked()
 			if err != nil {
 				return nil, err
 			}
-			text, ok := item.(string)
-			if !ok {
-				return nil, fmt.Errorf("unexpected redis array item %#v", item)
-			}
-			values = append(values, text)
+			values = append(values, item)
 		}
 		return values, nil
 	default:
