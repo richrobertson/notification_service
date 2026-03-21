@@ -65,7 +65,7 @@ func testLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard,
 func TestRunOnceRetryEnqueueFailureLeavesDurableAttemptPending(t *testing.T) {
 	st := &fakeRetryStore{due: []store.RetryDueAttempt{{Attempt: store.DeliveryAttempt{ID: "attempt-1", NotificationID: "notif-1", Channel: "email", AttemptNumber: 1, Status: "retry_scheduled"}, TenantID: "tenant-1"}}}
 	q := &fakeRetryQueue{err: errors.New("redis down")}
-	if err := runOnce(context.Background(), testLogger(), st, q); err != nil {
+	if err := runOnce(context.Background(), testLogger(), st, q, 0); err != nil {
 		t.Fatal(err)
 	}
 	if len(st.ensured) != 1 {
@@ -85,7 +85,7 @@ func TestRunOnceRetryEnqueueFailureLeavesDurableAttemptPending(t *testing.T) {
 func TestRunOnceOnlyEnqueuesExistingAttempts(t *testing.T) {
 	st := &fakeRetryStore{pending: []store.PendingEnqueueAttempt{{Attempt: store.DeliveryAttempt{ID: "attempt-2", NotificationID: "notif-1", Channel: "email", AttemptNumber: 2, Status: "pending"}, TenantID: "tenant-1"}}}
 	q := &fakeRetryQueue{}
-	if err := runOnce(context.Background(), testLogger(), st, q); err != nil {
+	if err := runOnce(context.Background(), testLogger(), st, q, 10); err != nil {
 		t.Fatal(err)
 	}
 	if len(q.jobs) != 1 || q.jobs[0].AttemptID != "attempt-2" {
@@ -100,7 +100,7 @@ func TestRunOnceFinalizesReplayAfterSuccessfulEnqueue(t *testing.T) {
 	dl := "dead-1"
 	st := &fakeRetryStore{pending: []store.PendingEnqueueAttempt{{Attempt: store.DeliveryAttempt{ID: "replay_" + dl, NotificationID: "notif-1", Channel: "email", AttemptNumber: 4, Status: "pending"}, TenantID: "tenant-1", DeadLetterID: &dl}}}
 	q := &fakeRetryQueue{}
-	if err := runOnce(context.Background(), testLogger(), st, q); err != nil {
+	if err := runOnce(context.Background(), testLogger(), st, q, 10); err != nil {
 		t.Fatal(err)
 	}
 	if len(st.finalizedReplay) != 1 {
@@ -111,7 +111,7 @@ func TestRunOnceFinalizesReplayAfterSuccessfulEnqueue(t *testing.T) {
 func TestRunOnceRecoversPendingInitialAttempt(t *testing.T) {
 	st := &fakeRetryStore{pending: []store.PendingEnqueueAttempt{{Attempt: store.DeliveryAttempt{ID: "attempt-initial", NotificationID: "notif-1", Channel: "email", AttemptNumber: 1, Status: "pending", EnqueueKind: "initial"}, TenantID: "tenant-1"}}}
 	q := &fakeRetryQueue{}
-	if err := runOnce(context.Background(), testLogger(), st, q); err != nil {
+	if err := runOnce(context.Background(), testLogger(), st, q, 10); err != nil {
 		t.Fatal(err)
 	}
 	if len(q.jobs) != 1 || q.jobs[0].AttemptID != "attempt-initial" {
@@ -122,7 +122,7 @@ func TestRunOnceRecoversPendingInitialAttempt(t *testing.T) {
 func TestRunOnceSkipsRetryStormWhenQueuePressured(t *testing.T) {
 	st := &fakeRetryStore{pending: []store.PendingEnqueueAttempt{{Attempt: store.DeliveryAttempt{ID: "attempt-2", NotificationID: "notif-1", Channel: "email", AttemptNumber: 2, Status: "pending"}, TenantID: "tenant-1"}}}
 	q := &fakeRetryQueue{snapshot: queue.PressureSnapshot{Depths: map[string]int{queue.DispatchQueueName: 100}, SoftLimit: 10, HardLimit: 100}}
-	if err := runOnce(context.Background(), testLogger(), st, q); err != nil {
+	if err := runOnce(context.Background(), testLogger(), st, q, 10); err != nil {
 		t.Fatal(err)
 	}
 	if len(q.jobs) != 0 {

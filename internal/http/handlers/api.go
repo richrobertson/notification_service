@@ -64,13 +64,18 @@ type notificationInspectionResponse struct {
 }
 
 type createTenantRequest struct {
-	ID, Name   string
-	DailyQuota int `json:"daily_quota"`
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	DailyQuota int    `json:"daily_quota"`
 }
 
 type createTemplateRequest struct {
-	ID, TenantID, Name, Channel, Body string
-	Version                           int `json:"version"`
+	ID       string `json:"id"`
+	TenantID string `json:"tenant_id"`
+	Name     string `json:"name"`
+	Channel  string `json:"channel"`
+	Version  int    `json:"version"`
+	Body     string `json:"body"`
 }
 
 type createNotificationRequest struct {
@@ -184,8 +189,6 @@ func (a *API) ensureAndEnqueueInitialAttempt(ctx context.Context, w http.Respons
 	a.recordAudit(ctx, existing.TenantID, "api", "enqueue_recovered", "delivery_attempt", attempt.ID, map[string]any{"notification_id": existing.ID, "channel": attempt.Channel})
 	writeJSON(w, http.StatusAccepted, existing)
 }
-
-// rest of file intentionally appended by keeping lower portion from existing via manual rewrite in patch later
 
 func (a *API) CreateTenant() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {

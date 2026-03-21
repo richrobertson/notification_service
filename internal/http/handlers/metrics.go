@@ -1,7 +1,6 @@
 package handlers
 
 import (
-	"context"
 	"net/http"
 
 	"github.com/richrobertson/notification-platform/internal/pressure"
@@ -13,7 +12,7 @@ func Metrics(m *pressure.Monitor) http.HandlerFunc {
 			writeJSON(w, http.StatusOK, map[string]any{"status": "disabled"})
 			return
 		}
-		metrics, err := m.Metrics(context.Background())
+		metrics, err := m.Metrics(r.Context())
 		if err != nil {
 			writeError(w, http.StatusServiceUnavailable, "metrics_unavailable", "unable to collect metrics")
 			return

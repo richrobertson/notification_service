@@ -23,12 +23,14 @@ type Options struct {
 }
 
 type fairScheduler struct {
-	burst     int
-	inflight  map[string]int
-	pending   map[string][]queue.ReservedJob
-	order     []string
-	next      int
-	maxFlight int
+	burst        int
+	inflight     map[string]int
+	pending      map[string][]queue.ReservedJob
+	order        []string
+	next         int
+	maxFlight    int
+	lastTenant   string
+	currentBurst int
 }
 
 func newFairScheduler(burst, maxFlight int) *fairScheduler {
@@ -56,29 +58,42 @@ func (s *fairScheduler) nextJob() (queue.ReservedJob, bool) {
 	if len(s.order) == 0 {
 		return queue.ReservedJob{}, false
 	}
-	for range s.order {
-		t := s.order[s.next%len(s.order)]
-		s.next = (s.next + 1) % len(s.order)
+	for checked := 0; checked < len(s.order); checked++ {
+		idx := s.next % len(s.order)
+		t := s.order[idx]
 		jobs := s.pending[t]
 		if len(jobs) == 0 || s.inflight[t] >= s.maxFlight {
+			s.next = (idx + 1) % len(s.order)
+			continue
+		}
+		if s.lastTenant == t && s.currentBurst >= s.burst && len(s.order) > 1 {
+			s.next = (idx + 1) % len(s.order)
 			continue
 		}
 		job := jobs[0]
-		limit := s.burst
-		if limit > len(jobs) {
-			limit = len(jobs)
-		}
 		s.pending[t] = jobs[1:]
 		s.inflight[t]++
+		if s.lastTenant == t {
+			s.currentBurst++
+		} else {
+			s.lastTenant = t
+			s.currentBurst = 1
+		}
 		if len(s.pending[t]) == 0 {
 			s.order = removeTenant(s.order, t)
 			if len(s.order) > 0 {
-				s.next %= len(s.order)
+				if idx >= len(s.order) {
+					idx = 0
+				}
+				s.next = idx % len(s.order)
 			} else {
 				s.next = 0
 			}
+		} else if s.lastTenant == t && s.currentBurst < s.burst {
+			s.next = idx
+		} else {
+			s.next = (idx + 1) % len(s.order)
 		}
-		_ = limit
 		return job, true
 	}
 	return queue.ReservedJob{}, false
@@ -132,13 +147,20 @@ func RunChannelWorker(ctx context.Context, logger *slog.Logger, redisQueue *queu
 	var mu sync.Mutex
 	for {
 		for len(sem) < cap(sem) {
+			mu.Lock()
 			job, ok := scheduler.nextJob()
+			mu.Unlock()
 			if !ok {
 				break
 			}
 			sem <- struct{}{}
 			go func(reserved queue.ReservedJob) {
-				defer func() { <-sem; mu.Lock(); scheduler.complete(reserved.Job.TenantID); mu.Unlock() }()
+				defer func() {
+					<-sem
+					mu.Lock()
+					scheduler.complete(reserved.Job.TenantID)
+					mu.Unlock()
+				}()
 				runReserved(ctx, logger, redisQueue, queueName, reserved, processor)
 			}(job)
 		}

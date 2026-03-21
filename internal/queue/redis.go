@@ -91,7 +91,7 @@ func (q *RedisQueue) PressureSnapshot(ctx context.Context) (PressureSnapshot, er
 		}
 		depths[name] = depth
 	}
-	return PressureSnapshot{Depths: depths, RetryAfter: time.Second}, nil
+	return PressureSnapshot{Depths: depths}, nil
 }
 
 func (q *RedisQueue) AllowTenant(ctx context.Context, tenantID string, limit int, window time.Duration) (bool, time.Duration, error) {
@@ -511,7 +511,11 @@ func (q *RedisQueue) expire(ctx context.Context, key string, ttl time.Duration) 
 	if err := q.ensureConnLocked(ctx); err != nil {
 		return err
 	}
-	if err := q.writeCommandLocked("EXPIRE", key, strconv.Itoa(int(ttl/time.Second))); err != nil {
+	seconds := int((ttl + time.Second - 1) / time.Second)
+	if seconds < 1 {
+		seconds = 1
+	}
+	if err := q.writeCommandLocked("EXPIRE", key, strconv.Itoa(seconds)); err != nil {
 		return err
 	}
 	if _, err := q.readResponseLocked(); err != nil {

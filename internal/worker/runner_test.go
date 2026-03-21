@@ -129,6 +129,22 @@ func TestFairSchedulerRotatesTenants(t *testing.T) {
 	}
 }
 
+func TestFairSchedulerHonorsTenantBurst(t *testing.T) {
+	s := newFairScheduler(2, 1)
+	s.add(queue.ReservedJob{Job: queue.DispatchJob{JobID: "a1", TenantID: "tenant-a"}})
+	s.add(queue.ReservedJob{Job: queue.DispatchJob{JobID: "a2", TenantID: "tenant-a"}})
+	s.add(queue.ReservedJob{Job: queue.DispatchJob{JobID: "a3", TenantID: "tenant-a"}})
+	s.add(queue.ReservedJob{Job: queue.DispatchJob{JobID: "b1", TenantID: "tenant-b"}})
+	j1, _ := s.nextJob()
+	s.complete(j1.Job.TenantID)
+	j2, _ := s.nextJob()
+	s.complete(j2.Job.TenantID)
+	j3, _ := s.nextJob()
+	if got := []string{j1.Job.TenantID, j2.Job.TenantID, j3.Job.TenantID}; got[0] != "tenant-a" || got[1] != "tenant-a" || got[2] != "tenant-b" {
+		t.Fatalf("unexpected scheduling order: %v", got)
+	}
+}
+
 func TestRunChannelWorkerRespectsConcurrency(t *testing.T) {
 	server := newFakeRedisServerForWorker(t)
 	defer server.close()

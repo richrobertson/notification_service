@@ -36,7 +36,10 @@ func NewMonitor(queues QueueSnapshotter, softLimit, hardLimit int, retryAfter ti
 	return &Monitor{queues: queues, softLimit: softLimit, hardLimit: hardLimit, retryAfter: retryAfter}
 }
 func (m *Monitor) Snapshot(ctx context.Context) (queue.PressureSnapshot, error) {
-	if m == nil || m.queues == nil {
+	if m == nil {
+		return queue.PressureSnapshot{}, nil
+	}
+	if m.queues == nil {
 		return queue.PressureSnapshot{SoftLimit: m.softLimit, HardLimit: m.hardLimit, RetryAfter: m.retryAfter}, nil
 	}
 	snapshot, err := m.queues.PressureSnapshot(ctx)

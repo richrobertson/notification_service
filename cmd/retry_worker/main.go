@@ -40,7 +40,7 @@ func main() {
 	ticker := time.NewTicker(cfg.RetryWorkerPollInterval)
 	defer ticker.Stop()
 	for {
-		if err := runOnce(ctx, logger, postgres, redisQueue); err != nil && !errors.Is(err, context.Canceled) {
+		if err := runOnce(ctx, logger, postgres, redisQueue, cfg.QueueSoftLimit); err != nil && !errors.Is(err, context.Canceled) {
 			logger.Error("retry worker iteration failed", slog.Any("error", err))
 		}
 		select {
@@ -66,7 +66,7 @@ type retryQueue interface {
 	PressureSnapshot(ctx context.Context) (queue.PressureSnapshot, error)
 }
 
-func runOnce(ctx context.Context, logger *slog.Logger, postgres retryStore, redisQueue retryQueue) error {
+func runOnce(ctx context.Context, logger *slog.Logger, postgres retryStore, redisQueue retryQueue, softLimit int) error {
 	due, err := postgres.ListDueRetryAttempts(ctx, 50)
 	if err != nil {
 		return err
@@ -88,9 +88,14 @@ func runOnce(ctx context.Context, logger *slog.Logger, postgres retryStore, redi
 		return err
 	}
 	snapshot, err := redisQueue.PressureSnapshot(ctx)
-	if err == nil && snapshot.AnySoftLimited() {
-		logger.Warn("retry worker delaying retries due to queue pressure", slog.Any("depths", snapshot.Depths))
-		return nil
+	if err == nil {
+		if softLimit > 0 {
+			snapshot.SoftLimit = softLimit
+		}
+		if snapshot.AnySoftLimited() {
+			logger.Warn("retry worker delaying retries due to queue pressure", slog.Any("depths", snapshot.Depths))
+			return nil
+		}
 	}
 	for _, item := range pending {
 		job := queue.DispatchJob{JobID: generateID("job"), NotificationID: item.Attempt.NotificationID, AttemptID: item.Attempt.ID, TenantID: item.TenantID, Channel: item.Attempt.Channel, CreatedAt: time.Now().UTC()}
