@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -39,7 +40,7 @@ func main() {
 	ticker := time.NewTicker(cfg.RetryWorkerPollInterval)
 	defer ticker.Stop()
 	for {
-		if err := runOnce(ctx, postgres, redisQueue); err != nil && !errors.Is(err, context.Canceled) {
+		if err := runOnce(ctx, logger, postgres, redisQueue); err != nil && !errors.Is(err, context.Canceled) {
 			logger.Error("retry worker iteration failed", slog.Any("error", err))
 		}
 		select {
@@ -53,28 +54,26 @@ func main() {
 
 type retryStore interface {
 	ListDueRetryAttempts(ctx context.Context, limit int) ([]store.RetryDueAttempt, error)
-	CreateRetryAttempt(ctx context.Context, scheduledAttemptID, newAttemptID string) (store.RetryDueAttempt, error)
+	FinalizeRetryDispatch(ctx context.Context, scheduledAttemptID, newAttemptID string) (store.RetryDueAttempt, error)
 }
 
 type retryQueue interface {
 	EnqueueDispatch(ctx context.Context, job queue.DispatchJob) error
 }
 
-func runOnce(ctx context.Context, postgres retryStore, redisQueue retryQueue) error {
+func runOnce(ctx context.Context, logger *slog.Logger, postgres retryStore, redisQueue retryQueue) error {
 	items, err := postgres.ListDueRetryAttempts(ctx, 50)
 	if err != nil {
 		return err
 	}
 	for _, item := range items {
-		created, err := postgres.CreateRetryAttempt(ctx, item.Attempt.ID, generateID("attempt"))
-		if err != nil {
-			if errors.Is(err, store.ErrNotFound) {
-				continue
-			}
-			return err
-		}
-		job := queue.DispatchJob{JobID: generateID("job"), NotificationID: created.Attempt.NotificationID, AttemptID: created.Attempt.ID, TenantID: created.TenantID, Channel: created.Attempt.Channel, CreatedAt: time.Now().UTC()}
+		attemptID := retryAttemptID(item.Attempt.ID)
+		job := queue.DispatchJob{JobID: generateID("job"), NotificationID: item.Attempt.NotificationID, AttemptID: attemptID, TenantID: item.TenantID, Channel: item.Attempt.Channel, CreatedAt: time.Now().UTC()}
 		if err := redisQueue.EnqueueDispatch(ctx, job); err != nil {
+			logger.Error("retry enqueue failed; attempt remains scheduled", slog.Any("error", err), slog.String("scheduled_attempt_id", item.Attempt.ID), slog.String("retry_attempt_id", attemptID), slog.String("channel", item.Attempt.Channel))
+			continue
+		}
+		if _, err := postgres.FinalizeRetryDispatch(ctx, item.Attempt.ID, attemptID); err != nil {
 			return err
 		}
 	}
@@ -83,4 +82,8 @@ func runOnce(ctx context.Context, postgres retryStore, redisQueue retryQueue) er
 
 func generateID(prefix string) string {
 	return prefix + "-" + time.Now().UTC().Format("20060102150405.000000000")
+}
+
+func retryAttemptID(scheduledAttemptID string) string {
+	return fmt.Sprintf("retry-%s", scheduledAttemptID)
 }

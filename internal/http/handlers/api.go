@@ -25,7 +25,7 @@ type apiStore interface {
 	CreateDeliveryAttempt(ctx context.Context, params store.CreateDeliveryAttemptParams) (store.DeliveryAttempt, error)
 	ListDeadLetters(ctx context.Context, limit int) ([]store.DeadLetter, error)
 	GetDeadLetterByID(ctx context.Context, id string) (store.DeadLetter, error)
-	ReplayDeadLetter(ctx context.Context, deadLetterID, newAttemptID string) (store.ReplayDeadLetterResult, error)
+	FinalizeDeadLetterReplay(ctx context.Context, deadLetterID, newAttemptID string) (store.ReplayDeadLetterResult, error)
 	GetNotificationByID(ctx context.Context, id string) (store.Notification, error)
 }
 
@@ -301,7 +301,33 @@ func (a *API) GetDeadLetter() http.HandlerFunc {
 
 func (a *API) ReplayDeadLetter() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		result, err := a.store.ReplayDeadLetter(r.Context(), r.PathValue("id"), generateID("attempt"))
+		deadLetterID := r.PathValue("id")
+		deadLetter, err := a.store.GetDeadLetterByID(r.Context(), deadLetterID)
+		if err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				writeError(w, http.StatusNotFound, "not_found", "dead letter not found")
+				return
+			}
+			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
+			return
+		}
+		if deadLetter.ReplayedAt != nil {
+			writeError(w, http.StatusConflict, "conflict", "dead letter already replayed")
+			return
+		}
+		notification, err := a.store.GetNotificationByID(r.Context(), deadLetter.NotificationID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
+			return
+		}
+		attemptID := replayAttemptID(deadLetterID)
+		job := queue.DispatchJob{JobID: generateID("job"), NotificationID: deadLetter.NotificationID, AttemptID: attemptID, TenantID: notification.TenantID, Channel: deadLetter.Channel, CreatedAt: time.Now().UTC()}
+		if err := a.queue.EnqueueDispatch(r.Context(), job); err != nil {
+			slog.Default().Error("replay enqueue failed; dead letter not marked replayed", slog.Any("error", err), slog.String("dead_letter_id", deadLetterID), slog.String("attempt_id", attemptID), slog.String("channel", deadLetter.Channel))
+			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
+			return
+		}
+		result, err := a.store.FinalizeDeadLetterReplay(r.Context(), deadLetterID, attemptID)
 		if err != nil {
 			if errors.Is(err, store.ErrNotFound) {
 				writeError(w, http.StatusNotFound, "not_found", "dead letter not found")
@@ -314,16 +340,10 @@ func (a *API) ReplayDeadLetter() http.HandlerFunc {
 			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
 			return
 		}
-		notification, err := a.store.GetNotificationByID(r.Context(), result.Attempt.NotificationID)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
-			return
-		}
-		job := queue.DispatchJob{JobID: generateID("job"), NotificationID: result.Attempt.NotificationID, AttemptID: result.Attempt.ID, TenantID: notification.TenantID, Channel: result.Attempt.Channel, CreatedAt: time.Now().UTC()}
-		if err := a.queue.EnqueueDispatch(r.Context(), job); err != nil {
-			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
-			return
-		}
 		writeJSON(w, http.StatusAccepted, result.Attempt)
 	}
+}
+
+func replayAttemptID(deadLetterID string) string {
+	return fmt.Sprintf("replay_%s", deadLetterID)
 }
