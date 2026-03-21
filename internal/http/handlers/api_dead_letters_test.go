@@ -15,34 +15,45 @@ import (
 )
 
 type fakeAPIStore struct {
-	deadLetters        map[string]store.DeadLetter
-	attempt            store.DeliveryAttempt
-	notification       store.Notification
-	ensureCalls        int
-	finalizeCalls      int
-	finalizedAttemptID string
-	ensureErr          error
-	finalizeErr        error
+	deadLetters         map[string]store.DeadLetter
+	attempt             store.DeliveryAttempt
+	notification        store.Notification
+	ensureCalls         int
+	markEnqueuedCalls   int
+	createdAttempt      *store.CreateDeliveryAttemptParams
+	createdNotification *store.CreateNotificationParams
+	finalizeCalls       int
+	finalizedAttemptID  string
+	ensureErr           error
+	finalizeErr         error
 }
 
 func (f *fakeAPIStore) CreateTenant(context.Context, store.CreateTenantParams) (store.Tenant, error) {
 	panic("unused")
 }
-func (f *fakeAPIStore) GetTenantByID(context.Context, string) (store.Tenant, error) { panic("unused") }
+func (f *fakeAPIStore) GetTenantByID(_ context.Context, id string) (store.Tenant, error) {
+	return store.Tenant{ID: id}, nil
+}
 func (f *fakeAPIStore) CreateTemplate(context.Context, store.CreateTemplateParams) (store.Template, error) {
 	panic("unused")
 }
-func (f *fakeAPIStore) GetTemplateByID(context.Context, string) (store.Template, error) {
-	panic("unused")
+func (f *fakeAPIStore) GetTemplateByID(_ context.Context, id string) (store.Template, error) {
+	return store.Template{ID: id, TenantID: "tenant-1", Channel: "email", Name: "welcome"}, nil
 }
 func (f *fakeAPIStore) GetNotificationByTenantAndIdempotencyKey(context.Context, string, string) (store.Notification, error) {
-	panic("unused")
+	return store.Notification{}, store.ErrNotFound
 }
-func (f *fakeAPIStore) CreateNotification(context.Context, store.CreateNotificationParams) (store.Notification, error) {
-	panic("unused")
+func (f *fakeAPIStore) CreateNotification(_ context.Context, params store.CreateNotificationParams) (store.Notification, error) {
+	f.createdNotification = &params
+	return store.Notification{ID: params.ID, TenantID: params.TenantID, TemplateID: params.TemplateID}, nil
 }
-func (f *fakeAPIStore) CreateDeliveryAttempt(context.Context, store.CreateDeliveryAttemptParams) (store.DeliveryAttempt, error) {
-	panic("unused")
+func (f *fakeAPIStore) CreateDeliveryAttempt(_ context.Context, params store.CreateDeliveryAttemptParams) (store.DeliveryAttempt, error) {
+	f.createdAttempt = &params
+	return store.DeliveryAttempt{ID: params.ID, NotificationID: params.NotificationID, Channel: params.Channel, AttemptNumber: params.AttemptNumber, Status: params.Status, EnqueueKind: params.EnqueueKind}, nil
+}
+func (f *fakeAPIStore) MarkAttemptEnqueued(_ context.Context, attemptID string) error {
+	f.markEnqueuedCalls++
+	return nil
 }
 func (f *fakeAPIStore) ListDeadLetters(context.Context, int) ([]store.DeadLetter, error) {
 	out := make([]store.DeadLetter, 0, len(f.deadLetters))
@@ -166,5 +177,25 @@ func TestReplayDeadLetterEnqueueFailureLeavesRecoverableAttempt(t *testing.T) {
 	}
 	if st.deadLetters["dead-1"].ReplayAttemptID == nil {
 		t.Fatal("replay attempt should remain durable and recoverable")
+	}
+}
+
+func TestCreateNotificationMarksInitialAttemptEnqueued(t *testing.T) {
+	st, q, api := newDeadLetterTestAPI()
+	req := httptest.NewRequest(http.MethodPost, "/v1/notifications", bytes.NewReader([]byte(`{"id":"notif-1","tenant_id":"tenant-1","template_id":"tpl-1","recipient_email":"user@example.test","variables":{}}`)))
+	req.Header.Set("Content-Type", "application/json")
+	res := httptest.NewRecorder()
+	api.CreateNotification().ServeHTTP(res, req)
+	if res.Code != http.StatusAccepted {
+		t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
+	}
+	if st.createdAttempt == nil || st.createdAttempt.EnqueueKind != "initial" {
+		t.Fatalf("createdAttempt=%+v", st.createdAttempt)
+	}
+	if st.markEnqueuedCalls != 1 {
+		t.Fatalf("markEnqueuedCalls=%d", st.markEnqueuedCalls)
+	}
+	if len(q.jobs) != 1 {
+		t.Fatalf("jobs=%d", len(q.jobs))
 	}
 }

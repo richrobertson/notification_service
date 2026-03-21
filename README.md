@@ -76,7 +76,7 @@ The current retry model is:
 6. if Redis is unavailable, the attempt remains pending enqueue in PostgreSQL and is retried later
 7. once the retry budget is exhausted, the final attempt is marked `dead_lettered` and a `dead_letters` row is inserted
 
-Replay uses the same model: the replay attempt is created durably first, the dead letter is only marked replayed after enqueue succeeds, and failed enqueue work remains recoverable from PostgreSQL. This keeps the history inspectable without introducing a full generalized outbox or lease framework.
+Replay uses the same model: the replay attempt is created durably first, the dead letter is only marked replayed after enqueue succeeds, and failed enqueue work remains recoverable from PostgreSQL. Normal initial API attempts are marked with `enqueue_kind = initial` and marked enqueued after successful publish, while retry/replay recovery only scans `enqueue_kind IN (retry, replay)`. This keeps the history inspectable without introducing a full generalized outbox or lease framework.
 
 ## Queue Recovery Behavior
 

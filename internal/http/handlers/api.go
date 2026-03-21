@@ -23,6 +23,7 @@ type apiStore interface {
 	GetNotificationByTenantAndIdempotencyKey(ctx context.Context, tenantID, idempotencyKey string) (store.Notification, error)
 	CreateNotification(ctx context.Context, params store.CreateNotificationParams) (store.Notification, error)
 	CreateDeliveryAttempt(ctx context.Context, params store.CreateDeliveryAttemptParams) (store.DeliveryAttempt, error)
+	MarkAttemptEnqueued(ctx context.Context, attemptID string) error
 	ListDeadLetters(ctx context.Context, limit int) ([]store.DeadLetter, error)
 	GetDeadLetterByID(ctx context.Context, id string) (store.DeadLetter, error)
 	EnsureReplayAttempt(ctx context.Context, deadLetterID, newAttemptID string) (store.ReplayDeadLetterResult, error)
@@ -248,7 +249,7 @@ func (a *API) CreateNotification() http.HandlerFunc {
 		}
 
 		attemptID := generateID("attempt")
-		attempt, err := a.store.CreateDeliveryAttempt(r.Context(), store.CreateDeliveryAttemptParams{ID: attemptID, NotificationID: notification.ID, Channel: template.Channel, AttemptNumber: 1, Status: "pending"})
+		attempt, err := a.store.CreateDeliveryAttempt(r.Context(), store.CreateDeliveryAttemptParams{ID: attemptID, NotificationID: notification.ID, Channel: template.Channel, AttemptNumber: 1, Status: "pending", EnqueueKind: "initial"})
 		if err != nil {
 			slog.Default().Error("failed to create delivery attempt", slog.Any("error", err), slog.String("notification_id", notification.ID), slog.String("attempt_id", attemptID), slog.String("channel", template.Channel))
 			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
@@ -258,6 +259,11 @@ func (a *API) CreateNotification() http.HandlerFunc {
 		job := queue.DispatchJob{JobID: generateID("job"), NotificationID: notification.ID, AttemptID: attempt.ID, TenantID: notification.TenantID, Channel: template.Channel, CreatedAt: time.Now().UTC()}
 		if err := a.queue.EnqueueDispatch(r.Context(), job); err != nil {
 			slog.Default().Error("failed to enqueue dispatch job", slog.Any("error", err), slog.String("notification_id", notification.ID), slog.String("attempt_id", attempt.ID), slog.String("job_id", job.JobID), slog.String("channel", job.Channel))
+			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
+			return
+		}
+
+		if err := a.store.MarkAttemptEnqueued(r.Context(), attempt.ID); err != nil {
 			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
 			return
 		}

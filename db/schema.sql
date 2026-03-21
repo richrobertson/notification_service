@@ -88,6 +88,7 @@ CREATE TABLE delivery_attempts (
     sent_at TIMESTAMPTZ,
     failed_at TIMESTAMPTZ,
     dispatch_enqueued_at TIMESTAMPTZ,
+    enqueue_kind TEXT NOT NULL DEFAULT 'initial',
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE (notification_id, channel, attempt_number)
@@ -102,7 +103,7 @@ CREATE INDEX delivery_attempts_retry_idx
 
 CREATE INDEX delivery_attempts_dispatch_pending_idx
     ON delivery_attempts (status, created_at)
-    WHERE dispatch_enqueued_at IS NULL;
+    WHERE dispatch_enqueued_at IS NULL AND enqueue_kind IN ('retry', 'replay');
 
 CREATE TABLE dead_letters (
     id UUID PRIMARY KEY,
