@@ -81,6 +81,10 @@ func (q *RedisQueue) EnqueueChannel(ctx context.Context, job DispatchJob) error 
 	return q.enqueue(ctx, queueName, job)
 }
 
+func (q *RedisQueue) ReserveDispatch(ctx context.Context, timeoutSeconds int) (ReservedJob, error) {
+	return q.ReserveChannel(ctx, DispatchQueueName, timeoutSeconds)
+}
+
 func (q *RedisQueue) ConsumeDispatch(ctx context.Context) (DispatchJob, error) {
 	return q.ConsumeChannel(ctx, DispatchQueueName, 1)
 }

@@ -13,9 +13,10 @@ import (
 )
 
 type fakeRedisServer struct {
-	ln    net.Listener
-	mu    sync.Mutex
-	lists map[string][]string
+	ln       net.Listener
+	mu       sync.Mutex
+	lists    map[string][]string
+	failNext map[string]error
 }
 
 func newFakeRedisServer(t *testing.T) *fakeRedisServer {
@@ -24,13 +25,18 @@ func newFakeRedisServer(t *testing.T) *fakeRedisServer {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	s := &fakeRedisServer{ln: ln, lists: map[string][]string{}}
+	s := &fakeRedisServer{ln: ln, lists: map[string][]string{}, failNext: map[string]error{}}
 	go s.serve(t)
 	return s
 }
 
 func (s *fakeRedisServer) addr() string { return s.ln.Addr().String() }
 func (s *fakeRedisServer) close()       { _ = s.ln.Close() }
+func (s *fakeRedisServer) failOnce(key string, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.failNext[key] = err
+}
 
 func (s *fakeRedisServer) serve(t *testing.T) {
 	for {
@@ -62,6 +68,10 @@ func (s *fakeRedisServer) handleConn(t *testing.T, conn net.Conn) {
 		case "PING":
 			writeSimple(w, "PONG")
 		case "MULTI":
+			if err := s.consumeFailureLocked("MULTI"); err != nil {
+				writeError(w, err.Error())
+				continue
+			}
 			tx = [][]string{{"MULTI"}}
 			writeSimple(w, "OK")
 		case "EXEC":
@@ -87,6 +97,16 @@ func (s *fakeRedisServer) handleConn(t *testing.T, conn net.Conn) {
 	}
 }
 
+func (s *fakeRedisServer) consumeFailureLocked(key string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err, ok := s.failNext[key]; ok {
+		delete(s.failNext, key)
+		return err
+	}
+	return nil
+}
+
 type respValue interface{ raw() string }
 
 type respInteger int64
@@ -99,6 +119,9 @@ func (v respBulk) raw() string    { return fmt.Sprintf("$%d\r\n%s\r\n", len(stri
 func (respNilBulk) raw() string   { return "$-1\r\n" }
 
 func (s *fakeRedisServer) execCommand(cmd []string) (respValue, error) {
+	if err := s.consumeFailureLocked(strings.ToUpper(cmd[0]) + " " + strings.Join(cmd[1:], " ")); err != nil {
+		return nil, err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	switch strings.ToUpper(cmd[0]) {
@@ -253,6 +276,107 @@ func TestRequeueReservedParsesRealExecIntegerReplies(t *testing.T) {
 	}
 	if err := q.RequeueReserved(ctx, reserved); err != nil {
 		t.Fatalf("RequeueReserved() error = %v", err)
+	}
+}
+
+func TestDispatchJobNotLostWhenChannelEnqueueFails(t *testing.T) {
+	t.Parallel()
+	server := newFakeRedisServer(t)
+	defer server.close()
+
+	q := NewRedisQueue(server.addr(), "", 0)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	job := DispatchJob{JobID: "job-3", NotificationID: "notif-3", AttemptID: "attempt-3", Channel: "email", CreatedAt: time.Now().UTC()}
+	if err := q.EnqueueDispatch(ctx, job); err != nil {
+		t.Fatalf("EnqueueDispatch() error = %v", err)
+	}
+	reserved, err := q.ReserveDispatch(ctx, 1)
+	if err != nil {
+		t.Fatalf("ReserveDispatch() error = %v", err)
+	}
+	server.failOnce("RPUSH "+DispatchEmailQueueName+" "+reserved.payload, fmt.Errorf("enqueue failed"))
+	if err := q.EnqueueChannel(ctx, reserved.Job); err == nil {
+		t.Fatal("EnqueueChannel() error = nil, want failure")
+	}
+	if err := q.RequeueReserved(ctx, reserved); err != nil {
+		t.Fatalf("RequeueReserved() error = %v", err)
+	}
+
+	server.mu.Lock()
+	defer server.mu.Unlock()
+	if got := len(server.lists[DispatchQueueName]); got != 1 {
+		t.Fatalf("dispatch queue length = %d, want 1", got)
+	}
+	if got := len(server.lists[ProcessingQueueName(DispatchQueueName)]); got != 0 {
+		t.Fatalf("dispatch processing queue length = %d, want 0", got)
+	}
+}
+
+func TestDispatchJobAckRemovesSourceReservationAfterSuccessfulRoute(t *testing.T) {
+	t.Parallel()
+	server := newFakeRedisServer(t)
+	defer server.close()
+
+	q := NewRedisQueue(server.addr(), "", 0)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	job := DispatchJob{JobID: "job-4", NotificationID: "notif-4", AttemptID: "attempt-4", Channel: "webhook", CreatedAt: time.Now().UTC()}
+	if err := q.EnqueueDispatch(ctx, job); err != nil {
+		t.Fatalf("EnqueueDispatch() error = %v", err)
+	}
+	reserved, err := q.ReserveDispatch(ctx, 1)
+	if err != nil {
+		t.Fatalf("ReserveDispatch() error = %v", err)
+	}
+	if err := q.EnqueueChannel(ctx, reserved.Job); err != nil {
+		t.Fatalf("EnqueueChannel() error = %v", err)
+	}
+	if err := q.AckReserved(ctx, reserved); err != nil {
+		t.Fatalf("AckReserved() error = %v", err)
+	}
+
+	server.mu.Lock()
+	defer server.mu.Unlock()
+	if got := len(server.lists[ProcessingQueueName(DispatchQueueName)]); got != 0 {
+		t.Fatalf("dispatch processing queue length = %d, want 0", got)
+	}
+	if got := len(server.lists[DispatchWebhookQueueName]); got != 1 {
+		t.Fatalf("target queue length = %d, want 1", got)
+	}
+}
+
+func TestDispatchJobRemainsReservedWhenRequeueFails(t *testing.T) {
+	t.Parallel()
+	server := newFakeRedisServer(t)
+	defer server.close()
+
+	q := NewRedisQueue(server.addr(), "", 0)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	job := DispatchJob{JobID: "job-5", NotificationID: "notif-5", AttemptID: "attempt-5", Channel: "email", CreatedAt: time.Now().UTC()}
+	if err := q.EnqueueDispatch(ctx, job); err != nil {
+		t.Fatalf("EnqueueDispatch() error = %v", err)
+	}
+	reserved, err := q.ReserveDispatch(ctx, 1)
+	if err != nil {
+		t.Fatalf("ReserveDispatch() error = %v", err)
+	}
+	server.failOnce("MULTI", fmt.Errorf("multi failed"))
+	if err := q.RequeueReserved(ctx, reserved); err == nil {
+		t.Fatal("RequeueReserved() error = nil, want failure")
+	}
+
+	server.mu.Lock()
+	defer server.mu.Unlock()
+	if got := len(server.lists[DispatchQueueName]); got != 0 {
+		t.Fatalf("dispatch queue length = %d, want 0", got)
+	}
+	if got := len(server.lists[ProcessingQueueName(DispatchQueueName)]); got != 1 {
+		t.Fatalf("dispatch processing queue length = %d, want 1", got)
 	}
 }
 

@@ -64,20 +64,21 @@ Current request flow:
 3. API persists the notification row in PostgreSQL
 4. API inserts the initial `delivery_attempts` row with `pending`
 5. API enqueues a small JSON dispatch job onto `notify:dispatch`
-6. `cmd/dispatcher` blocks on `notify:dispatch`
+6. `cmd/dispatcher` reserves a job from `notify:dispatch` into `notify:dispatch:processing`
 7. Dispatcher republishes the same job to either `notify:dispatch:webhook` or `notify:dispatch:email`
-8. A channel worker loads the notification, template, and delivery attempt from PostgreSQL
-9. The worker renders the outbound payload and performs real delivery
-10. The worker marks the attempt `in_progress` once work begins
-11. On durable success the worker ACKs the reserved Redis job and marks `delivery_attempts` as `sent`
-12. On durable terminal failure the worker ACKs the reserved Redis job and marks `delivery_attempts` as `failed`
-13. On transient persistence or processing interruption the worker requeues the reserved job instead of silently losing it
+8. Dispatcher ACKs the reserved dispatch job only after the channel enqueue succeeds; otherwise it requeues the job back to `notify:dispatch`
+9. A channel worker reserves the channel job into its own `*:processing` queue, loads the notification, template, and delivery attempt from PostgreSQL
+10. The worker renders the outbound payload and performs real delivery
+11. The worker marks the attempt `in_progress` once work begins
+12. On durable success the worker ACKs the reserved Redis job and marks `delivery_attempts` as `sent`
+13. On durable terminal failure the worker ACKs the reserved Redis job and marks `delivery_attempts` as `failed`
+14. On transient persistence or processing interruption the worker requeues the reserved job instead of silently losing it
 
 Important honesty notes:
 
 - The API still does **not** push directly to channel queues.
 - Workers currently process one job at a time in a simple loop.
-- Workers now reserve jobs into per-channel processing queues before attempting delivery so transient DB/update failures do not silently drop work.
+- The dispatcher and channel workers now reserve jobs into processing queues before acknowledging them, so transient routing or DB/update failures do not silently drop work.
 - Malformed queue jobs can still strand a reserved entry in the processing queue and require operator cleanup; there is no automated recovery sweeper yet.
 - PostgreSQL writes and Redis enqueue are **not** yet coordinated with an outbox pattern, so DB/queue atomicity is not yet hardened.
 - Reserved in-flight jobs are safer than destructive pops, but a worker crash can still leave a job sitting in `*:processing`. Current workers do not automatically recover or replay those reserved jobs; manual recovery or a future recovery loop is still required.
@@ -88,7 +89,8 @@ Important honesty notes:
 
 What Stage 4 now guarantees:
 
-- a worker does not remove a channel job from Redis until it has durably recorded either `sent` or terminal `failed`, or explicitly requeued the job after a transient processing failure
+- the dispatcher does not remove a dispatch job from Redis until channel republish succeeds or the dispatch job has been requeued back to `notify:dispatch`
+- a channel worker does not remove a channel job from Redis until it has durably recorded either `sent` or terminal `failed`, or explicitly requeued the job after a transient processing failure
 - attempts move to `in_progress` when a worker begins meaningful work
 - terminal failures such as missing recipients, template rendering errors, webhook failures, and SMTP delivery failures are recorded as `failed`
 - transient infrastructure failures such as PostgreSQL load/update failures cause the job to remain recoverable instead of being silently lost
@@ -97,7 +99,7 @@ What Stage 4 now guarantees:
 What Stage 4 still does **not** guarantee:
 
 - no retries, retry scheduling, DLQ routing, replay APIs, or provider failover yet
-- no automated recovery or replay of jobs left behind in `*:processing` after a worker crash
+- no automated recovery or replay of jobs left behind in `*:processing` after a dispatcher or worker crash
 - no outbox-style atomicity between PostgreSQL writes and Redis enqueue
 - no exactly-once delivery semantics
 
@@ -120,7 +122,8 @@ Redis list queues used in Stage 4:
 - channel queues:
   - `notify:dispatch:webhook`
   - `notify:dispatch:email`
-- processing queues used by workers while a job is reserved:
+- processing queues used while a job is reserved:
+  - `notify:dispatch:processing`
   - `notify:dispatch:webhook:processing`
   - `notify:dispatch:email:processing`
 
