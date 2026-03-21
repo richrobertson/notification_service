@@ -109,6 +109,8 @@ func (f *fakeAPIStore) EnsureInitialAttempt(_ context.Context, notificationID, c
 		params := store.CreateDeliveryAttemptParams{ID: attemptID, NotificationID: notificationID, Channel: channel, AttemptNumber: 1, Status: "pending", EnqueueKind: "initial"}
 		f.createAttemptCalls++
 		f.createdAttempt = &params
+		f.notification.ID = notificationID
+		f.notification.Status = "processing"
 	}
 	f.initialAttemptMissing = false
 	return f.GetInitialAttemptByNotificationID(context.Background(), notificationID)
@@ -146,6 +148,8 @@ func (f *fakeAPIStore) EnsureReplayAttempt(_ context.Context, id, newAttemptID s
 	attempt.ID = newAttemptID
 	dl.ReplayAttemptID = &attempt.ID
 	f.deadLetters[id] = dl
+	f.notification.ID = dl.NotificationID
+	f.notification.Status = "processing"
 	return store.ReplayDeadLetterResult{DeadLetter: dl, Attempt: attempt}, nil
 }
 func (f *fakeAPIStore) FinalizeReplayEnqueue(_ context.Context, id, attemptID string) error {
@@ -280,6 +284,67 @@ func TestReplayDeadLetterEnqueueFailureLeavesRecoverableAttempt(t *testing.T) {
 	}
 	if st.deadLetters["dead-1"].ReplayAttemptID == nil {
 		t.Fatal("replay attempt should remain durable and recoverable")
+	}
+}
+
+func TestCreateNotificationUpdatesInspectionStatusWhenAttemptIsPending(t *testing.T) {
+	_, q, api := newDeadLetterTestAPI()
+	q.err = errors.New("redis down")
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/notifications", bytes.NewReader([]byte(`{"id":"notif-1","tenant_id":"tenant-1","template_id":"tpl-1","recipient_email":"user@example.test","variables":{}}`)))
+	req.Header.Set("Content-Type", "application/json")
+	res := httptest.NewRecorder()
+	api.CreateNotification().ServeHTTP(res, req)
+	if res.Code != http.StatusAccepted {
+		t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
+	}
+
+	getReq := httptest.NewRequest(http.MethodGet, "/v1/notifications/notif-1", nil)
+	getReq.SetPathValue("id", "notif-1")
+	getRes := httptest.NewRecorder()
+	api.GetNotification().ServeHTTP(getRes, getReq)
+	if getRes.Code != http.StatusOK {
+		t.Fatalf("get status=%d body=%s", getRes.Code, getRes.Body.String())
+	}
+	var payload struct {
+		Notification store.Notification `json:"notification"`
+	}
+	if err := json.NewDecoder(getRes.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Notification.Status != "processing" {
+		t.Fatalf("notification status=%q", payload.Notification.Status)
+	}
+}
+
+func TestReplayDeadLetterUpdatesInspectionStatusWhenReplayAttemptIsPending(t *testing.T) {
+	st, q, api := newDeadLetterTestAPI()
+	q.err = errors.New("redis down")
+	st.notification.Status = "dead_lettered"
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/dead-letters/dead-1/replay", bytes.NewReader(nil))
+	req.SetPathValue("id", "dead-1")
+	res := httptest.NewRecorder()
+	api.ReplayDeadLetter().ServeHTTP(res, req)
+	if res.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
+	}
+
+	getReq := httptest.NewRequest(http.MethodGet, "/v1/notifications/notif-1", nil)
+	getReq.SetPathValue("id", "notif-1")
+	getRes := httptest.NewRecorder()
+	api.GetNotification().ServeHTTP(getRes, getReq)
+	if getRes.Code != http.StatusOK {
+		t.Fatalf("get status=%d body=%s", getRes.Code, getRes.Body.String())
+	}
+	var payload struct {
+		Notification store.Notification `json:"notification"`
+	}
+	if err := json.NewDecoder(getRes.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Notification.Status != "processing" {
+		t.Fatalf("notification status=%q", payload.Notification.Status)
 	}
 }
 
