@@ -93,6 +93,9 @@ func runOnce(ctx context.Context, logger *slog.Logger, postgres retryStore, redi
 		if err := postgres.MarkAttemptEnqueued(ctx, item.Attempt.ID); err != nil {
 			return err
 		}
+		if item.Attempt.EnqueueKind == "initial" {
+			logger.Info("recovered pending initial attempt and enqueued dispatch job", slog.String("attempt_id", item.Attempt.ID), slog.String("notification_id", item.Attempt.NotificationID), slog.String("channel", item.Attempt.Channel))
+		}
 		if item.DeadLetterID != nil {
 			if err := postgres.FinalizeReplayEnqueue(ctx, *item.DeadLetterID, item.Attempt.ID); err != nil {
 				return err

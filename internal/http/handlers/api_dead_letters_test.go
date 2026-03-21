@@ -15,18 +15,24 @@ import (
 )
 
 type fakeAPIStore struct {
-	deadLetters         map[string]store.DeadLetter
-	attempt             store.DeliveryAttempt
-	notification        store.Notification
-	ensureCalls         int
-	markEnqueuedCalls   int
-	createdAttempt      *store.CreateDeliveryAttemptParams
-	createdNotification *store.CreateNotificationParams
-	finalizeCalls       int
-	finalizedAttemptID  string
-	ensureErr           error
-	finalizeErr         error
-	existingByKey       map[string]store.Notification
+	deadLetters           map[string]store.DeadLetter
+	attempt               store.DeliveryAttempt
+	notification          store.Notification
+	ensureCalls           int
+	markEnqueuedCalls     int
+	createAttemptCalls    int
+	createNotifyCalls     int
+	createdAttempt        *store.CreateDeliveryAttemptParams
+	createdNotification   *store.CreateNotificationParams
+	finalizeCalls         int
+	finalizedAttemptID    string
+	ensureErr             error
+	finalizeErr           error
+	existingByKey         map[string]store.Notification
+	createNotificationErr error
+	fallbackExisting      *store.Notification
+	lookupCalls           int
+	fallbackAfterLookup   int
 }
 
 func (f *fakeAPIStore) CreateTenant(context.Context, store.CreateTenantParams) (store.Tenant, error) {
@@ -42,14 +48,22 @@ func (f *fakeAPIStore) GetTemplateByID(_ context.Context, id string) (store.Temp
 	return store.Template{ID: id, TenantID: "tenant-1", Channel: "email", Name: "welcome"}, nil
 }
 func (f *fakeAPIStore) GetNotificationByTenantAndIdempotencyKey(_ context.Context, tenantID, key string) (store.Notification, error) {
+	f.lookupCalls++
 	if f.existingByKey != nil {
 		if n, ok := f.existingByKey[tenantID+"/"+key]; ok {
 			return n, nil
 		}
 	}
+	if f.fallbackExisting != nil && f.lookupCalls >= f.fallbackAfterLookup {
+		return *f.fallbackExisting, nil
+	}
 	return store.Notification{}, store.ErrNotFound
 }
 func (f *fakeAPIStore) CreateNotification(_ context.Context, params store.CreateNotificationParams) (store.Notification, error) {
+	f.createNotifyCalls++
+	if f.createNotificationErr != nil {
+		return store.Notification{}, f.createNotificationErr
+	}
 	f.createdNotification = &params
 	n := store.Notification{ID: params.ID, TenantID: params.TenantID, TemplateID: params.TemplateID, IdempotencyKey: params.IdempotencyKey}
 	if params.IdempotencyKey != nil {
@@ -73,6 +87,7 @@ func (f *fakeAPIStore) GetInitialAttemptByNotificationID(_ context.Context, noti
 	return store.DeliveryAttempt{}, store.ErrNotFound
 }
 func (f *fakeAPIStore) CreateDeliveryAttempt(_ context.Context, params store.CreateDeliveryAttemptParams) (store.DeliveryAttempt, error) {
+	f.createAttemptCalls++
 	f.createdAttempt = &params
 	return store.DeliveryAttempt{ID: params.ID, NotificationID: params.NotificationID, Channel: params.Channel, AttemptNumber: params.AttemptNumber, Status: params.Status, EnqueueKind: params.EnqueueKind}, nil
 }
@@ -249,6 +264,50 @@ func TestIdempotentRetryRecoversPendingInitialAttempt(t *testing.T) {
 	}
 	if st.createdNotification == nil || st.createdNotification.ID != "notif-1" {
 		t.Fatalf("createdNotification=%+v", st.createdNotification)
+	}
+	if st.createNotifyCalls != 1 {
+		t.Fatalf("createNotifyCalls=%d", st.createNotifyCalls)
+	}
+	if st.createAttemptCalls != 1 {
+		t.Fatalf("createAttemptCalls=%d", st.createAttemptCalls)
+	}
+	if st.markEnqueuedCalls != 1 {
+		t.Fatalf("markEnqueuedCalls=%d", st.markEnqueuedCalls)
+	}
+	if len(q.jobs) != 1 {
+		t.Fatalf("jobs=%d", len(q.jobs))
+	}
+}
+
+func TestIdempotentConflictRecoversPendingInitialAttempt(t *testing.T) {
+	st, q, api := newDeadLetterTestAPI()
+	key := "stable-key"
+	first := httptest.NewRequest(http.MethodPost, "/v1/notifications", bytes.NewReader([]byte(`{"id":"notif-1","tenant_id":"tenant-1","template_id":"tpl-1","recipient_email":"user@example.test","variables":{},"idempotency_key":"`+key+`"}`)))
+	first.Header.Set("Content-Type", "application/json")
+	q.err = errors.New("redis down")
+	firstRes := httptest.NewRecorder()
+	api.CreateNotification().ServeHTTP(firstRes, first)
+	if firstRes.Code != http.StatusAccepted {
+		t.Fatalf("first status=%d body=%s", firstRes.Code, firstRes.Body.String())
+	}
+
+	st.fallbackExisting = &store.Notification{ID: "notif-1", TenantID: "tenant-1"}
+	st.fallbackAfterLookup = 3
+	st.existingByKey = nil
+	st.createNotificationErr = store.ErrConflict
+	q.err = nil
+	second := httptest.NewRequest(http.MethodPost, "/v1/notifications", bytes.NewReader([]byte(`{"id":"notif-2","tenant_id":"tenant-1","template_id":"tpl-1","recipient_email":"user@example.test","variables":{},"idempotency_key":"`+key+`"}`)))
+	second.Header.Set("Content-Type", "application/json")
+	secondRes := httptest.NewRecorder()
+	api.CreateNotification().ServeHTTP(secondRes, second)
+	if secondRes.Code != http.StatusAccepted {
+		t.Fatalf("second status=%d body=%s", secondRes.Code, secondRes.Body.String())
+	}
+	if st.createNotifyCalls != 2 {
+		t.Fatalf("createNotifyCalls=%d", st.createNotifyCalls)
+	}
+	if st.createAttemptCalls != 1 {
+		t.Fatalf("createAttemptCalls=%d", st.createAttemptCalls)
 	}
 	if st.markEnqueuedCalls != 1 {
 		t.Fatalf("markEnqueuedCalls=%d", st.markEnqueuedCalls)

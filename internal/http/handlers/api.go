@@ -70,6 +70,34 @@ func NewAPI(store apiStore, redisQueue dispatchQueue) *API {
 	return &API{store: store, queue: redisQueue}
 }
 
+func (a *API) recoverPendingInitialAttempt(ctx context.Context, w http.ResponseWriter, existing store.Notification) {
+	attempt, attemptErr := a.store.GetInitialAttemptByNotificationID(ctx, existing.ID)
+	if attemptErr != nil {
+		if errors.Is(attemptErr, store.ErrNotFound) {
+			writeJSON(w, http.StatusOK, existing)
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
+		return
+	}
+	if attempt.DispatchEnqueuedAt != nil {
+		writeJSON(w, http.StatusOK, existing)
+		return
+	}
+	slog.Default().Warn("idempotent retry found existing notification with pending initial enqueue", slog.String("notification_id", existing.ID), slog.String("attempt_id", attempt.ID), slog.String("channel", attempt.Channel))
+	job := queue.DispatchJob{JobID: generateID("job"), NotificationID: existing.ID, AttemptID: attempt.ID, TenantID: existing.TenantID, Channel: attempt.Channel, CreatedAt: time.Now().UTC()}
+	if enqueueErr := a.queue.EnqueueDispatch(ctx, job); enqueueErr != nil {
+		slog.Default().Error("initial attempt enqueue failed; attempt remains recoverable in postgres", slog.Any("error", enqueueErr), slog.String("notification_id", existing.ID), slog.String("attempt_id", attempt.ID), slog.String("channel", attempt.Channel))
+		writeJSON(w, http.StatusAccepted, existing)
+		return
+	}
+	if markErr := a.store.MarkAttemptEnqueued(ctx, attempt.ID); markErr != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
+		return
+	}
+	writeJSON(w, http.StatusAccepted, existing)
+}
+
 func (a *API) CreateTenant() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req createTenantRequest
@@ -176,23 +204,7 @@ func (a *API) CreateNotification() http.HandlerFunc {
 		if req.IdempotencyKey != "" {
 			existing, err := a.store.GetNotificationByTenantAndIdempotencyKey(r.Context(), req.TenantID, req.IdempotencyKey)
 			if err == nil {
-				attempt, attemptErr := a.store.GetInitialAttemptByNotificationID(r.Context(), existing.ID)
-				if attemptErr == nil && attempt.DispatchEnqueuedAt == nil {
-					slog.Default().Warn("idempotent retry found existing notification with pending initial enqueue", slog.String("notification_id", existing.ID), slog.String("attempt_id", attempt.ID), slog.String("channel", attempt.Channel))
-					job := queue.DispatchJob{JobID: generateID("job"), NotificationID: existing.ID, AttemptID: attempt.ID, TenantID: existing.TenantID, Channel: attempt.Channel, CreatedAt: time.Now().UTC()}
-					if enqueueErr := a.queue.EnqueueDispatch(r.Context(), job); enqueueErr != nil {
-						slog.Default().Error("initial attempt enqueue failed; attempt remains recoverable in postgres", slog.Any("error", enqueueErr), slog.String("notification_id", existing.ID), slog.String("attempt_id", attempt.ID), slog.String("channel", attempt.Channel))
-						writeJSON(w, http.StatusAccepted, existing)
-						return
-					}
-					if markErr := a.store.MarkAttemptEnqueued(r.Context(), attempt.ID); markErr != nil {
-						writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
-						return
-					}
-					writeJSON(w, http.StatusAccepted, existing)
-					return
-				}
-				writeJSON(w, http.StatusOK, existing)
+				a.recoverPendingInitialAttempt(r.Context(), w, existing)
 				return
 			}
 			if !errors.Is(err, store.ErrNotFound) {
@@ -253,7 +265,7 @@ func (a *API) CreateNotification() http.HandlerFunc {
 			if req.IdempotencyKey != "" && store.IsConflict(err) {
 				existing, lookupErr := a.store.GetNotificationByTenantAndIdempotencyKey(r.Context(), req.TenantID, req.IdempotencyKey)
 				if lookupErr == nil {
-					writeJSON(w, http.StatusOK, existing)
+					a.recoverPendingInitialAttempt(r.Context(), w, existing)
 					return
 				}
 			}
