@@ -37,12 +37,12 @@ func (s *WebhookSender) Send(ctx context.Context, req WebhookRequest) (string, e
 		return "", fmt.Errorf("build webhook request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", contentTypeForBody(req.Body))
-	if strings.TrimSpace(req.AttemptID) != "" {
-		httpReq.Header.Set("Idempotency-Key", req.AttemptID)
-		httpReq.Header.Set("X-Notification-Attempt-ID", req.AttemptID)
+	if id := sanitizeHeaderValue(req.AttemptID); id != "" {
+		httpReq.Header.Set("Idempotency-Key", id)
+		httpReq.Header.Set("X-Notification-Attempt-ID", id)
 	}
-	if strings.TrimSpace(req.NotificationID) != "" {
-		httpReq.Header.Set("X-Notification-ID", req.NotificationID)
+	if id := sanitizeHeaderValue(req.NotificationID); id != "" {
+		httpReq.Header.Set("X-Notification-ID", id)
 	}
 
 	resp, err := s.client.Do(httpReq)
@@ -72,4 +72,12 @@ func contentTypeForBody(body string) string {
 		return "application/json"
 	}
 	return "text/plain; charset=utf-8"
+}
+
+// sanitizeHeaderValue strips CR and LF characters to prevent header injection.
+func sanitizeHeaderValue(v string) string {
+	v = strings.TrimSpace(v)
+	v = strings.ReplaceAll(v, "\r", "")
+	v = strings.ReplaceAll(v, "\n", "")
+	return v
 }
