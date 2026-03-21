@@ -558,16 +558,18 @@ func (p *Postgres) EnsureInitialAttempt(ctx context.Context, notificationID, cha
 	`
 	result, err := p.DB.ExecContext(ctx, insertQuery, attemptID, notificationID, channel)
 	if err != nil {
-	_, err := p.DB.ExecContext(ctx, insertQuery, attemptID, notificationID, channel)
+		return DeliveryAttempt{}, wrapStoreError("ensure initial attempt", err)
+	}
+	rowsAffected, err := result.RowsAffected()
 	if err != nil {
 		return DeliveryAttempt{}, wrapStoreError("ensure initial attempt", err)
 	}
-	if err := p.RecalculateNotificationStatus(ctx, notificationID); err != nil {
-		return DeliveryAttempt{}, err
+	if rowsAffected > 0 {
+		if err := p.RecalculateNotificationStatus(ctx, notificationID); err != nil {
+			return DeliveryAttempt{}, err
+		}
 	}
 	const selectQuery = `
-		SELECT id, notification_id, channel, attempt_number, status, error_code, error_message, provider_message_id, last_error, next_retry_at, started_at, completed_at, sent_at, failed_at, dispatch_enqueued_at, enqueue_kind, created_at, updated_at
-		FROM delivery_attempts
 		SELECT id, notification_id, channel, attempt_number, status, error_code, error_message, provider_message_id, last_error, next_retry_at, started_at, completed_at, sent_at, failed_at, dispatch_enqueued_at, enqueue_kind, created_at, updated_at
 		FROM delivery_attempts
 		WHERE notification_id = $1 AND channel = $2 AND attempt_number = 1
@@ -804,8 +806,12 @@ func (p *Postgres) MarkAttemptInProgress(ctx context.Context, attemptID string) 
 			return fmt.Errorf("mark attempt in progress: %w", ErrInvalidStateTransition)
 		}
 	}
-	if notificationID, err := p.notificationIDForAttempt(ctx, attemptID); err == nil {
-		_ = p.RecalculateNotificationStatus(ctx, notificationID)
+	notificationID, err := p.notificationIDForAttempt(ctx, attemptID)
+	if err != nil {
+		return fmt.Errorf("mark attempt in progress: notification lookup: %w", err)
+	}
+	if err := p.RecalculateNotificationStatus(ctx, notificationID); err != nil {
+		return fmt.Errorf("mark attempt in progress: recalculate notification status: %w", err)
 	}
 	return nil
 }
