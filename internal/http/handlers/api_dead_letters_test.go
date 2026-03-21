@@ -36,6 +36,7 @@ type fakeAPIStore struct {
 	fallbackAfterLookup   int
 	initialAttemptMissing bool
 	ensureInitialErr      error
+	templates             map[string]store.Template
 }
 
 func (f *fakeAPIStore) CreateTenant(context.Context, store.CreateTenantParams) (store.Tenant, error) {
@@ -48,6 +49,11 @@ func (f *fakeAPIStore) CreateTemplate(context.Context, store.CreateTemplateParam
 	panic("unused")
 }
 func (f *fakeAPIStore) GetTemplateByID(_ context.Context, id string) (store.Template, error) {
+	if f.templates != nil {
+		if tpl, ok := f.templates[id]; ok {
+			return tpl, nil
+		}
+	}
 	return store.Template{ID: id, TenantID: "tenant-1", Channel: "email", Name: "welcome"}, nil
 }
 func (f *fakeAPIStore) GetNotificationByTenantAndIdempotencyKey(_ context.Context, tenantID, key string) (store.Notification, error) {
@@ -171,7 +177,15 @@ func (f *fakeDispatchQueue) EnqueueDispatch(_ context.Context, job queue.Dispatc
 }
 
 func newDeadLetterTestAPI() (*fakeAPIStore, *fakeDispatchQueue, *API) {
-	st := &fakeAPIStore{deadLetters: map[string]store.DeadLetter{"dead-1": {ID: "dead-1", NotificationID: "notif-1", Channel: "email", FinalError: "smtp down", DeadLetteredAt: time.Unix(100, 0).UTC()}}, attempt: store.DeliveryAttempt{ID: "attempt-old", NotificationID: "notif-1", Channel: "email", AttemptNumber: 4, Status: "pending"}, notification: store.Notification{ID: "notif-1", TenantID: "tenant-1"}}
+	st := &fakeAPIStore{
+		deadLetters:  map[string]store.DeadLetter{"dead-1": {ID: "dead-1", NotificationID: "notif-1", Channel: "email", FinalError: "smtp down", DeadLetteredAt: time.Unix(100, 0).UTC()}},
+		attempt:      store.DeliveryAttempt{ID: "attempt-old", NotificationID: "notif-1", Channel: "email", AttemptNumber: 4, Status: "pending"},
+		notification: store.Notification{ID: "notif-1", TenantID: "tenant-1"},
+		templates: map[string]store.Template{
+			"tpl-1": {ID: "tpl-1", TenantID: "tenant-1", Channel: "email", Name: "welcome"},
+			"tpl-2": {ID: "tpl-2", TenantID: "tenant-1", Channel: "webhook", Name: "webhook"},
+		},
+	}
 	q := &fakeDispatchQueue{}
 	return st, q, NewAPI(st, q)
 }
@@ -372,8 +386,39 @@ func TestIdempotentRetryRepairsMissingInitialAttempt(t *testing.T) {
 	if st.createdAttempt == nil || st.createdAttempt.NotificationID != "notif-1" {
 		t.Fatalf("createdAttempt=%+v", st.createdAttempt)
 	}
+	if st.createdAttempt.Channel != "email" {
+		t.Fatalf("createdAttempt.Channel=%s", st.createdAttempt.Channel)
+	}
 	if len(q.jobs) != 1 || q.jobs[0].AttemptID != st.createdAttempt.ID {
 		t.Fatalf("jobs=%+v createdAttempt=%+v", q.jobs, st.createdAttempt)
+	}
+}
+
+func TestIdempotentRetryWithChangedRequestTemplateRepairsUsingStoredTemplateChannel(t *testing.T) {
+	st, q, api := newDeadLetterTestAPI()
+	key := "stable-key"
+	existing := store.Notification{ID: "notif-1", TenantID: "tenant-1", TemplateID: "tpl-1"}
+	st.existingByKey = map[string]store.Notification{"tenant-1/" + key: existing}
+	st.initialAttemptMissing = true
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/notifications", bytes.NewReader([]byte(`{"id":"notif-2","tenant_id":"tenant-1","template_id":"tpl-2","recipient_webhook_url":"https://example.test/hook","variables":{},"idempotency_key":"`+key+`"}`)))
+	req.Header.Set("Content-Type", "application/json")
+	res := httptest.NewRecorder()
+	api.CreateNotification().ServeHTTP(res, req)
+	if res.Code != http.StatusAccepted {
+		t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
+	}
+	if st.ensureInitialCalls != 1 {
+		t.Fatalf("ensureInitialCalls=%d", st.ensureInitialCalls)
+	}
+	if st.createdAttempt == nil {
+		t.Fatal("createdAttempt=nil")
+	}
+	if st.createdAttempt.Channel != "email" {
+		t.Fatalf("createdAttempt.Channel=%s", st.createdAttempt.Channel)
+	}
+	if len(q.jobs) != 1 || q.jobs[0].Channel != "email" {
+		t.Fatalf("jobs=%+v", q.jobs)
 	}
 }
 
@@ -400,6 +445,34 @@ func TestIdempotentRetryReturnsExistingNotificationWhenInitialAlreadyEnqueued(t 
 	}
 	if len(q.jobs) != 0 {
 		t.Fatalf("jobs=%d", len(q.jobs))
+	}
+}
+
+func TestIdempotentRetryWithChangedRequestTemplateReusesPendingStoredChannelAttempt(t *testing.T) {
+	st, q, api := newDeadLetterTestAPI()
+	key := "stable-key"
+	existing := store.Notification{ID: "notif-1", TenantID: "tenant-1", TemplateID: "tpl-1"}
+	st.existingByKey = map[string]store.Notification{"tenant-1/" + key: existing}
+	st.createdAttempt = &store.CreateDeliveryAttemptParams{ID: "attempt-1", NotificationID: "notif-1", Channel: "email", AttemptNumber: 1, Status: "pending", EnqueueKind: "initial"}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/notifications", bytes.NewReader([]byte(`{"id":"notif-2","tenant_id":"tenant-1","template_id":"tpl-2","recipient_webhook_url":"https://example.test/hook","variables":{},"idempotency_key":"`+key+`"}`)))
+	req.Header.Set("Content-Type", "application/json")
+	res := httptest.NewRecorder()
+	api.CreateNotification().ServeHTTP(res, req)
+	if res.Code != http.StatusAccepted {
+		t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
+	}
+	if st.ensureInitialCalls != 0 {
+		t.Fatalf("ensureInitialCalls=%d", st.ensureInitialCalls)
+	}
+	if len(q.jobs) != 1 {
+		t.Fatalf("jobs=%d", len(q.jobs))
+	}
+	if q.jobs[0].Channel != "email" {
+		t.Fatalf("job channel=%s", q.jobs[0].Channel)
+	}
+	if q.jobs[0].AttemptID != "attempt-1" {
+		t.Fatalf("jobs=%+v", q.jobs)
 	}
 }
 

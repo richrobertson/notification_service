@@ -71,12 +71,18 @@ func NewAPI(store apiStore, redisQueue dispatchQueue) *API {
 	return &API{store: store, queue: redisQueue}
 }
 
-func (a *API) ensureAndEnqueueInitialAttempt(ctx context.Context, w http.ResponseWriter, existing store.Notification, channel string) {
+func (a *API) ensureAndEnqueueInitialAttempt(ctx context.Context, w http.ResponseWriter, existing store.Notification) {
+	template, err := a.store.GetTemplateByID(ctx, existing.TemplateID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
+		return
+	}
+	slog.Default().Info("idempotent retry recovering existing notification using stored template channel", slog.String("notification_id", existing.ID), slog.String("template_id", existing.TemplateID), slog.String("channel", template.Channel))
 	attempt, attemptErr := a.store.GetInitialAttemptByNotificationID(ctx, existing.ID)
 	if attemptErr != nil {
 		if errors.Is(attemptErr, store.ErrNotFound) {
-			slog.Default().Warn("existing notification found without initial attempt; creating missing initial attempt", slog.String("notification_id", existing.ID), slog.String("channel", channel))
-			attempt, attemptErr = a.store.EnsureInitialAttempt(ctx, existing.ID, channel, generateID("attempt"))
+			slog.Default().Warn("existing notification found without initial attempt; creating missing initial attempt from stored template", slog.String("notification_id", existing.ID), slog.String("template_id", existing.TemplateID), slog.String("channel", template.Channel))
+			attempt, attemptErr = a.store.EnsureInitialAttempt(ctx, existing.ID, template.Channel, generateID("attempt"))
 			if attemptErr != nil {
 				writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
 				return
@@ -248,7 +254,7 @@ func (a *API) CreateNotification() http.HandlerFunc {
 		if req.IdempotencyKey != "" {
 			existing, err := a.store.GetNotificationByTenantAndIdempotencyKey(r.Context(), req.TenantID, req.IdempotencyKey)
 			if err == nil {
-				a.ensureAndEnqueueInitialAttempt(r.Context(), w, existing, template.Channel)
+				a.ensureAndEnqueueInitialAttempt(r.Context(), w, existing)
 				return
 			}
 			if !errors.Is(err, store.ErrNotFound) {
@@ -271,7 +277,7 @@ func (a *API) CreateNotification() http.HandlerFunc {
 			if req.IdempotencyKey != "" && store.IsConflict(err) {
 				existing, lookupErr := a.store.GetNotificationByTenantAndIdempotencyKey(r.Context(), req.TenantID, req.IdempotencyKey)
 				if lookupErr == nil {
-					a.ensureAndEnqueueInitialAttempt(r.Context(), w, existing, template.Channel)
+					a.ensureAndEnqueueInitialAttempt(r.Context(), w, existing)
 					return
 				}
 			}
