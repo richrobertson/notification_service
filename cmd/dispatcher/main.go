@@ -6,17 +6,17 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
 
 	"github.com/richrobertson/notification-platform/internal/config"
+	"github.com/richrobertson/notification-platform/internal/platform"
 	"github.com/richrobertson/notification-platform/internal/queue"
 )
 
 func main() {
 	cfg := config.Load()
-	logger := newLogger(cfg.LogLevel)
+	logger := platform.NewLogger(cfg.LogLevel)
 	slog.SetDefault(logger)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -63,22 +63,4 @@ func main() {
 
 		logger.Info("routed dispatch job", slog.String("job_id", job.JobID), slog.String("notification_id", job.NotificationID), slog.String("attempt_id", job.AttemptID), slog.String("channel", job.Channel), slog.String("source_queue", queue.DispatchQueueName), slog.String("target_queue", targetQueue))
 	}
-}
-
-func newLogger(level string) *slog.Logger {
-	var slogLevel slog.Level
-	switch strings.ToLower(level) {
-	case "debug":
-		slogLevel = slog.LevelDebug
-	case "info":
-		slogLevel = slog.LevelInfo
-	case "warn":
-		slogLevel = slog.LevelWarn
-	case "error":
-		slogLevel = slog.LevelError
-	default:
-		slogLevel = slog.LevelInfo
-	}
-
-	return slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slogLevel}))
 }

@@ -75,11 +75,18 @@ func (q *RedisQueue) EnqueueChannel(ctx context.Context, job DispatchJob) error 
 }
 
 func (q *RedisQueue) ConsumeDispatch(ctx context.Context) (DispatchJob, error) {
+	return q.ConsumeChannel(ctx, DispatchQueueName, 1)
+}
+
+func (q *RedisQueue) ConsumeChannel(ctx context.Context, queueName string, timeoutSeconds int) (DispatchJob, error) {
+	if timeoutSeconds <= 0 {
+		timeoutSeconds = 1
+	}
 	for {
 		if err := ctx.Err(); err != nil {
 			return DispatchJob{}, err
 		}
-		payload, err := q.blpop(ctx, DispatchQueueName, 1)
+		payload, err := q.blpop(ctx, queueName, timeoutSeconds)
 		if err != nil {
 			if errors.Is(err, errRedisNil) {
 				continue
@@ -88,7 +95,7 @@ func (q *RedisQueue) ConsumeDispatch(ctx context.Context) (DispatchJob, error) {
 		}
 		var job DispatchJob
 		if err := json.Unmarshal([]byte(payload), &job); err != nil {
-			return DispatchJob{}, fmt.Errorf("consume dispatch job: unmarshal job: %w", err)
+			return DispatchJob{}, fmt.Errorf("consume %s job: unmarshal job: %w", queueName, err)
 		}
 		return job, nil
 	}

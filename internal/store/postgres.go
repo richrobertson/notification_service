@@ -52,17 +52,22 @@ type Notification struct {
 }
 
 type DeliveryAttempt struct {
-	ID             string     `json:"id"`
-	NotificationID string     `json:"notification_id"`
-	Channel        string     `json:"channel"`
-	AttemptNumber  int        `json:"attempt_number"`
-	Status         string     `json:"status"`
-	ErrorCode      *string    `json:"error_code"`
-	ErrorMessage   *string    `json:"error_message"`
-	NextRetryAt    *time.Time `json:"next_retry_at"`
-	StartedAt      *time.Time `json:"started_at"`
-	CompletedAt    *time.Time `json:"completed_at"`
-	CreatedAt      time.Time  `json:"created_at"`
+	ID                string     `json:"id"`
+	NotificationID    string     `json:"notification_id"`
+	Channel           string     `json:"channel"`
+	AttemptNumber     int        `json:"attempt_number"`
+	Status            string     `json:"status"`
+	ErrorCode         *string    `json:"error_code"`
+	ErrorMessage      *string    `json:"error_message"`
+	ProviderMessageID *string    `json:"provider_message_id"`
+	LastError         *string    `json:"last_error"`
+	NextRetryAt       *time.Time `json:"next_retry_at"`
+	StartedAt         *time.Time `json:"started_at"`
+	CompletedAt       *time.Time `json:"completed_at"`
+	SentAt            *time.Time `json:"sent_at"`
+	FailedAt          *time.Time `json:"failed_at"`
+	CreatedAt         time.Time  `json:"created_at"`
+	UpdatedAt         time.Time  `json:"updated_at"`
 }
 
 type CreateTenantParams struct {
@@ -425,10 +430,15 @@ func (p *Postgres) CreateDeliveryAttempt(ctx context.Context, params CreateDeliv
 			status,
 			error_code,
 			error_message,
+			provider_message_id,
+			last_error,
 			next_retry_at,
 			started_at,
 			completed_at,
-			created_at
+			sent_at,
+			failed_at,
+			created_at,
+			updated_at
 	`
 
 	var attempt DeliveryAttempt
@@ -448,14 +458,117 @@ func (p *Postgres) CreateDeliveryAttempt(ctx context.Context, params CreateDeliv
 		&attempt.Status,
 		&attempt.ErrorCode,
 		&attempt.ErrorMessage,
+		&attempt.ProviderMessageID,
+		&attempt.LastError,
 		&attempt.NextRetryAt,
 		&attempt.StartedAt,
 		&attempt.CompletedAt,
+		&attempt.SentAt,
+		&attempt.FailedAt,
 		&attempt.CreatedAt,
+		&attempt.UpdatedAt,
 	)
 	if err != nil {
 		return DeliveryAttempt{}, wrapStoreError("create delivery attempt", err)
 	}
 
 	return attempt, nil
+}
+
+func (p *Postgres) LoadDeliveryJob(ctx context.Context, notificationID, attemptID string) (Notification, Template, DeliveryAttempt, error) {
+	notification, err := p.GetNotificationByID(ctx, notificationID)
+	if err != nil {
+		return Notification{}, Template{}, DeliveryAttempt{}, err
+	}
+	template, err := p.GetTemplateByID(ctx, notification.TemplateID)
+	if err != nil {
+		return Notification{}, Template{}, DeliveryAttempt{}, err
+	}
+	attempt, err := p.GetDeliveryAttemptByID(ctx, attemptID)
+	if err != nil {
+		return Notification{}, Template{}, DeliveryAttempt{}, err
+	}
+	if attempt.NotificationID != notificationID {
+		return Notification{}, Template{}, DeliveryAttempt{}, fmt.Errorf("load delivery job: attempt %s does not belong to notification %s", attemptID, notificationID)
+	}
+	return notification, template, attempt, nil
+}
+
+func (p *Postgres) GetNotificationByID(ctx context.Context, id string) (Notification, error) {
+	const query = `
+		SELECT id, tenant_id, template_id, idempotency_key, status, recipient_email, recipient_webhook_url, variables, submitted_at, updated_at
+		FROM notifications
+		WHERE id = $1
+	`
+	var notification Notification
+	var rawVariables []byte
+	err := p.DB.QueryRowContext(ctx, query, id).Scan(&notification.ID, &notification.TenantID, &notification.TemplateID, &notification.IdempotencyKey, &notification.Status, &notification.RecipientEmail, &notification.RecipientWebhookURL, &rawVariables, &notification.SubmittedAt, &notification.UpdatedAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return Notification{}, fmt.Errorf("get notification: %w", ErrNotFound)
+		}
+		return Notification{}, fmt.Errorf("get notification: %w", err)
+	}
+	notification.Variables, err = unmarshalVariables(rawVariables)
+	if err != nil {
+		return Notification{}, fmt.Errorf("get notification: %w", err)
+	}
+	return notification, nil
+}
+
+func (p *Postgres) GetDeliveryAttemptByID(ctx context.Context, id string) (DeliveryAttempt, error) {
+	const query = `
+		SELECT id, notification_id, channel, attempt_number, status, error_code, error_message, provider_message_id, last_error, next_retry_at, started_at, completed_at, sent_at, failed_at, created_at, updated_at
+		FROM delivery_attempts
+		WHERE id = $1
+	`
+	var attempt DeliveryAttempt
+	err := p.DB.QueryRowContext(ctx, query, id).Scan(&attempt.ID, &attempt.NotificationID, &attempt.Channel, &attempt.AttemptNumber, &attempt.Status, &attempt.ErrorCode, &attempt.ErrorMessage, &attempt.ProviderMessageID, &attempt.LastError, &attempt.NextRetryAt, &attempt.StartedAt, &attempt.CompletedAt, &attempt.SentAt, &attempt.FailedAt, &attempt.CreatedAt, &attempt.UpdatedAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return DeliveryAttempt{}, fmt.Errorf("get delivery attempt: %w", ErrNotFound)
+		}
+		return DeliveryAttempt{}, fmt.Errorf("get delivery attempt: %w", err)
+	}
+	return attempt, nil
+}
+
+func (p *Postgres) MarkAttemptSent(ctx context.Context, attemptID string, providerMessageID *string) error {
+	const query = `
+		UPDATE delivery_attempts
+		SET status = 'sent', provider_message_id = $2, last_error = NULL, error_message = NULL, sent_at = NOW(), failed_at = NULL, completed_at = NOW()
+		WHERE id = $1
+	`
+	result, err := p.DB.ExecContext(ctx, query, attemptID, providerMessageID)
+	if err != nil {
+		return fmt.Errorf("mark attempt sent: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("mark attempt sent: rows affected: %w", err)
+	}
+	if rows == 0 {
+		return fmt.Errorf("mark attempt sent: %w", ErrNotFound)
+	}
+	return nil
+}
+
+func (p *Postgres) MarkAttemptFailed(ctx context.Context, attemptID string, lastError string) error {
+	const query = `
+		UPDATE delivery_attempts
+		SET status = 'failed', last_error = $2, error_message = $2, provider_message_id = NULL, failed_at = NOW(), completed_at = NOW()
+		WHERE id = $1
+	`
+	result, err := p.DB.ExecContext(ctx, query, attemptID, lastError)
+	if err != nil {
+		return fmt.Errorf("mark attempt failed: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("mark attempt failed: rows affected: %w", err)
+	}
+	if rows == 0 {
+		return fmt.Errorf("mark attempt failed: %w", ErrNotFound)
+	}
+	return nil
 }

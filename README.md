@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-`notification_service` is a runnable Go foundation for a multi-tenant notification platform. Stage 3 adds the first durable async dispatch foundation while intentionally stopping before any real delivery execution.
+`notification_service` is a runnable Go foundation for a multi-tenant notification platform. Stage 4 adds real channel delivery workers while deliberately keeping delivery guarantees simple and limited.
 
 The service currently provides:
 
@@ -13,10 +13,13 @@ The service currently provides:
 - PostgreSQL-backed persistence using `database/sql`
 - Redis-backed dispatch queues using Redis lists
 - a standalone dispatcher process that routes generic dispatch jobs to channel-specific queues
+- standalone webhook and email workers that consume channel-specific queues
+- real webhook HTTP POST delivery
+- real SMTP-based email delivery
 - OpenTelemetry bootstrap wiring for local development
-- Docker Compose infrastructure for Postgres, Redis, Prometheus, Grafana, Jaeger, and the OpenTelemetry Collector
+- Docker Compose infrastructure for Postgres, Redis, Prometheus, Grafana, Jaeger, the OpenTelemetry Collector, and Mailpit for local SMTP capture
 
-## Stage 3 Status
+## Stage 4 Status
 
 Implemented in this stage:
 
@@ -32,14 +35,16 @@ Implemented in this stage:
 - dispatcher routing to channel queues:
   - `notify:dispatch:webhook`
   - `notify:dispatch:email`
+- webhook worker consumption from `notify:dispatch:webhook`
+- email worker consumption from `notify:dispatch:email`
+- template rendering with deterministic missing-variable failures
+- delivery attempt finalization to `sent` or `failed`
+- storage of delivery timestamps, provider message id, and concise delivery errors
 - request logging and panic recovery middleware
 - idempotent notification submission when `idempotency_key` is provided
 
 Not implemented yet:
 
-- webhook execution
-- email sending
-- workers that consume channel queues
 - retries
 - DLQ handling
 - replay flow
@@ -48,8 +53,9 @@ Not implemented yet:
 - usage endpoints
 - dead-letter inspection endpoints
 - transactional outbox protection for DB + queue atomicity
+- production-grade delivery guarantees such as retries, exactly-once execution, or provider failover
 
-## Stage 3 Architecture Summary
+## Stage 4 Architecture Summary
 
 Current request flow:
 
@@ -60,14 +66,17 @@ Current request flow:
 5. API enqueues a small JSON dispatch job onto `notify:dispatch`
 6. `cmd/dispatcher` blocks on `notify:dispatch`
 7. Dispatcher republishes the same job to either `notify:dispatch:webhook` or `notify:dispatch:email`
+8. A channel worker loads the notification, template, and delivery attempt from PostgreSQL
+9. The worker renders the outbound payload and performs real delivery
+10. The worker updates `delivery_attempts` to `sent` or `failed`
 
 Important honesty notes:
 
-- The API does **not** push directly to channel queues in this stage.
-- No worker consumes the channel-specific queues yet.
-- No delivery execution occurs yet.
-- The design is intentionally simple and demoable for now.
+- The API still does **not** push directly to channel queues.
+- Workers currently process one job at a time in a simple loop.
+- Malformed queue jobs are logged and skipped; there is no retry or dead-letter path yet.
 - PostgreSQL writes and Redis enqueue are **not** yet coordinated with an outbox pattern, so DB/queue atomicity is not yet hardened.
+- Delivery completion is tracked on `delivery_attempts`; broader notification rollup state is intentionally still simple.
 
 ## Current Endpoints
 
@@ -77,61 +86,9 @@ Important honesty notes:
 - `POST /v1/templates`
 - `POST /v1/notifications`
 
-### `POST /v1/tenants`
-
-Creates a tenant record.
-
-Required fields:
-
-- `id`
-- `name`
-- `daily_quota`
-
-### `POST /v1/templates`
-
-Creates a template for an existing tenant.
-
-Required fields:
-
-- `id`
-- `tenant_id`
-- `name`
-- `channel`
-- `version`
-- `body`
-
-Supported channels:
-
-- `email`
-- `webhook`
-
-### `POST /v1/notifications`
-
-Creates a notification submission for an existing tenant and template.
-
-Required fields:
-
-- `id`
-- `tenant_id`
-- `template_id`
-
-Optional fields:
-
-- `idempotency_key`
-- `recipient_email`
-- `recipient_webhook_url`
-- `variables`
-
-The required recipient field depends on the template channel:
-
-- email templates require `recipient_email`
-- webhook templates require `recipient_webhook_url`
-
-Submission now also creates the first delivery attempt and enqueues one generic dispatch job.
-
 ## Current Queue Design
 
-Redis list queues used in Stage 3:
+Redis list queues used in Stage 4:
 
 - generic dispatch queue:
   - `notify:dispatch`
@@ -148,7 +105,7 @@ Dispatch job envelope fields:
 - `channel`
 - `created_at`
 
-The job is intentionally small so later workers can load full records from PostgreSQL.
+The job is intentionally small so workers load the full records from PostgreSQL.
 
 ## Local Development
 
@@ -158,7 +115,7 @@ Start local infrastructure:
 make dev-up
 ```
 
-Apply the database migration:
+Apply the database migrations:
 
 ```bash
 make migrate-up
@@ -176,6 +133,18 @@ Run the dispatcher in a second terminal:
 make run-dispatcher
 ```
 
+Run the webhook worker in a third terminal:
+
+```bash
+make run-webhook-worker
+```
+
+Run the email worker in a fourth terminal:
+
+```bash
+make run-email-worker
+```
+
 Default local configuration:
 
 - HTTP port: `8080`
@@ -184,6 +153,22 @@ Default local configuration:
 - Redis password: empty
 - Redis DB: `0`
 - OTLP endpoint: `localhost:4317`
+- webhook timeout: `5s`
+- Mailpit SMTP host/port: `localhost:1025`
+- Mailpit UI: `http://localhost:8025`
+
+New environment variables:
+
+- `WEBHOOK_TIMEOUT`
+- `QUEUE_BLOCK_TIMEOUT`
+- `SMTP_HOST`
+- `SMTP_PORT`
+- `SMTP_USERNAME`
+- `SMTP_PASSWORD`
+- `SMTP_FROM`
+- `SMTP_USE_TLS`
+- `SMTP_STARTTLS`
+- `SMTP_INSECURE_SKIP_VERIFY`
 
 Useful local endpoints:
 
@@ -192,6 +177,7 @@ Useful local endpoints:
 - Prometheus: `http://localhost:9090`
 - Grafana: `http://localhost:3000`
 - Jaeger: `http://localhost:16686`
+- Mailpit UI: `http://localhost:8025`
 
 Run checks:
 
@@ -201,87 +187,61 @@ make lint
 make test
 ```
 
-### Example: Create Tenant
+### Example: Create Webhook Template
 
 ```bash
-curl -X POST http://localhost:8080/v1/tenants \
-  -H "Content-Type: application/json" \
-  -d '{
-    "id": "acme",
-    "name": "Acme Corp",
-    "daily_quota": 1000
-  }'
-```
-
-### Example: Create Template
-
-```bash
-curl -X POST http://localhost:8080/v1/templates \
-  -H "Content-Type: application/json" \
-  -d '{
+curl -X POST http://localhost:8080/v1/templates   -H "Content-Type: application/json"   -d '{
     "id": "tpl_password_reset_webhook_v1",
     "tenant_id": "acme",
     "name": "password-reset",
     "channel": "webhook",
     "version": 1,
-    "body": "{\"event\":\"password_reset\",\"url\":\"{{.reset_url}}\"}"
+    "body": "{"event":"password_reset","url":"{{.reset_url}}"}"
   }'
 ```
 
-### Example: Submit Notification
+### Example: Test Webhook Delivery Locally
+
+Start a simple local receiver:
 
 ```bash
-curl -X POST http://localhost:8080/v1/notifications \
-  -H "Content-Type: application/json" \
-  -d '{
-    "id": "notif_001",
+python -m http.server 18080
+```
+
+Then submit a webhook notification pointing at a real POST-capable endpoint you control locally, for example a request bin or a small mock server. If you use a custom local handler, the webhook worker will mark the attempt `sent` on any `2xx` response and `failed` on non-`2xx` or network errors.
+
+### Example: Create Email Template
+
+```bash
+curl -X POST http://localhost:8080/v1/templates   -H "Content-Type: application/json"   -d '{
+    "id": "tpl_welcome_email_v1",
     "tenant_id": "acme",
-    "template_id": "tpl_password_reset_webhook_v1",
-    "idempotency_key": "idem-123",
-    "recipient_webhook_url": "https://example.com/hooks/password-reset",
+    "name": "welcome-email",
+    "channel": "email",
+    "version": 1,
+    "body": "Hello {{.first_name}}, welcome to Acme."
+  }'
+```
+
+### Example: Submit Email Notification
+
+```bash
+curl -X POST http://localhost:8080/v1/notifications   -H "Content-Type: application/json"   -d '{
+    "id": "notif_email_001",
+    "tenant_id": "acme",
+    "template_id": "tpl_welcome_email_v1",
+    "recipient_email": "user@example.test",
     "variables": {
-      "reset_url": "https://example.com/reset/abc"
+      "first_name": "Ada"
     }
   }'
 ```
 
-After submission you should be able to observe:
+Mailpit will capture local emails so you can inspect them at `http://localhost:8025`.
 
-- a row in `notifications`
-- an initial row in `delivery_attempts` with `attempt_number = 1` and `status = pending`
-- a JSON job pushed to `notify:dispatch`
-- the dispatcher moving that job to `notify:dispatch:webhook`
+## Database Migrations
 
-## Database Migration
-
-The active schema is in:
+Active migrations:
 
 - `migrations/001_init.sql`
-
-Reset and reapply locally:
-
-```bash
-make migrate-reset
-```
-
-The current service actively uses `tenants`, `templates`, `notifications`, and `delivery_attempts`. Other schema objects remain reserved for later milestones.
-
-## Current Limitations
-
-This service currently accepts notification requests, stores them, creates an initial delivery attempt, and routes dispatch jobs. It still does not perform delivery.
-
-There is no:
-
-- webhook execution
-- email sending
-- worker execution on channel queues
-- retry handling
-- dead-letter processing
-- tenant authentication or authorization hardening
-- replay API
-- usage reporting
-- transactional outbox for DB + queue consistency
-
-## Next Planned Work
-
-The next milestone should focus on adding workers that consume the channel-specific queues and execute delivery while preserving the intentionally small job envelope introduced here.
+- `migrations/002_stage4_delivery_attempts.sql`
