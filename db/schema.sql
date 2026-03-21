@@ -79,9 +79,16 @@ CREATE TABLE delivery_attempts (
     attempt_number INTEGER NOT NULL CHECK (attempt_number > 0),
     status delivery_attempt_status NOT NULL,
     error_code TEXT,
+    error_message TEXT,
+    provider_message_id TEXT,
+    last_error TEXT,
     next_retry_at TIMESTAMPTZ,
+    started_at TIMESTAMPTZ,
     completed_at TIMESTAMPTZ,
+    sent_at TIMESTAMPTZ,
+    failed_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE (notification_id, channel, attempt_number)
 );
 
