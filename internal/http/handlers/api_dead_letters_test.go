@@ -114,11 +114,11 @@ func (f *fakeAPIStore) EnsureInitialAttempt(_ context.Context, notificationID, c
 		f.createdAttempt = &params
 		f.notification.ID = notificationID
 		f.notification.Status = "processing"
-		f.recalculateCalls++
-		f.recalculatedIDs = append(f.recalculatedIDs, notificationID)
-		if f.recalculateErr != nil {
-			return store.DeliveryAttempt{}, f.recalculateErr
-		}
+	}
+	f.recalculateCalls++
+	f.recalculatedIDs = append(f.recalculatedIDs, notificationID)
+	if f.recalculateErr != nil {
+		return store.DeliveryAttempt{}, f.recalculateErr
 	}
 	f.initialAttemptMissing = false
 	return f.GetInitialAttemptByNotificationID(context.Background(), notificationID)
@@ -349,6 +349,22 @@ func TestCreateNotificationUpdatesInspectionStatusWhenAttemptIsPending(t *testin
 		t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
 	}
 
+	getReq := httptest.NewRequest(http.MethodGet, "/v1/notifications/notif-1", nil)
+	getReq.SetPathValue("id", "notif-1")
+	getRes := httptest.NewRecorder()
+	api.GetNotification().ServeHTTP(getRes, getReq)
+	if getRes.Code != http.StatusOK {
+		t.Fatalf("get status=%d body=%s", getRes.Code, getRes.Body.String())
+	}
+	var payload struct {
+		Notification store.Notification `json:"notification"`
+	}
+	if err := json.NewDecoder(getRes.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Notification.Status != "processing" {
+		t.Fatalf("notification status=%q", payload.Notification.Status)
+	}
 	assertNotificationInspectionStatus(t, api, "notif-1", "processing")
 }
 
@@ -365,6 +381,22 @@ func TestReplayDeadLetterUpdatesInspectionStatusWhenReplayAttemptIsPending(t *te
 		t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
 	}
 
+	getReq := httptest.NewRequest(http.MethodGet, "/v1/notifications/notif-1", nil)
+	getReq.SetPathValue("id", "notif-1")
+	getRes := httptest.NewRecorder()
+	api.GetNotification().ServeHTTP(getRes, getReq)
+	if getRes.Code != http.StatusOK {
+		t.Fatalf("get status=%d body=%s", getRes.Code, getRes.Body.String())
+	}
+	var payload struct {
+		Notification store.Notification `json:"notification"`
+	}
+	if err := json.NewDecoder(getRes.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Notification.Status != "processing" {
+		t.Fatalf("notification status=%q", payload.Notification.Status)
+	}
 	assertNotificationInspectionStatus(t, api, "notif-1", "processing")
 }
 

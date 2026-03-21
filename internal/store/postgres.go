@@ -746,13 +746,6 @@ func (p *Postgres) ListDeliveryAttemptsByNotificationID(ctx context.Context, not
 	return attempts, nil
 }
 
-func (p *Postgres) recalculateNotificationStatusAfterInsert(ctx context.Context, notificationID string, inserted bool) error {
-	if !inserted {
-		return nil
-	}
-	return p.RecalculateNotificationStatus(ctx, notificationID)
-}
-
 func (p *Postgres) RecalculateNotificationStatus(ctx context.Context, notificationID string) error {
 	attempts, err := p.ListDeliveryAttemptsByNotificationID(ctx, notificationID)
 	if err != nil {
@@ -1216,7 +1209,6 @@ func (p *Postgres) EnsureReplayAttempt(ctx context.Context, deadLetterID, newAtt
 		attemptID = *dl.ReplayAttemptID
 	}
 	attempt, err := getAttemptByIDTx(ctx, tx, attemptID)
-	createdReplayAttempt := false
 	if err != nil && !errors.Is(err, ErrNotFound) {
 		return ReplayDeadLetterResult{}, fmt.Errorf("ensure replay attempt: get attempt: %w", err)
 	}
@@ -1232,7 +1224,6 @@ func (p *Postgres) EnsureReplayAttempt(ctx context.Context, deadLetterID, newAtt
 		`, attemptID, dl.NotificationID, dl.Channel, attemptNumber).Scan(&attempt.ID, &attempt.NotificationID, &attempt.Channel, &attempt.AttemptNumber, &attempt.Status, &attempt.ErrorCode, &attempt.ErrorMessage, &attempt.ProviderMessageID, &attempt.LastError, &attempt.NextRetryAt, &attempt.StartedAt, &attempt.CompletedAt, &attempt.SentAt, &attempt.FailedAt, &attempt.DispatchEnqueuedAt, &attempt.EnqueueKind, &attempt.CreatedAt, &attempt.UpdatedAt); err != nil {
 			return ReplayDeadLetterResult{}, wrapStoreError("ensure replay attempt", err)
 		}
-		createdReplayAttempt = true
 	}
 	if dl.ReplayAttemptID == nil {
 		if _, err := tx.ExecContext(ctx, `UPDATE dead_letters SET replay_attempt_id = $2 WHERE id = $1 AND replay_attempt_id IS NULL`, deadLetterID, attempt.ID); err != nil {
@@ -1243,7 +1234,7 @@ func (p *Postgres) EnsureReplayAttempt(ctx context.Context, deadLetterID, newAtt
 	if err := tx.Commit(); err != nil {
 		return ReplayDeadLetterResult{}, fmt.Errorf("ensure replay attempt: commit: %w", err)
 	}
-	if err := p.recalculateNotificationStatusAfterInsert(ctx, dl.NotificationID, createdReplayAttempt); err != nil {
+	if err := p.RecalculateNotificationStatus(ctx, dl.NotificationID); err != nil {
 		return ReplayDeadLetterResult{}, err
 	}
 	return ReplayDeadLetterResult{DeadLetter: dl, Attempt: attempt}, nil

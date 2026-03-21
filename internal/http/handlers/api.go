@@ -86,10 +86,6 @@ func (a *API) recordAudit(ctx context.Context, tenantID, actor, action, resource
 	}
 }
 
-func (a *API) refreshNotificationStatus(ctx context.Context, notificationID string) error {
-	return a.store.RecalculateNotificationStatus(ctx, notificationID)
-}
-
 func (a *API) ensureAndEnqueueInitialAttempt(ctx context.Context, w http.ResponseWriter, existing store.Notification) {
 	template, err := a.store.GetTemplateByID(ctx, existing.TemplateID)
 	if err != nil {
