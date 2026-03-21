@@ -17,13 +17,22 @@ func TestWebhookSenderSendSuccess(t *testing.T) {
 		if got := r.Header.Get("Content-Type"); got != "application/json" {
 			t.Fatalf("Content-Type = %q", got)
 		}
+		if got := r.Header.Get("Idempotency-Key"); got != "attempt-1" {
+			t.Fatalf("Idempotency-Key = %q", got)
+		}
+		if got := r.Header.Get("X-Notification-Attempt-ID"); got != "attempt-1" {
+			t.Fatalf("X-Notification-Attempt-ID = %q", got)
+		}
+		if got := r.Header.Get("X-Notification-ID"); got != "notif-1" {
+			t.Fatalf("X-Notification-ID = %q", got)
+		}
 		w.Header().Set("X-Request-Id", "abc-123")
 		w.WriteHeader(http.StatusAccepted)
 	}))
 	defer server.Close()
 
 	sender := NewWebhookSender(2 * time.Second)
-	providerID, err := sender.Send(context.Background(), WebhookRequest{URL: server.URL, Body: `{"ok":true}`})
+	providerID, err := sender.Send(context.Background(), WebhookRequest{URL: server.URL, Body: `{"ok":true}`, AttemptID: "attempt-1", NotificationID: "notif-1"})
 	if err != nil {
 		t.Fatalf("Send() error = %v", err)
 	}
@@ -57,5 +66,32 @@ func TestContentTypeForBody(t *testing.T) {
 		if got := contentTypeForBody(body); got != want {
 			t.Fatalf("contentTypeForBody(%q) = %q, want %q", body, got, want)
 		}
+	}
+}
+
+func TestWebhookSenderSanitizesIdentifierHeaders(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Idempotency-Key"); got != "attemptBccbad" {
+			t.Fatalf("Idempotency-Key = %q", got)
+		}
+		if got := r.Header.Get("X-Notification-Attempt-ID"); got != "attemptBccbad" {
+			t.Fatalf("X-Notification-Attempt-ID = %q", got)
+		}
+		if got := r.Header.Get("X-Notification-ID"); got != "notifInjectedbad" {
+			t.Fatalf("X-Notification-ID = %q", got)
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+
+	sender := NewWebhookSender(2 * time.Second)
+	if _, err := sender.Send(context.Background(), WebhookRequest{
+		URL:            server.URL,
+		Body:           `{"ok":true}`,
+		AttemptID:      "attempt\r\nBcc:bad",
+		NotificationID: "notif\r\nInjected:bad",
+	}); err != nil {
+		t.Fatalf("Send() error = %v", err)
 	}
 }

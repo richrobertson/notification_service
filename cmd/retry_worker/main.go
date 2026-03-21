@@ -58,6 +58,7 @@ type retryStore interface {
 	ListAttemptsPendingEnqueue(ctx context.Context, limit int) ([]store.PendingEnqueueAttempt, error)
 	MarkAttemptEnqueued(ctx context.Context, attemptID string) error
 	FinalizeReplayEnqueue(ctx context.Context, deadLetterID, attemptID string) error
+	RecordAuditEvent(ctx context.Context, id, tenantID, actor, action, resourceType, resourceID string, metadata map[string]any) error
 }
 
 type retryQueue interface {
@@ -78,6 +79,7 @@ func runOnce(ctx context.Context, logger *slog.Logger, postgres retryStore, redi
 			return err
 		}
 		logger.Info("retry attempt created and left pending enqueue", slog.String("scheduled_attempt_id", item.Attempt.ID), slog.String("retry_attempt_id", created.Attempt.ID))
+		_ = postgres.RecordAuditEvent(ctx, generateID("audit"), created.TenantID, "retry-worker", "retry_dispatched", "delivery_attempt", created.Attempt.ID, map[string]any{"scheduled_attempt_id": item.Attempt.ID, "notification_id": created.Attempt.NotificationID, "channel": created.Attempt.Channel})
 	}
 
 	pending, err := postgres.ListAttemptsPendingEnqueue(ctx, 100)
@@ -95,11 +97,13 @@ func runOnce(ctx context.Context, logger *slog.Logger, postgres retryStore, redi
 		}
 		if item.Attempt.EnqueueKind == "initial" {
 			logger.Info("recovered pending initial attempt and enqueued dispatch job", slog.String("attempt_id", item.Attempt.ID), slog.String("notification_id", item.Attempt.NotificationID), slog.String("channel", item.Attempt.Channel))
+			_ = postgres.RecordAuditEvent(ctx, generateID("audit"), item.TenantID, "retry-worker", "enqueue_recovered", "delivery_attempt", item.Attempt.ID, map[string]any{"notification_id": item.Attempt.NotificationID, "channel": item.Attempt.Channel})
 		}
 		if item.DeadLetterID != nil {
 			if err := postgres.FinalizeReplayEnqueue(ctx, *item.DeadLetterID, item.Attempt.ID); err != nil {
 				return err
 			}
+			_ = postgres.RecordAuditEvent(ctx, generateID("audit"), item.TenantID, "retry-worker", "replay_enqueued", "delivery_attempt", item.Attempt.ID, map[string]any{"dead_letter_id": *item.DeadLetterID, "notification_id": item.Attempt.NotificationID, "channel": item.Attempt.Channel})
 		}
 	}
 	return nil

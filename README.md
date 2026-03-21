@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-`notification_service` is a runnable Go notification platform foundation. Stage 5 keeps the Stage 4 Redis-list + PostgreSQL architecture, and adds bounded retries, durable dead-letter persistence, operator replay, and best-effort recovery of stranded reserved jobs.
+`notification_service` is a runnable Go notification platform foundation. Stage 6 keeps the Stage 5 Redis-list + PostgreSQL architecture, and adds stronger attempt-level idempotency, duplicate suppression, notification rollups, operator inspection endpoints, and a more explicit audit trail.
 
 The service now provides:
 
@@ -20,9 +20,13 @@ The service now provides:
 - bounded retry scheduling for transient delivery failures
 - durable PostgreSQL dead-letter persistence after retry exhaustion
 - dead-letter list/get/replay API endpoints
+- notification and attempt inspection API endpoints
+- attempt-level duplicate-job suppression using PostgreSQL state guards
+- notification status rollups derived from durable attempt history
+- audit events for major lifecycle transitions
 - automated best-effort recovery that drains stranded `*:processing` queues back to their source queues
 
-## Stage 5 Status
+## Stage 6 Status
 
 Implemented in this stage:
 
@@ -31,6 +35,9 @@ Implemented in this stage:
 - `POST /v1/tenants`
 - `POST /v1/templates`
 - `POST /v1/notifications`
+- `GET /v1/notifications/{id}`
+- `GET /v1/notifications/{id}/attempts`
+- `GET /v1/attempts/{id}`
 - `GET /v1/dead-letters`
 - `GET /v1/dead-letters/{id}`
 - `POST /v1/dead-letters/{id}/replay`
@@ -41,13 +48,19 @@ Implemented in this stage:
 - retry scheduling using `delivery_attempts.status = retry_scheduled` plus `next_retry_at`
 - retry execution via `cmd/retry_worker`
 - durable dead-lettering using the existing `dead_letters` table
-- operator replay that creates a fresh attempt row and republishes a new dispatch job
+- operator replay that reuses a durable replay attempt identity and republishes a new dispatch job
+- compare-and-set attempt activation so only one worker can move `pending -> in_progress`
+- duplicate-job suppression when a queued attempt is already `in_progress`, `sent`, `failed`, `retry_scheduled`, or `dead_lettered`
+- monotonic attempt transitions guarded in SQL (`in_progress -> sent|failed|retry_scheduled|dead_lettered`)
+- webhook/email correlation headers (`Idempotency-Key`, `X-Notification-Attempt-ID`, `X-Notification-ID`, deterministic email `Message-ID`)
+- notification rollups (`accepted`, `processing`, `delivered`, `partially_delivered`, `failed`, `dead_lettered`)
+- audit events for notification acceptance, enqueue recovery, retry scheduling, retry dispatch, dead-lettering, replay, and duplicate suppression
 - startup and periodic recovery of stranded jobs in:
   - `notify:dispatch:processing`
   - `notify:dispatch:webhook:processing`
   - `notify:dispatch:email:processing`
 
-## Stage 5 Delivery Semantics
+## Stage 6 Delivery Semantics
 
 The delivery service now uses a small explicit error model:
 
@@ -69,14 +82,28 @@ Retry policy is intentionally simple and configurable:
 The current retry model is:
 
 1. the active attempt starts as `pending`
-2. a worker marks it `in_progress`
+2. exactly one worker may mark it `in_progress` via a compare-and-set update
 3. on transient failure, the same attempt is marked `retry_scheduled` with `next_retry_at`
 4. when the retry worker picks up a due retry, it first creates the next attempt durably in PostgreSQL with enqueue still pending
 5. the retry worker then enqueues Redis work only for that already-durable attempt and marks it enqueued after success
 6. if Redis is unavailable, the attempt remains pending enqueue in PostgreSQL and is retried later
 7. once the retry budget is exhausted, the final attempt is marked `dead_lettered` and a `dead_letters` row is inserted
 
-Replay uses the same model: the replay attempt is created durably first, the dead letter is only marked replayed after enqueue succeeds, and failed enqueue work remains recoverable from PostgreSQL. Normal initial API attempts are also DB-authoritative now: the notification row may exist before enqueue succeeds, the initial attempt is ensured durably before dispatch, and if enqueue fails it remains recoverable. Idempotent retries reuse the original notification and repair missing initial attempts instead of treating the existing notification as "done enough"; that repair is derived from the existing notification's stored template/channel, not from any new request payload, so reusing an idempotency key with a different template cannot create a wrong-channel first attempt. Enqueue recovery scans `enqueue_kind IN (initial, retry, replay)` but only for attempts whose `dispatch_enqueued_at` is still null. This keeps the history inspectable without introducing a full generalized outbox or lease framework.
+Replay uses the same model: the replay attempt is created durably first, the dead letter is only marked replayed after enqueue succeeds, and failed enqueue work remains recoverable from PostgreSQL. Normal initial API attempts are also DB-authoritative now: the notification row may exist before enqueue succeeds, the initial attempt is ensured durably before dispatch, and if enqueue fails it remains recoverable. Idempotent retries reuse the original notification and repair missing initial attempts instead of treating the existing notification as "done enough"; that repair is derived from the existing notification's stored template/channel, not from any new request payload, so reusing an idempotency key with a different template cannot create a wrong-channel first attempt. Enqueue recovery scans `enqueue_kind IN (initial, retry, replay)` but only for attempts whose `dispatch_enqueued_at` is still null. Duplicate Redis jobs are still possible underneath, but the worker now proves whether the attempt is still executable before sending and safely ACKs duplicate/stale jobs without repeating side effects. This keeps the history inspectable without introducing a full generalized outbox or lease framework.
+
+## Duplicate Suppression Model
+
+Stage 6 still uses **at-least-once queueing** underneath. It does **not** claim true exactly-once delivery across Redis, process crashes, PostgreSQL, and downstream providers.
+
+What it now does provide:
+
+- submission idempotency at the notification API layer
+- attempt-level compare-and-set activation (`pending -> in_progress`)
+- suppression of duplicate jobs once an attempt is already active or already terminal/superseded
+- monotonic terminal updates so a duplicate worker cannot turn `sent -> failed` or `dead_lettered -> sent`
+- downstream correlation headers so operators and receivers can identify repeated deliveries more easily
+
+The goal is an **exactly-once illusion** for operators and API users, while remaining honest that the underlying queueing model is still at-least-once.
 
 ## Queue Recovery Behavior
 
@@ -170,12 +197,14 @@ New in Stage 5:
 - `RETRY_WORKER_POLL_INTERVAL`
 - `PROCESSING_RECOVERY_INTERVAL`
 
-## Remaining Intentional Limitations After Stage 5
+## Remaining Intentional Limitations After Stage 6
 
-Stage 5 is deliberately modest. The service still does **not** provide:
+Stage 6 is deliberately pragmatic. The service still does **not** provide:
 
 - a transactional outbox pattern for PostgreSQL + Redis atomicity
 - exactly-once delivery semantics
+- generalized duplicate suppression across every possible crash boundary
+- rich multi-channel fanout semantics
 - provider failover
 - advanced scheduling beyond bounded retry delays
 - rate limiting / quota enforcement beyond whatever already exists in the broader codebase
