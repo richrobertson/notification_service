@@ -212,3 +212,43 @@ Stage 6 is deliberately pragmatic. The service still does **not** provide:
 - distributed coordination or leader election for recovery/retry workers
 
 Those remain future milestones.
+
+## Stage 7: Backpressure, rate limiting, and tenant isolation
+
+Stage 7 adds graceful degradation controls while keeping the existing Redis + Postgres architecture.
+
+### Overload behavior
+- The API now applies a per-tenant Redis-backed fixed-window rate limit and returns `429 Too Many Requests` with `Retry-After` when exceeded.
+- The API checks queue depth on the dispatch queue and channel queues before accepting new notifications or replay requests.
+- Queue soft limits emit warnings; queue hard limits reject new work early with explicit overload responses instead of letting Redis queues grow without bound.
+
+### Fairness model
+- Workers use a bounded fair scheduler that rotates buffered jobs by tenant instead of draining one tenant indefinitely.
+- Each worker has configurable total concurrency and a configurable per-tenant in-flight cap so a single tenant cannot monopolize SMTP or webhook capacity.
+- This is lightweight fairness, not strict QoS: ordering is still best-effort and delivery remains at-least-once.
+
+### Retry behavior under pressure
+- Retry scheduling stretches when channel queue depth is already above the soft limit.
+- The retry worker skips enqueue bursts when queues are already saturated, reducing retry storms during incidents.
+
+### Visibility
+- `/v1/metrics` returns queue depth, soft/hard limits, rate-limited totals, rejected totals, worker saturation counts, and tenant throttling counts.
+- Logs now distinguish rate limiting, soft pressure warnings, hard queue rejection, and retry deferrals.
+
+### New environment variables
+- `API_RATE_LIMIT_PER_SECOND`
+- `API_RATE_LIMIT_WINDOW`
+- `QUEUE_SOFT_LIMIT`
+- `QUEUE_HARD_LIMIT`
+- `BACKPRESSURE_RETRY_AFTER`
+- `EMAIL_WORKER_CONCURRENCY`
+- `WEBHOOK_WORKER_CONCURRENCY`
+- `PER_TENANT_WORKER_BURST`
+- `PER_TENANT_MAX_IN_FLIGHT`
+- `RETRY_PRESSURE_MULTIPLIER`
+- `RETRY_PRESSURE_MIN_DELAY`
+
+### Remaining limitations
+- Fairness is bounded and opportunistic rather than strict weighted fair queuing.
+- Rate limiting is fixed-window Redis counter based, so it is simple rather than perfectly smooth.
+- The system still provides at-least-once delivery with no strict SLA or strict per-tenant QoS guarantees.

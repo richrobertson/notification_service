@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 type RedisQueue struct {
@@ -71,6 +72,50 @@ func (q *RedisQueue) Ping(ctx context.Context) error {
 
 func (q *RedisQueue) EnqueueDispatch(ctx context.Context, job DispatchJob) error {
 	return q.enqueue(ctx, DispatchQueueName, job)
+}
+
+func (q *RedisQueue) QueueDepth(ctx context.Context, queueName string) (int, error) {
+	value, err := q.llen(ctx, queueName)
+	if err != nil {
+		return 0, err
+	}
+	return int(value), nil
+}
+
+func (q *RedisQueue) PressureSnapshot(ctx context.Context) (PressureSnapshot, error) {
+	depths := map[string]int{}
+	for _, name := range []string{DispatchQueueName, DispatchEmailQueueName, DispatchWebhookQueueName} {
+		depth, err := q.QueueDepth(ctx, name)
+		if err != nil {
+			return PressureSnapshot{}, err
+		}
+		depths[name] = depth
+	}
+	return PressureSnapshot{Depths: depths}, nil
+}
+
+func (q *RedisQueue) AllowTenant(ctx context.Context, tenantID string, limit int, window time.Duration) (bool, time.Duration, error) {
+	if limit <= 0 || tenantID == "" {
+		return true, 0, nil
+	}
+	key := "notify:rate:" + tenantID
+	count, err := q.incr(ctx, key)
+	if err != nil {
+		return false, 0, err
+	}
+	if count == 1 {
+		if err := q.expire(ctx, key, window); err != nil {
+			return false, 0, err
+		}
+	}
+	if count <= int64(limit) {
+		return true, 0, nil
+	}
+	ttl, err := q.ttl(ctx, key)
+	if err != nil || ttl <= 0 {
+		ttl = window
+	}
+	return false, ttl, nil
 }
 
 func (q *RedisQueue) EnqueueChannel(ctx context.Context, job DispatchJob) error {
@@ -438,4 +483,84 @@ func (q *RedisQueue) readResponseLocked() (any, error) {
 	default:
 		return nil, fmt.Errorf("unsupported redis response prefix %q", prefix)
 	}
+}
+
+func (q *RedisQueue) ttl(ctx context.Context, key string) (time.Duration, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if err := q.ensureConnLocked(ctx); err != nil {
+		return 0, err
+	}
+	if err := q.writeCommandLocked("TTL", key); err != nil {
+		return 0, err
+	}
+	response, err := q.readResponseLocked()
+	if err != nil {
+		q.resetConnLocked()
+		return 0, fmt.Errorf("ttl %s: %w", key, err)
+	}
+	v, ok := response.(int64)
+	if !ok {
+		return 0, fmt.Errorf("ttl %s: unexpected response %#v", key, response)
+	}
+	return time.Duration(v) * time.Second, nil
+}
+func (q *RedisQueue) expire(ctx context.Context, key string, ttl time.Duration) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if err := q.ensureConnLocked(ctx); err != nil {
+		return err
+	}
+	seconds := int((ttl + time.Second - 1) / time.Second)
+	if seconds < 1 {
+		seconds = 1
+	}
+	if err := q.writeCommandLocked("EXPIRE", key, strconv.Itoa(seconds)); err != nil {
+		return err
+	}
+	if _, err := q.readResponseLocked(); err != nil {
+		q.resetConnLocked()
+		return fmt.Errorf("expire %s: %w", key, err)
+	}
+	return nil
+}
+func (q *RedisQueue) incr(ctx context.Context, key string) (int64, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if err := q.ensureConnLocked(ctx); err != nil {
+		return 0, err
+	}
+	if err := q.writeCommandLocked("INCR", key); err != nil {
+		return 0, err
+	}
+	response, err := q.readResponseLocked()
+	if err != nil {
+		q.resetConnLocked()
+		return 0, fmt.Errorf("incr %s: %w", key, err)
+	}
+	v, ok := response.(int64)
+	if !ok {
+		return 0, fmt.Errorf("incr %s: unexpected response %#v", key, response)
+	}
+	return v, nil
+}
+func (q *RedisQueue) llen(ctx context.Context, key string) (int64, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if err := q.ensureConnLocked(ctx); err != nil {
+		return 0, err
+	}
+	if err := q.writeCommandLocked("LLEN", key); err != nil {
+		return 0, err
+	}
+	response, err := q.readResponseLocked()
+	if err != nil {
+		q.resetConnLocked()
+		return 0, fmt.Errorf("llen %s: %w", key, err)
+	}
+	v, ok := response.(int64)
+	if !ok {
+		return 0, fmt.Errorf("llen %s: unexpected response %#v", key, response)
+	}
+	return v, nil
 }

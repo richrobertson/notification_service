@@ -16,6 +16,8 @@ type fakeRedisServer struct {
 	ln       net.Listener
 	mu       sync.Mutex
 	lists    map[string][]string
+	counts   map[string]int64
+	expires  map[string]time.Time
 	failNext map[string]error
 }
 
@@ -25,7 +27,7 @@ func newFakeRedisServer(t *testing.T) *fakeRedisServer {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	s := &fakeRedisServer{ln: ln, lists: map[string][]string{}, failNext: map[string]error{}}
+	s := &fakeRedisServer{ln: ln, lists: map[string][]string{}, counts: map[string]int64{}, expires: map[string]time.Time{}, failNext: map[string]error{}}
 	go s.serve(t)
 	return s
 }
@@ -159,6 +161,22 @@ func (s *fakeRedisServer) execCommand(cmd []string) (respValue, error) {
 		}
 		s.lists[key] = out
 		return respInteger(removed), nil
+	case "LLEN":
+		return respInteger(len(s.lists[cmd[1]])), nil
+	case "INCR":
+		key := cmd[1]
+		s.counts[key]++
+		return respInteger(s.counts[key]), nil
+	case "EXPIRE":
+		seconds, _ := strconv.Atoi(cmd[2])
+		s.expires[cmd[1]] = time.Now().Add(time.Duration(seconds) * time.Second)
+		return respInteger(1), nil
+	case "TTL":
+		exp, ok := s.expires[cmd[1]]
+		if !ok {
+			return respInteger(-1), nil
+		}
+		return respInteger(int(time.Until(exp).Seconds())), nil
 	default:
 		return nil, fmt.Errorf("unsupported command %q", cmd[0])
 	}
@@ -436,5 +454,40 @@ func TestRecoverProcessingQueueMovesReservedJobsBack(t *testing.T) {
 	}
 	if got := len(server.lists[ProcessingQueueName(DispatchEmailQueueName)]); got != 0 {
 		t.Fatalf("processing len=%d", got)
+	}
+}
+
+func TestPressureSnapshotLeavesRetryAfterUnset(t *testing.T) {
+	t.Parallel()
+	server := newFakeRedisServer(t)
+	defer server.close()
+
+	q := NewRedisQueue(server.addr(), "", 0)
+	snapshot, err := q.PressureSnapshot(context.Background())
+	if err != nil {
+		t.Fatalf("PressureSnapshot() error = %v", err)
+	}
+	if snapshot.RetryAfter != 0 {
+		t.Fatalf("RetryAfter = %v, want 0", snapshot.RetryAfter)
+	}
+}
+
+func TestAllowTenantClampsSubsecondWindow(t *testing.T) {
+	t.Parallel()
+	server := newFakeRedisServer(t)
+	defer server.close()
+
+	q := NewRedisQueue(server.addr(), "", 0)
+	allowed, _, err := q.AllowTenant(context.Background(), "tenant-1", 1, 500*time.Millisecond)
+	if err != nil {
+		t.Fatalf("AllowTenant() error = %v", err)
+	}
+	if !allowed {
+		t.Fatal("AllowTenant() = false, want true")
+	}
+	server.mu.Lock()
+	defer server.mu.Unlock()
+	if exp := server.expires["notify:rate:tenant-1"]; time.Until(exp) <= 0 {
+		t.Fatal("rate limit key expired immediately")
 	}
 }

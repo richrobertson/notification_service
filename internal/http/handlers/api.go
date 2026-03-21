@@ -41,9 +41,21 @@ type dispatchQueue interface {
 	EnqueueDispatch(ctx context.Context, job queue.DispatchJob) error
 }
 
+type TenantRateLimiter interface {
+	Allow(ctx context.Context, tenantID string) (bool, time.Duration, error)
+}
+
+type PressureMonitor interface {
+	Snapshot(ctx context.Context) (queue.PressureSnapshot, error)
+	IncRateLimited(tenantID string)
+	IncRejected(reason, tenantID string)
+}
+
 type API struct {
-	store apiStore
-	queue dispatchQueue
+	store   apiStore
+	queue   dispatchQueue
+	limiter TenantRateLimiter
+	monitor PressureMonitor
 }
 
 type notificationInspectionResponse struct {
@@ -76,14 +88,65 @@ type createNotificationRequest struct {
 	Variables           map[string]any `json:"variables"`
 }
 
-func NewAPI(store apiStore, redisQueue dispatchQueue) *API {
-	return &API{store: store, queue: redisQueue}
+func NewAPI(store apiStore, redisQueue dispatchQueue, limiter TenantRateLimiter, monitor PressureMonitor) *API {
+	return &API{store: store, queue: redisQueue, limiter: limiter, monitor: monitor}
 }
 
 func (a *API) recordAudit(ctx context.Context, tenantID, actor, action, resourceType, resourceID string, metadata map[string]any) {
 	if err := a.store.RecordAuditEvent(ctx, generateID("audit"), tenantID, actor, action, resourceType, resourceID, metadata); err != nil {
 		slog.Default().Warn("failed to record audit event", slog.Any("error", err), slog.String("action", action), slog.String("resource_id", resourceID))
 	}
+}
+
+func (a *API) enforceRateLimit(ctx context.Context, w http.ResponseWriter, tenantID string) bool {
+	if a.limiter == nil || tenantID == "" {
+		return true
+	}
+	allowed, retryAfter, err := a.limiter.Allow(ctx, tenantID)
+	if err != nil {
+		slog.Default().Error("rate limiter unavailable", slog.Any("error", err), slog.String("tenant_id", tenantID))
+		writeError(w, http.StatusServiceUnavailable, "pressure_unavailable", "unable to evaluate request pressure")
+		return false
+	}
+	if allowed {
+		return true
+	}
+	if a.monitor != nil {
+		a.monitor.IncRateLimited(tenantID)
+	}
+	w.Header().Set("Retry-After", fmt.Sprintf("%.0f", retryAfter.Seconds()))
+	slog.Default().Warn("request rate limited", slog.String("tenant_id", tenantID), slog.Duration("retry_after", retryAfter))
+	writeError(w, http.StatusTooManyRequests, "rate_limited", "tenant request rate exceeded")
+	return false
+}
+
+func (a *API) enforceBackpressure(ctx context.Context, w http.ResponseWriter, tenantID string) bool {
+	if a.monitor == nil {
+		return true
+	}
+	snapshot, err := a.monitor.Snapshot(ctx)
+	if err != nil {
+		slog.Default().Error("queue pressure snapshot failed", slog.Any("error", err))
+		writeError(w, http.StatusServiceUnavailable, "pressure_unavailable", "unable to evaluate queue pressure")
+		return false
+	}
+	if !snapshot.AcceptingWrites() {
+		if a.monitor != nil {
+			a.monitor.IncRejected("queue_hard_limit", tenantID)
+		}
+		code := http.StatusServiceUnavailable
+		if snapshot.AnyHardLimited() {
+			code = http.StatusTooManyRequests
+		}
+		w.Header().Set("Retry-After", fmt.Sprintf("%.0f", snapshot.RetryAfter.Seconds()))
+		slog.Default().Warn("request rejected due to queue pressure", slog.String("tenant_id", tenantID), slog.Any("depths", snapshot.Depths), slog.Int("soft_limit", snapshot.SoftLimit), slog.Int("hard_limit", snapshot.HardLimit))
+		writeError(w, code, "queue_overloaded", "notification service is saturated; retry later")
+		return false
+	}
+	if snapshot.AnySoftLimited() {
+		slog.Default().Warn("queue pressure soft limit reached", slog.String("tenant_id", tenantID), slog.Any("depths", snapshot.Depths), slog.Int("soft_limit", snapshot.SoftLimit))
+	}
+	return true
 }
 
 func (a *API) ensureAndEnqueueInitialAttempt(ctx context.Context, w http.ResponseWriter, existing store.Notification) {
@@ -228,6 +291,12 @@ func (a *API) CreateNotification() http.HandlerFunc {
 		}
 		if strings.TrimSpace(req.TemplateID) == "" {
 			writeError(w, http.StatusBadRequest, "bad_request", "template_id is required")
+			return
+		}
+		if !a.enforceRateLimit(r.Context(), w, req.TenantID) {
+			return
+		}
+		if !a.enforceBackpressure(r.Context(), w, req.TenantID) {
 			return
 		}
 		if _, err := a.store.GetTenantByID(r.Context(), req.TenantID); err != nil {
@@ -384,6 +453,9 @@ func (a *API) ReplayDeadLetter() http.HandlerFunc {
 		notification, err := a.store.GetNotificationByID(r.Context(), deadLetter.NotificationID)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
+			return
+		}
+		if !a.enforceBackpressure(r.Context(), w, notification.TenantID) {
 			return
 		}
 		a.recordAudit(r.Context(), notification.TenantID, "api", "replay_requested", "dead_letter", deadLetterID, map[string]any{"notification_id": deadLetter.NotificationID, "channel": deadLetter.Channel})

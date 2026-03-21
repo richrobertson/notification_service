@@ -274,7 +274,7 @@ func newDeadLetterTestAPI() (*fakeAPIStore, *fakeDispatchQueue, *API) {
 		},
 	}
 	q := &fakeDispatchQueue{}
-	return st, q, NewAPI(st, q)
+	return st, q, NewAPI(st, q, nil, nil)
 }
 
 func TestDeadLetterHandlersListGetReplay(t *testing.T) {
