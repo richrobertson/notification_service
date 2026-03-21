@@ -15,3 +15,28 @@ func TestBuildEmailMessage(t *testing.T) {
 		}
 	}
 }
+
+func TestBuildEmailMessageSanitizesIdentifiers(t *testing.T) {
+	t.Parallel()
+
+	msg := buildEmailMessage("from@example.test", EmailRequest{
+		To:             "to@example.test",
+		Subject:        "hello",
+		Body:           "body",
+		AttemptID:      "attempt\r\nBcc:bad",
+		NotificationID: "notif\r\nInjected:bad",
+	})
+
+	for _, want := range []string{
+		"X-Notification-Attempt-ID: attemptBccbad",
+		"X-Notification-ID: notifInjectedbad",
+		"Message-ID: <attemptBccbad@notification-service>",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("message missing %q in %q", want, msg)
+		}
+	}
+	if strings.Contains(msg, "Bcc:bad") || strings.Contains(msg, "Injected:bad") {
+		t.Fatalf("message contains unsanitized identifiers: %q", msg)
+	}
+}

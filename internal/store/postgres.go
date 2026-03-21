@@ -502,10 +502,10 @@ func deriveNotificationStatus(attempts []DeliveryAttempt) string {
 		return "partially_delivered"
 	case hasSent:
 		return "delivered"
-	case hasDeadLettered:
-		return "dead_lettered"
 	case hasActive:
 		return "processing"
+	case hasDeadLettered:
+		return "dead_lettered"
 	case hasFailed:
 		return "failed"
 	default:
@@ -720,9 +720,28 @@ func (p *Postgres) GetDeliveryAttemptByID(ctx context.Context, id string) (Deliv
 
 func (p *Postgres) ListDeliveryAttemptsByNotificationID(ctx context.Context, notificationID string) ([]DeliveryAttempt, error) {
 	rows, err := p.DB.QueryContext(ctx, `
-		SELECT da.id, da.notification_id, da.channel, da.attempt_number, da.status, da.error_code, da.error_message, da.provider_message_id, da.last_error, da.next_retry_at, da.started_at, da.completed_at, da.sent_at, da.failed_at, da.dispatch_enqueued_at, da.enqueue_kind, dl.id, replay_dl.id, da.created_at, da.updated_at
+		WITH dead_lettered_attempts AS (
+			SELECT
+				id,
+				notification_id,
+				channel,
+				ROW_NUMBER() OVER (PARTITION BY notification_id, channel ORDER BY attempt_number ASC, created_at ASC, id ASC) AS seq
+			FROM delivery_attempts
+			WHERE notification_id = $1 AND status = 'dead_lettered'
+		),
+		dead_letter_rows AS (
+			SELECT
+				id,
+				notification_id,
+				channel,
+				ROW_NUMBER() OVER (PARTITION BY notification_id, channel ORDER BY dead_lettered_at ASC, id ASC) AS seq
+			FROM dead_letters
+			WHERE notification_id = $1
+		)
+		SELECT da.id, da.notification_id, da.channel, da.attempt_number, da.status, da.error_code, da.error_message, da.provider_message_id, da.last_error, da.next_retry_at, da.started_at, da.completed_at, da.sent_at, da.failed_at, da.dispatch_enqueued_at, da.enqueue_kind, dlr.id, replay_dl.id, da.created_at, da.updated_at
 		FROM delivery_attempts da
-		LEFT JOIN dead_letters dl ON dl.notification_id = da.notification_id AND dl.channel = da.channel AND da.status = 'dead_lettered'
+		LEFT JOIN dead_lettered_attempts dla ON dla.id = da.id
+		LEFT JOIN dead_letter_rows dlr ON dlr.notification_id = da.notification_id AND dlr.channel = da.channel AND dlr.seq = dla.seq
 		LEFT JOIN dead_letters replay_dl ON replay_dl.replay_attempt_id = da.id
 		WHERE da.notification_id = $1
 		ORDER BY da.attempt_number ASC, da.created_at ASC
@@ -824,6 +843,13 @@ func (p *Postgres) MarkAttemptSent(ctx context.Context, attemptID string, provid
 		return fmt.Errorf("mark attempt sent: rows affected: %w", err)
 	}
 	if rows == 0 {
+		attempt, loadErr := p.GetDeliveryAttemptByID(ctx, attemptID)
+		if loadErr != nil {
+			return fmt.Errorf("mark attempt sent: %w", loadErr)
+		}
+		if isAttemptTerminalState(attempt.Status) {
+			return fmt.Errorf("mark attempt sent: %w", ErrAttemptAlreadyFinalized)
+		}
 		return fmt.Errorf("mark attempt sent: %w", ErrInvalidStateTransition)
 	}
 	notificationID, err := p.notificationIDForAttempt(ctx, attemptID)
@@ -848,6 +874,13 @@ func (p *Postgres) MarkAttemptFailed(ctx context.Context, attemptID string, last
 		return fmt.Errorf("mark attempt failed: rows affected: %w", err)
 	}
 	if rows == 0 {
+		attempt, loadErr := p.GetDeliveryAttemptByID(ctx, attemptID)
+		if loadErr != nil {
+			return fmt.Errorf("mark attempt failed: %w", loadErr)
+		}
+		if isAttemptTerminalState(attempt.Status) {
+			return fmt.Errorf("mark attempt failed: %w", ErrAttemptAlreadyFinalized)
+		}
 		return fmt.Errorf("mark attempt failed: %w", ErrInvalidStateTransition)
 	}
 	notificationID, err := p.notificationIDForAttempt(ctx, attemptID)
@@ -877,6 +910,13 @@ func (p *Postgres) ScheduleRetry(ctx context.Context, attemptID, lastError strin
 		return fmt.Errorf("schedule retry: rows affected: %w", err)
 	}
 	if rows == 0 {
+		attempt, loadErr := p.GetDeliveryAttemptByID(ctx, attemptID)
+		if loadErr != nil {
+			return fmt.Errorf("schedule retry: %w", loadErr)
+		}
+		if isAttemptTerminalState(attempt.Status) {
+			return fmt.Errorf("schedule retry: %w", ErrAttemptAlreadyFinalized)
+		}
 		return fmt.Errorf("schedule retry: %w", ErrInvalidStateTransition)
 	}
 	notificationID, err := p.notificationIDForAttempt(ctx, attemptID)
@@ -901,6 +941,13 @@ func (p *Postgres) MarkAttemptDeadLettered(ctx context.Context, attemptID, lastE
 		return fmt.Errorf("mark attempt dead lettered: rows affected: %w", err)
 	}
 	if rows == 0 {
+		attempt, loadErr := p.GetDeliveryAttemptByID(ctx, attemptID)
+		if loadErr != nil {
+			return fmt.Errorf("mark attempt dead lettered: %w", loadErr)
+		}
+		if isAttemptTerminalState(attempt.Status) {
+			return fmt.Errorf("mark attempt dead lettered: %w", ErrAttemptAlreadyFinalized)
+		}
 		return fmt.Errorf("mark attempt dead lettered: %w", ErrInvalidStateTransition)
 	}
 	notificationID, err := p.notificationIDForAttempt(ctx, attemptID)
@@ -1151,6 +1198,7 @@ func (p *Postgres) EnsureRetryAttempt(ctx context.Context, scheduledAttemptID, n
 		return RetryDueAttempt{}, fmt.Errorf("ensure retry attempt: %w", err)
 	}
 	item.NotificationID = item.Attempt.NotificationID
+	createdNewAttempt := false
 	attempt, err := getAttemptByIDTx(ctx, tx, newAttemptID)
 	if err != nil && !errors.Is(err, ErrNotFound) {
 		return RetryDueAttempt{}, fmt.Errorf("ensure retry attempt: get child: %w", err)
@@ -1166,6 +1214,7 @@ func (p *Postgres) EnsureRetryAttempt(ctx context.Context, scheduledAttemptID, n
 		`, newAttemptID, item.Attempt.NotificationID, item.Attempt.Channel, item.Attempt.AttemptNumber+1).Scan(&attempt.ID, &attempt.NotificationID, &attempt.Channel, &attempt.AttemptNumber, &attempt.Status, &attempt.ErrorCode, &attempt.ErrorMessage, &attempt.ProviderMessageID, &attempt.LastError, &attempt.NextRetryAt, &attempt.StartedAt, &attempt.CompletedAt, &attempt.SentAt, &attempt.FailedAt, &attempt.DispatchEnqueuedAt, &attempt.EnqueueKind, &attempt.CreatedAt, &attempt.UpdatedAt); err != nil {
 			return RetryDueAttempt{}, wrapStoreError("ensure retry attempt", err)
 		}
+		createdNewAttempt = true
 	}
 	if item.Attempt.Status == "retry_scheduled" {
 		if _, err := tx.ExecContext(ctx, `UPDATE delivery_attempts SET status = 'failed', next_retry_at = NULL, updated_at = NOW() WHERE id = $1 AND status = 'retry_scheduled'`, scheduledAttemptID); err != nil {
@@ -1174,6 +1223,11 @@ func (p *Postgres) EnsureRetryAttempt(ctx context.Context, scheduledAttemptID, n
 	}
 	if err := tx.Commit(); err != nil {
 		return RetryDueAttempt{}, fmt.Errorf("ensure retry attempt: commit: %w", err)
+	}
+	if createdNewAttempt {
+		if err := p.RecalculateNotificationStatus(ctx, item.NotificationID); err != nil {
+			return RetryDueAttempt{}, err
+		}
 	}
 	item.Attempt = attempt
 	return item, nil

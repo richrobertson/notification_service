@@ -408,18 +408,6 @@ func (a *API) ReplayDeadLetter() http.HandlerFunc {
 			return
 		}
 		a.recordAudit(r.Context(), notification.TenantID, "api", "replay_enqueued", "delivery_attempt", result.Attempt.ID, map[string]any{"notification_id": result.Attempt.NotificationID, "dead_letter_id": deadLetterID, "channel": result.Attempt.Channel})
-		if err != nil {
-			if errors.Is(err, store.ErrNotFound) {
-				writeError(w, http.StatusNotFound, "not_found", "dead letter not found")
-				return
-			}
-			if errors.Is(err, store.ErrConflict) {
-				writeError(w, http.StatusConflict, "conflict", "dead letter already replayed")
-				return
-			}
-			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
-			return
-		}
 		writeJSON(w, http.StatusAccepted, result.Attempt)
 	}
 }

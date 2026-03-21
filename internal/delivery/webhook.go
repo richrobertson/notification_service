@@ -37,11 +37,11 @@ func (s *WebhookSender) Send(ctx context.Context, req WebhookRequest) (string, e
 		return "", fmt.Errorf("build webhook request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", contentTypeForBody(req.Body))
-	if id := sanitizeHeaderValue(req.AttemptID); id != "" {
+	if id := sanitizeIdentifier(req.AttemptID); id != "" {
 		httpReq.Header.Set("Idempotency-Key", id)
 		httpReq.Header.Set("X-Notification-Attempt-ID", id)
 	}
-	if id := sanitizeHeaderValue(req.NotificationID); id != "" {
+	if id := sanitizeIdentifier(req.NotificationID); id != "" {
 		httpReq.Header.Set("X-Notification-ID", id)
 	}
 
@@ -74,10 +74,17 @@ func contentTypeForBody(body string) string {
 	return "text/plain; charset=utf-8"
 }
 
-// sanitizeHeaderValue strips CR and LF characters to prevent header injection.
-func sanitizeHeaderValue(v string) string {
+// sanitizeIdentifier removes control characters and restricts values to a safe header/message-id subset.
+func sanitizeIdentifier(v string) string {
 	v = strings.TrimSpace(v)
-	v = strings.ReplaceAll(v, "\r", "")
-	v = strings.ReplaceAll(v, "\n", "")
-	return v
+	var b strings.Builder
+	for _, r := range v {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+			b.WriteRune(r)
+		case r == '-', r == '_', r == '.':
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }

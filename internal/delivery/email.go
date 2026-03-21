@@ -104,11 +104,11 @@ func buildEmailMessage(from string, req EmailRequest) string {
 		"MIME-Version: 1.0",
 		"Content-Type: text/plain; charset=UTF-8",
 	}
-	if id := sanitizeHeaderValue(req.AttemptID); id != "" {
+	if id := sanitizeIdentifier(req.AttemptID); id != "" {
 		headers = append(headers, fmt.Sprintf("X-Notification-Attempt-ID: %s", id))
 		headers = append(headers, fmt.Sprintf("Message-ID: <%s@notification-service>", id))
 	}
-	if id := sanitizeHeaderValue(req.NotificationID); id != "" {
+	if id := sanitizeIdentifier(req.NotificationID); id != "" {
 		headers = append(headers, fmt.Sprintf("X-Notification-ID: %s", id))
 	}
 	return strings.Join(headers, "\r\n") + "\r\n\r\n" + body + "\r\n"
