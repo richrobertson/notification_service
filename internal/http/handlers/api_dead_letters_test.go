@@ -177,6 +177,11 @@ func (f *fakeAPIStore) FinalizeReplayEnqueue(_ context.Context, id, attemptID st
 	f.deadLetters[id] = dl
 	return nil
 }
+func (f *fakeAPIStore) RecalculateNotificationStatus(_ context.Context, notificationID string) error {
+	f.recalculateCalls++
+	f.recalculatedIDs = append(f.recalculatedIDs, notificationID)
+	return f.recalculateErr
+}
 func (f *fakeAPIStore) GetNotificationByID(context.Context, string) (store.Notification, error) {
 	return f.notification, nil
 }
@@ -397,6 +402,9 @@ func TestCreateNotificationMarksInitialAttemptEnqueued(t *testing.T) {
 		t.Fatalf("markEnqueuedCalls=%d", st.markEnqueuedCalls)
 	}
 	assertStatusRefresh(t, st, "notif-1")
+	if st.recalculateCalls != 1 || len(st.recalculatedIDs) != 1 || st.recalculatedIDs[0] != "notif-1" {
+		t.Fatalf("recalculateCalls=%d recalculatedIDs=%v", st.recalculateCalls, st.recalculatedIDs)
+	}
 	if len(q.jobs) != 1 {
 		t.Fatalf("jobs=%d", len(q.jobs))
 	}

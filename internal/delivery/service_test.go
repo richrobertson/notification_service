@@ -29,6 +29,7 @@ type stubStore struct {
 	deadLetterMsg    string
 	insertedDead     *store.DeadLetter
 	auditActions     []string
+	auditTenantIDs   map[string]string
 }
 
 func (s *stubStore) LoadDeliveryJob(context.Context, string, string) (store.Notification, store.Template, store.DeliveryAttempt, error) {
@@ -68,8 +69,12 @@ func (s *stubStore) InsertDeadLetter(_ context.Context, id, notificationID, chan
 	s.insertedDead = &dl
 	return dl, nil
 }
-func (s *stubStore) RecordAuditEvent(_ context.Context, _, _, _, action, _, _ string, _ map[string]any) error {
+func (s *stubStore) RecordAuditEvent(_ context.Context, _, tenantID, _, action, _, _ string, _ map[string]any) error {
 	s.auditActions = append(s.auditActions, action)
+	if s.auditTenantIDs == nil {
+		s.auditTenantIDs = make(map[string]string)
+	}
+	s.auditTenantIDs[action] = tenantID
 	return nil
 }
 
@@ -118,7 +123,7 @@ func TestServiceSchedulesRetryOnTransientEmailFailure(t *testing.T) {
 }
 
 func TestServiceDoesNotScheduleRetryOnTerminalFailure(t *testing.T) {
-	st := &stubStore{notification: store.Notification{Variables: map[string]any{"name": "Ada"}}, template: store.Template{Body: "hello {{.name}}"}, attempt: store.DeliveryAttempt{ID: "attempt-1", AttemptNumber: 1}}
+	st := &stubStore{notification: store.Notification{ID: "notif-1", TenantID: "tenant-1", Variables: map[string]any{"name": "Ada"}}, template: store.Template{Body: "hello {{.name}}"}, attempt: store.DeliveryAttempt{ID: "attempt-1", NotificationID: "notif-1", AttemptNumber: 1}}
 	svc := newTestService(t, st)
 	result, err := svc.ProcessWebhook(context.Background(), queue.DispatchJob{AttemptID: "attempt-1", NotificationID: "notif-1", Channel: "webhook"})
 	if !IsTerminal(err) {
@@ -129,6 +134,9 @@ func TestServiceDoesNotScheduleRetryOnTerminalFailure(t *testing.T) {
 	}
 	if st.scheduledAt != nil {
 		t.Fatalf("unexpected retry scheduled: %v", st.scheduledAt)
+	}
+	if got := st.auditTenantIDs["attempt_failed"]; got != "tenant-1" {
+		t.Fatalf("attempt_failed tenant_id=%q", got)
 	}
 }
 
