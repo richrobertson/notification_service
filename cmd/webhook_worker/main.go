@@ -17,12 +17,22 @@ import (
 )
 
 func main() {
-	run("webhook-worker", queue.DispatchWebhookQueueName, func(cfg config.Config, postgres *store.Postgres) (*delivery.Service, error) {
-		return delivery.NewService(postgres, delivery.NewWebhookSender(cfg.WebhookTimeout), delivery.NewSMTPSender(cfg), delivery.RetryPolicy{MaxAttempts: cfg.RetryMaxAttempts, BaseDelay: cfg.RetryBaseDelay, MaxDelay: cfg.RetryMaxDelay, ExponentialBackoff: cfg.RetryExponentialBackoff, Jitter: cfg.RetryJitter, Now: func() time.Time { return time.Now().UTC() }})
+	run("webhook-worker", queue.DispatchWebhookQueueName, func(cfg config.Config, postgres *store.Postgres, redisQueue *queue.RedisQueue) (*delivery.Service, error) {
+		return delivery.NewService(postgres, delivery.NewWebhookSender(cfg.WebhookTimeout), delivery.NewSMTPSender(cfg), delivery.RetryPolicy{MaxAttempts: cfg.RetryMaxAttempts, BaseDelay: cfg.RetryBaseDelay, MaxDelay: cfg.RetryMaxDelay, ExponentialBackoff: cfg.RetryExponentialBackoff, Jitter: cfg.RetryJitter, Now: func() time.Time { return time.Now().UTC() }, PressureMultiplier: cfg.RetryPressureMultiplier, PressureMinDelay: cfg.RetryPressureMinDelay, QueueSoftLimit: cfg.QueueSoftLimit, QueueDepth: func(channel string) int {
+			name, err := queue.QueueNameForChannel(channel)
+			if err != nil {
+				return 0
+			}
+			depth, err := redisQueue.QueueDepth(context.Background(), name)
+			if err != nil {
+				return 0
+			}
+			return depth
+		}})
 	})
 }
 
-func run(appName, queueName string, svcFactory func(config.Config, *store.Postgres) (*delivery.Service, error)) {
+func run(appName, queueName string, svcFactory func(config.Config, *store.Postgres, *queue.RedisQueue) (*delivery.Service, error)) {
 	cfg := config.Load()
 	cfg.AppName = appName
 	logger := platform.NewLogger(cfg.LogLevel)
@@ -55,7 +65,7 @@ func run(appName, queueName string, svcFactory func(config.Config, *store.Postgr
 	defer redisQueue.Close()
 	worker.RecoverProcessingQueues(startupCtx, logger, redisQueue)
 	worker.StartRecoveryLoop(ctx, logger, redisQueue, cfg.RecoveryInterval)
-	svc, err := svcFactory(cfg, postgres)
+	svc, err := svcFactory(cfg, postgres, redisQueue)
 	if err != nil {
 		logger.Error("failed to initialize delivery service", slog.Any("error", err))
 		os.Exit(1)
@@ -68,5 +78,5 @@ func run(appName, queueName string, svcFactory func(config.Config, *store.Postgr
 		default:
 			return delivery.Result{}, delivery.MaybeRetryable(os.ErrInvalid)
 		}
-	})
+	}, worker.Options{Concurrency: cfg.WebhookWorkerConcurrency, TenantBurst: cfg.PerTenantWorkerBurst, TenantMaxInFlight: cfg.PerTenantMaxInFlight})
 }

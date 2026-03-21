@@ -63,6 +63,7 @@ type retryStore interface {
 
 type retryQueue interface {
 	EnqueueDispatch(ctx context.Context, job queue.DispatchJob) error
+	PressureSnapshot(ctx context.Context) (queue.PressureSnapshot, error)
 }
 
 func runOnce(ctx context.Context, logger *slog.Logger, postgres retryStore, redisQueue retryQueue) error {
@@ -85,6 +86,11 @@ func runOnce(ctx context.Context, logger *slog.Logger, postgres retryStore, redi
 	pending, err := postgres.ListAttemptsPendingEnqueue(ctx, 100)
 	if err != nil {
 		return err
+	}
+	snapshot, err := redisQueue.PressureSnapshot(ctx)
+	if err == nil && snapshot.AnySoftLimited() {
+		logger.Warn("retry worker delaying retries due to queue pressure", slog.Any("depths", snapshot.Depths))
+		return nil
 	}
 	for _, item := range pending {
 		job := queue.DispatchJob{JobID: generateID("job"), NotificationID: item.Attempt.NotificationID, AttemptID: item.Attempt.ID, TenantID: item.TenantID, Channel: item.Attempt.Channel, CreatedAt: time.Now().UTC()}

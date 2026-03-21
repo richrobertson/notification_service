@@ -44,8 +44,9 @@ func (f *fakeRetryStore) RecordAuditEvent(context.Context, string, string, strin
 }
 
 type fakeRetryQueue struct {
-	jobs []queue.DispatchJob
-	err  error
+	jobs     []queue.DispatchJob
+	err      error
+	snapshot queue.PressureSnapshot
 }
 
 func (f *fakeRetryQueue) EnqueueDispatch(_ context.Context, job queue.DispatchJob) error {
@@ -54,6 +55,9 @@ func (f *fakeRetryQueue) EnqueueDispatch(_ context.Context, job queue.DispatchJo
 	}
 	f.jobs = append(f.jobs, job)
 	return nil
+}
+func (f *fakeRetryQueue) PressureSnapshot(context.Context) (queue.PressureSnapshot, error) {
+	return f.snapshot, nil
 }
 
 func testLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
@@ -111,6 +115,17 @@ func TestRunOnceRecoversPendingInitialAttempt(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(q.jobs) != 1 || q.jobs[0].AttemptID != "attempt-initial" {
+		t.Fatalf("jobs=%+v", q.jobs)
+	}
+}
+
+func TestRunOnceSkipsRetryStormWhenQueuePressured(t *testing.T) {
+	st := &fakeRetryStore{pending: []store.PendingEnqueueAttempt{{Attempt: store.DeliveryAttempt{ID: "attempt-2", NotificationID: "notif-1", Channel: "email", AttemptNumber: 2, Status: "pending"}, TenantID: "tenant-1"}}}
+	q := &fakeRetryQueue{snapshot: queue.PressureSnapshot{Depths: map[string]int{queue.DispatchQueueName: 100}, SoftLimit: 10, HardLimit: 100}}
+	if err := runOnce(context.Background(), testLogger(), st, q); err != nil {
+		t.Fatal(err)
+	}
+	if len(q.jobs) != 0 {
 		t.Fatalf("jobs=%+v", q.jobs)
 	}
 }

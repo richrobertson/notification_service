@@ -37,6 +37,10 @@ type RetryPolicy struct {
 	Now                func() time.Time
 	IDGenerator        func() string
 	RandSource         *rand.Rand
+	PressureMultiplier int
+	PressureMinDelay   time.Duration
+	QueueDepth         func(channel string) int
+	QueueSoftLimit     int
 }
 
 type webhookSender interface {
@@ -116,6 +120,9 @@ func NewService(store NotificationStore, webhookSender webhookSender, emailSende
 	}
 	if policy.RandSource == nil {
 		policy.RandSource = rand.New(rand.NewSource(1))
+	}
+	if policy.PressureMultiplier <= 0 {
+		policy.PressureMultiplier = 1
 	}
 	meter := otel.Meter("notification-platform/delivery")
 	sentCounter, err := meter.Int64Counter("deliveries_sent_total")
@@ -219,7 +226,7 @@ func (s *Service) handleRetryable(ctx context.Context, notification store.Notifi
 		s.failCounter.Add(ctx, 1, metric.WithAttributes(attribute.String("channel", channel), attribute.String("final_state", "dead_lettered")))
 		return Result{Outcome: OutcomeDeadLettered, DeadLetter: &dl}, cause
 	}
-	nextRetryAt := s.nextRetryAt(attempt.AttemptNumber)
+	nextRetryAt := s.nextRetryAt(channel, attempt.AttemptNumber)
 	if err := s.store.ScheduleRetry(ctx, attempt.ID, cause.Error(), nextRetryAt); err != nil {
 		return Result{}, err
 	}
@@ -240,7 +247,7 @@ func (s *Service) failTerminal(ctx context.Context, tenantID, attemptID, channel
 	return Result{Outcome: OutcomeFailedTerminal}, cause
 }
 
-func (s *Service) nextRetryAt(attemptNumber int) time.Time {
+func (s *Service) nextRetryAt(channel string, attemptNumber int) time.Time {
 	delay := s.policy.BaseDelay
 	if s.policy.ExponentialBackoff {
 		for i := 1; i < attemptNumber; i++ {
@@ -253,6 +260,20 @@ func (s *Service) nextRetryAt(attemptNumber int) time.Time {
 	}
 	if delay > s.policy.MaxDelay {
 		delay = s.policy.MaxDelay
+	}
+	if s.policy.QueueDepth != nil && s.policy.QueueSoftLimit > 0 {
+		if depth := s.policy.QueueDepth(channel); depth >= s.policy.QueueSoftLimit {
+			for i := 1; i < s.policy.PressureMultiplier; i++ {
+				delay *= 2
+				if delay >= s.policy.MaxDelay {
+					delay = s.policy.MaxDelay
+					break
+				}
+			}
+			if delay < s.policy.PressureMinDelay {
+				delay = s.policy.PressureMinDelay
+			}
+		}
 	}
 	if s.policy.Jitter > 0 {
 		delta := time.Duration(s.policy.RandSource.Int63n(int64(s.policy.Jitter)*2+1)) - s.policy.Jitter

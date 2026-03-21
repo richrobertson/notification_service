@@ -16,6 +16,8 @@ type fakeRedisServer struct {
 	ln       net.Listener
 	mu       sync.Mutex
 	lists    map[string][]string
+	counts   map[string]int64
+	expires  map[string]time.Time
 	failNext map[string]error
 }
 
@@ -25,7 +27,7 @@ func newFakeRedisServer(t *testing.T) *fakeRedisServer {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	s := &fakeRedisServer{ln: ln, lists: map[string][]string{}, failNext: map[string]error{}}
+	s := &fakeRedisServer{ln: ln, lists: map[string][]string{}, counts: map[string]int64{}, expires: map[string]time.Time{}, failNext: map[string]error{}}
 	go s.serve(t)
 	return s
 }
@@ -159,6 +161,22 @@ func (s *fakeRedisServer) execCommand(cmd []string) (respValue, error) {
 		}
 		s.lists[key] = out
 		return respInteger(removed), nil
+	case "LLEN":
+		return respInteger(len(s.lists[cmd[1]])), nil
+	case "INCR":
+		key := cmd[1]
+		s.counts[key]++
+		return respInteger(s.counts[key]), nil
+	case "EXPIRE":
+		seconds, _ := strconv.Atoi(cmd[2])
+		s.expires[cmd[1]] = time.Now().Add(time.Duration(seconds) * time.Second)
+		return respInteger(1), nil
+	case "TTL":
+		exp, ok := s.expires[cmd[1]]
+		if !ok {
+			return respInteger(-1), nil
+		}
+		return respInteger(int(time.Until(exp).Seconds())), nil
 	default:
 		return nil, fmt.Errorf("unsupported command %q", cmd[0])
 	}

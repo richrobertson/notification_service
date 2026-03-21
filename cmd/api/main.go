@@ -14,6 +14,7 @@ import (
 	"github.com/richrobertson/notification-platform/internal/config"
 	httpserver "github.com/richrobertson/notification-platform/internal/http"
 	"github.com/richrobertson/notification-platform/internal/platform"
+	"github.com/richrobertson/notification-platform/internal/pressure"
 	"github.com/richrobertson/notification-platform/internal/queue"
 	"github.com/richrobertson/notification-platform/internal/store"
 )
@@ -64,7 +65,8 @@ func main() {
 		}
 	}()
 
-	router := httpserver.NewRouter(httpserver.RouterDeps{AppName: cfg.AppName, DBPing: postgres.Ping, Store: postgres, Queue: redisQueue})
+	monitor := pressure.NewMonitor(redisQueue, cfg.QueueSoftLimit, cfg.QueueHardLimit, cfg.BackpressureRetryAfter)
+	router := httpserver.NewRouter(httpserver.RouterDeps{AppName: cfg.AppName, DBPing: postgres.Ping, Store: postgres, Queue: redisQueue, Monitor: monitor, Limiter: queue.NewTenantRateLimiter(redisQueue, cfg.APIRateLimitPerSecond, cfg.APIRateLimitWindow)})
 	server := &http.Server{Addr: ":" + cfg.HTTPPort, Handler: router, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 15 * time.Second, IdleTimeout: 60 * time.Second}
 
 	errCh := make(chan error, 1)
