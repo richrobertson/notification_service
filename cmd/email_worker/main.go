@@ -70,7 +70,7 @@ func main() {
 		if processErr != nil {
 			if delivery.IsTerminal(processErr) {
 				if ackErr := redisQueue.AckReserved(ctx, reserved); ackErr != nil {
-					logger.Error("worker terminal failure but ack failed; preserving job for retry", slog.Any("error", ackErr), slog.String("job_id", job.JobID), slog.String("attempt_id", job.AttemptID), slog.String("queue", queue.DispatchEmailQueueName))
+					logger.Error("worker terminal failure but ack failed; job remains reserved in processing queue for manual recovery", slog.Any("error", ackErr), slog.String("job_id", job.JobID), slog.String("attempt_id", job.AttemptID), slog.String("queue", queue.DispatchEmailQueueName))
 					continue
 				}
 				logger.Warn("worker job reached terminal failed state", slog.Any("error", processErr), slog.String("job_id", job.JobID), slog.String("notification_id", job.NotificationID), slog.String("attempt_id", job.AttemptID), slog.String("channel", job.Channel), slog.String("queue", queue.DispatchEmailQueueName))
@@ -80,11 +80,11 @@ func main() {
 				logger.Error("worker transient failure and requeue failed; job left in processing queue", slog.Any("error", requeueErr), slog.String("job_id", job.JobID), slog.String("attempt_id", job.AttemptID), slog.String("queue", queue.DispatchEmailQueueName))
 				continue
 			}
-			logger.Error("worker job failed transiently and was requeued", slog.Any("error", processErr), slog.String("job_id", job.JobID), slog.String("notification_id", job.NotificationID), slog.String("attempt_id", job.AttemptID), slog.String("channel", job.Channel), slog.String("queue", queue.DispatchEmailQueueName))
+			logger.Error("worker job failed transiently and was requeued to the main queue", slog.Any("error", processErr), slog.String("job_id", job.JobID), slog.String("notification_id", job.NotificationID), slog.String("attempt_id", job.AttemptID), slog.String("channel", job.Channel), slog.String("queue", queue.DispatchEmailQueueName))
 			continue
 		}
 		if err := redisQueue.AckReserved(ctx, reserved); err != nil {
-			logger.Error("worker job completed but ack failed; preserving job for retry", slog.Any("error", err), slog.String("job_id", job.JobID), slog.String("attempt_id", job.AttemptID), slog.String("queue", queue.DispatchEmailQueueName))
+			logger.Error("worker job completed but ack failed; job remains reserved in processing queue for manual recovery", slog.Any("error", err), slog.String("job_id", job.JobID), slog.String("attempt_id", job.AttemptID), slog.String("queue", queue.DispatchEmailQueueName))
 			continue
 		}
 		logger.Info("worker job completed", slog.String("job_id", job.JobID), slog.String("notification_id", job.NotificationID), slog.String("attempt_id", job.AttemptID), slog.String("channel", job.Channel), slog.String("queue", queue.DispatchEmailQueueName))

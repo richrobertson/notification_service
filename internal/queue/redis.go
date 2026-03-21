@@ -159,9 +159,19 @@ func (q *RedisQueue) RequeueReserved(ctx context.Context, reserved ReservedJob) 
 		q.resetConnLocked()
 		return fmt.Errorf("requeue reserved job: exec: %w", err)
 	}
-	values, ok := response.([]string)
+	values, ok := response.([]any)
 	if !ok || len(values) != 2 {
 		return fmt.Errorf("requeue reserved job: unexpected exec response %#v", response)
+	}
+	removed, ok := values[0].(int64)
+	if !ok {
+		return fmt.Errorf("requeue reserved job: unexpected lrem result %#v", values[0])
+	}
+	if removed == 0 {
+		return fmt.Errorf("requeue reserved job: reserved payload missing from processing queue")
+	}
+	if _, ok := values[1].(int64); !ok {
+		return fmt.Errorf("requeue reserved job: unexpected lpush result %#v", values[1])
 	}
 	return nil
 }
@@ -359,17 +369,13 @@ func (q *RedisQueue) readResponseLocked() (any, error) {
 		if count < 0 {
 			return nil, nil
 		}
-		values := make([]string, 0, count)
+		values := make([]any, 0, count)
 		for i := 0; i < count; i++ {
 			item, err := q.readResponseLocked()
 			if err != nil {
 				return nil, err
 			}
-			text, ok := item.(string)
-			if !ok {
-				return nil, fmt.Errorf("unexpected redis array item %#v", item)
-			}
-			values = append(values, text)
+			values = append(values, item)
 		}
 		return values, nil
 	default:

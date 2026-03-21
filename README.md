@@ -80,7 +80,7 @@ Important honesty notes:
 - Workers now reserve jobs into per-channel processing queues before attempting delivery so transient DB/update failures do not silently drop work.
 - Malformed queue jobs can still strand a reserved entry in the processing queue and require operator cleanup; there is no automated recovery sweeper yet.
 - PostgreSQL writes and Redis enqueue are **not** yet coordinated with an outbox pattern, so DB/queue atomicity is not yet hardened.
-- Reserved in-flight jobs are safer than destructive pops, but a worker crash can still leave a job sitting in `*:processing` until an operator or a future recovery loop moves it back.
+- Reserved in-flight jobs are safer than destructive pops, but a worker crash can still leave a job sitting in `*:processing`. Current workers do not automatically recover or replay those reserved jobs; manual recovery or a future recovery loop is still required.
 - Delivery completion is tracked on `delivery_attempts`; broader notification rollup state is intentionally still simple.
 
 
@@ -97,7 +97,7 @@ What Stage 4 now guarantees:
 What Stage 4 still does **not** guarantee:
 
 - no retries, retry scheduling, DLQ routing, replay APIs, or provider failover yet
-- no automated recovery of jobs left behind in `*:processing` after a worker crash
+- no automated recovery or replay of jobs left behind in `*:processing` after a worker crash
 - no outbox-style atomicity between PostgreSQL writes and Redis enqueue
 - no exactly-once delivery semantics
 
