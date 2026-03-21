@@ -438,6 +438,24 @@ func unmarshalVariables(raw []byte) (map[string]any, error) {
 	return variables, nil
 }
 
+func (p *Postgres) GetInitialAttemptByNotificationID(ctx context.Context, notificationID string) (DeliveryAttempt, error) {
+	const query = `
+		SELECT id, notification_id, channel, attempt_number, status, error_code, error_message, provider_message_id, last_error, next_retry_at, started_at, completed_at, sent_at, failed_at, dispatch_enqueued_at, enqueue_kind, created_at, updated_at
+		FROM delivery_attempts
+		WHERE notification_id = $1 AND enqueue_kind = 'initial'
+		ORDER BY attempt_number ASC
+		LIMIT 1
+	`
+	var attempt DeliveryAttempt
+	if err := p.DB.QueryRowContext(ctx, query, notificationID).Scan(&attempt.ID, &attempt.NotificationID, &attempt.Channel, &attempt.AttemptNumber, &attempt.Status, &attempt.ErrorCode, &attempt.ErrorMessage, &attempt.ProviderMessageID, &attempt.LastError, &attempt.NextRetryAt, &attempt.StartedAt, &attempt.CompletedAt, &attempt.SentAt, &attempt.FailedAt, &attempt.DispatchEnqueuedAt, &attempt.EnqueueKind, &attempt.CreatedAt, &attempt.UpdatedAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return DeliveryAttempt{}, fmt.Errorf("get initial attempt: %w", ErrNotFound)
+		}
+		return DeliveryAttempt{}, fmt.Errorf("get initial attempt: %w", err)
+	}
+	return attempt, nil
+}
+
 func (p *Postgres) CreateDeliveryAttempt(ctx context.Context, params CreateDeliveryAttemptParams) (DeliveryAttempt, error) {
 	const query = `
 		INSERT INTO delivery_attempts (
@@ -1012,7 +1030,7 @@ func (p *Postgres) ListAttemptsPendingEnqueue(ctx context.Context, limit int) ([
 		FROM delivery_attempts da
 		JOIN notifications n ON n.id = da.notification_id
 		LEFT JOIN dead_letters dl ON dl.replay_attempt_id = da.id
-		WHERE da.status = 'pending' AND da.dispatch_enqueued_at IS NULL AND da.enqueue_kind IN ('retry', 'replay')
+		WHERE da.status = 'pending' AND da.dispatch_enqueued_at IS NULL AND da.enqueue_kind IN ('initial', 'retry', 'replay')
 		ORDER BY da.created_at ASC
 		LIMIT $1
 	`, limit)

@@ -21,6 +21,7 @@ type apiStore interface {
 	CreateTemplate(ctx context.Context, params store.CreateTemplateParams) (store.Template, error)
 	GetTemplateByID(ctx context.Context, id string) (store.Template, error)
 	GetNotificationByTenantAndIdempotencyKey(ctx context.Context, tenantID, idempotencyKey string) (store.Notification, error)
+	GetInitialAttemptByNotificationID(ctx context.Context, notificationID string) (store.DeliveryAttempt, error)
 	CreateNotification(ctx context.Context, params store.CreateNotificationParams) (store.Notification, error)
 	CreateDeliveryAttempt(ctx context.Context, params store.CreateDeliveryAttemptParams) (store.DeliveryAttempt, error)
 	MarkAttemptEnqueued(ctx context.Context, attemptID string) error
@@ -175,6 +176,22 @@ func (a *API) CreateNotification() http.HandlerFunc {
 		if req.IdempotencyKey != "" {
 			existing, err := a.store.GetNotificationByTenantAndIdempotencyKey(r.Context(), req.TenantID, req.IdempotencyKey)
 			if err == nil {
+				attempt, attemptErr := a.store.GetInitialAttemptByNotificationID(r.Context(), existing.ID)
+				if attemptErr == nil && attempt.DispatchEnqueuedAt == nil {
+					slog.Default().Warn("idempotent retry found existing notification with pending initial enqueue", slog.String("notification_id", existing.ID), slog.String("attempt_id", attempt.ID), slog.String("channel", attempt.Channel))
+					job := queue.DispatchJob{JobID: generateID("job"), NotificationID: existing.ID, AttemptID: attempt.ID, TenantID: existing.TenantID, Channel: attempt.Channel, CreatedAt: time.Now().UTC()}
+					if enqueueErr := a.queue.EnqueueDispatch(r.Context(), job); enqueueErr != nil {
+						slog.Default().Error("initial attempt enqueue failed; attempt remains recoverable in postgres", slog.Any("error", enqueueErr), slog.String("notification_id", existing.ID), slog.String("attempt_id", attempt.ID), slog.String("channel", attempt.Channel))
+						writeJSON(w, http.StatusAccepted, existing)
+						return
+					}
+					if markErr := a.store.MarkAttemptEnqueued(r.Context(), attempt.ID); markErr != nil {
+						writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
+						return
+					}
+					writeJSON(w, http.StatusAccepted, existing)
+					return
+				}
 				writeJSON(w, http.StatusOK, existing)
 				return
 			}
@@ -258,8 +275,8 @@ func (a *API) CreateNotification() http.HandlerFunc {
 
 		job := queue.DispatchJob{JobID: generateID("job"), NotificationID: notification.ID, AttemptID: attempt.ID, TenantID: notification.TenantID, Channel: template.Channel, CreatedAt: time.Now().UTC()}
 		if err := a.queue.EnqueueDispatch(r.Context(), job); err != nil {
-			slog.Default().Error("failed to enqueue dispatch job", slog.Any("error", err), slog.String("notification_id", notification.ID), slog.String("attempt_id", attempt.ID), slog.String("job_id", job.JobID), slog.String("channel", job.Channel))
-			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
+			slog.Default().Error("initial attempt enqueue failed; attempt remains recoverable in postgres", slog.Any("error", err), slog.String("notification_id", notification.ID), slog.String("attempt_id", attempt.ID), slog.String("job_id", job.JobID), slog.String("channel", job.Channel))
+			writeJSON(w, http.StatusAccepted, notification)
 			return
 		}
 

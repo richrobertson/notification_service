@@ -100,3 +100,14 @@ func TestRunOnceFinalizesReplayAfterSuccessfulEnqueue(t *testing.T) {
 		t.Fatalf("finalizedReplay=%v", st.finalizedReplay)
 	}
 }
+
+func TestRunOnceRecoversPendingInitialAttempt(t *testing.T) {
+	st := &fakeRetryStore{pending: []store.PendingEnqueueAttempt{{Attempt: store.DeliveryAttempt{ID: "attempt-initial", NotificationID: "notif-1", Channel: "email", AttemptNumber: 1, Status: "pending", EnqueueKind: "initial"}, TenantID: "tenant-1"}}}
+	q := &fakeRetryQueue{}
+	if err := runOnce(context.Background(), testLogger(), st, q); err != nil {
+		t.Fatal(err)
+	}
+	if len(q.jobs) != 1 || q.jobs[0].AttemptID != "attempt-initial" {
+		t.Fatalf("jobs=%+v", q.jobs)
+	}
+}

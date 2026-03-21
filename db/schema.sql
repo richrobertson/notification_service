@@ -103,7 +103,7 @@ CREATE INDEX delivery_attempts_retry_idx
 
 CREATE INDEX delivery_attempts_dispatch_pending_idx
     ON delivery_attempts (status, created_at)
-    WHERE dispatch_enqueued_at IS NULL AND enqueue_kind IN ('retry', 'replay');
+    WHERE dispatch_enqueued_at IS NULL AND enqueue_kind IN ('initial', 'retry', 'replay');
 
 CREATE TABLE dead_letters (
     id UUID PRIMARY KEY,

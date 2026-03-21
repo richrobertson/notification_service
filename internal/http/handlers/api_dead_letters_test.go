@@ -26,6 +26,7 @@ type fakeAPIStore struct {
 	finalizedAttemptID  string
 	ensureErr           error
 	finalizeErr         error
+	existingByKey       map[string]store.Notification
 }
 
 func (f *fakeAPIStore) CreateTenant(context.Context, store.CreateTenantParams) (store.Tenant, error) {
@@ -40,12 +41,36 @@ func (f *fakeAPIStore) CreateTemplate(context.Context, store.CreateTemplateParam
 func (f *fakeAPIStore) GetTemplateByID(_ context.Context, id string) (store.Template, error) {
 	return store.Template{ID: id, TenantID: "tenant-1", Channel: "email", Name: "welcome"}, nil
 }
-func (f *fakeAPIStore) GetNotificationByTenantAndIdempotencyKey(context.Context, string, string) (store.Notification, error) {
+func (f *fakeAPIStore) GetNotificationByTenantAndIdempotencyKey(_ context.Context, tenantID, key string) (store.Notification, error) {
+	if f.existingByKey != nil {
+		if n, ok := f.existingByKey[tenantID+"/"+key]; ok {
+			return n, nil
+		}
+	}
 	return store.Notification{}, store.ErrNotFound
 }
 func (f *fakeAPIStore) CreateNotification(_ context.Context, params store.CreateNotificationParams) (store.Notification, error) {
 	f.createdNotification = &params
-	return store.Notification{ID: params.ID, TenantID: params.TenantID, TemplateID: params.TemplateID}, nil
+	n := store.Notification{ID: params.ID, TenantID: params.TenantID, TemplateID: params.TemplateID, IdempotencyKey: params.IdempotencyKey}
+	if params.IdempotencyKey != nil {
+		if f.existingByKey == nil {
+			f.existingByKey = map[string]store.Notification{}
+		}
+		f.existingByKey[params.TenantID+"/"+*params.IdempotencyKey] = n
+	}
+	return n, nil
+}
+
+func (f *fakeAPIStore) GetInitialAttemptByNotificationID(_ context.Context, notificationID string) (store.DeliveryAttempt, error) {
+	if f.createdAttempt != nil && f.createdAttempt.NotificationID == notificationID {
+		attempt := store.DeliveryAttempt{ID: f.createdAttempt.ID, NotificationID: notificationID, Channel: f.createdAttempt.Channel, AttemptNumber: f.createdAttempt.AttemptNumber, Status: f.createdAttempt.Status, EnqueueKind: f.createdAttempt.EnqueueKind}
+		if f.markEnqueuedCalls > 0 {
+			now := time.Unix(300, 0).UTC()
+			attempt.DispatchEnqueuedAt = &now
+		}
+		return attempt, nil
+	}
+	return store.DeliveryAttempt{}, store.ErrNotFound
 }
 func (f *fakeAPIStore) CreateDeliveryAttempt(_ context.Context, params store.CreateDeliveryAttemptParams) (store.DeliveryAttempt, error) {
 	f.createdAttempt = &params
@@ -191,6 +216,39 @@ func TestCreateNotificationMarksInitialAttemptEnqueued(t *testing.T) {
 	}
 	if st.createdAttempt == nil || st.createdAttempt.EnqueueKind != "initial" {
 		t.Fatalf("createdAttempt=%+v", st.createdAttempt)
+	}
+	if st.markEnqueuedCalls != 1 {
+		t.Fatalf("markEnqueuedCalls=%d", st.markEnqueuedCalls)
+	}
+	if len(q.jobs) != 1 {
+		t.Fatalf("jobs=%d", len(q.jobs))
+	}
+}
+
+func TestIdempotentRetryRecoversPendingInitialAttempt(t *testing.T) {
+	st, q, api := newDeadLetterTestAPI()
+	key := "stable-key"
+	first := httptest.NewRequest(http.MethodPost, "/v1/notifications", bytes.NewReader([]byte(`{"id":"notif-1","tenant_id":"tenant-1","template_id":"tpl-1","recipient_email":"user@example.test","variables":{},"idempotency_key":"`+key+`"}`)))
+	first.Header.Set("Content-Type", "application/json")
+	q.err = errors.New("redis down")
+	firstRes := httptest.NewRecorder()
+	api.CreateNotification().ServeHTTP(firstRes, first)
+	if firstRes.Code != http.StatusAccepted {
+		t.Fatalf("first status=%d body=%s", firstRes.Code, firstRes.Body.String())
+	}
+	if st.markEnqueuedCalls != 0 {
+		t.Fatalf("markEnqueuedCalls=%d", st.markEnqueuedCalls)
+	}
+	q.err = nil
+	second := httptest.NewRequest(http.MethodPost, "/v1/notifications", bytes.NewReader([]byte(`{"id":"notif-2","tenant_id":"tenant-1","template_id":"tpl-1","recipient_email":"user@example.test","variables":{},"idempotency_key":"`+key+`"}`)))
+	second.Header.Set("Content-Type", "application/json")
+	secondRes := httptest.NewRecorder()
+	api.CreateNotification().ServeHTTP(secondRes, second)
+	if secondRes.Code != http.StatusAccepted {
+		t.Fatalf("second status=%d body=%s", secondRes.Code, secondRes.Body.String())
+	}
+	if st.createdNotification == nil || st.createdNotification.ID != "notif-1" {
+		t.Fatalf("createdNotification=%+v", st.createdNotification)
 	}
 	if st.markEnqueuedCalls != 1 {
 		t.Fatalf("markEnqueuedCalls=%d", st.markEnqueuedCalls)
