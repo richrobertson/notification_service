@@ -19,9 +19,11 @@ type SMTPSender struct {
 }
 
 type EmailRequest struct {
-	To      string
-	Subject string
-	Body    string
+	To             string
+	Subject        string
+	Body           string
+	AttemptID      string
+	NotificationID string
 }
 
 func NewSMTPSender(cfg config.Config) *SMTPSender {
@@ -95,5 +97,19 @@ func (s *SMTPSender) Send(ctx context.Context, req EmailRequest) error {
 
 func buildEmailMessage(from string, req EmailRequest) string {
 	body := strings.ReplaceAll(req.Body, "\n", "\r\n")
-	return fmt.Sprintf("To: %s\r\nFrom: %s\r\nSubject: %s\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n%s\r\n", req.To, from, req.Subject, body)
+	headers := []string{
+		fmt.Sprintf("To: %s", req.To),
+		fmt.Sprintf("From: %s", from),
+		fmt.Sprintf("Subject: %s", req.Subject),
+		"MIME-Version: 1.0",
+		"Content-Type: text/plain; charset=UTF-8",
+	}
+	if req.AttemptID != "" {
+		headers = append(headers, fmt.Sprintf("X-Notification-Attempt-ID: %s", req.AttemptID))
+		headers = append(headers, fmt.Sprintf("Message-ID: <%s@notification-service>", req.AttemptID))
+	}
+	if req.NotificationID != "" {
+		headers = append(headers, fmt.Sprintf("X-Notification-ID: %s", req.NotificationID))
+	}
+	return strings.Join(headers, "\r\n") + "\r\n\r\n" + body + "\r\n"
 }

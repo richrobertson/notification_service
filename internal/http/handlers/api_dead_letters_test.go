@@ -15,28 +15,29 @@ import (
 )
 
 type fakeAPIStore struct {
-	deadLetters           map[string]store.DeadLetter
-	attempt               store.DeliveryAttempt
-	notification          store.Notification
-	ensureCalls           int
-	ensureInitialCalls    int
-	markEnqueuedCalls     int
-	createAttemptCalls    int
-	createNotifyCalls     int
-	createdAttempt        *store.CreateDeliveryAttemptParams
-	createdNotification   *store.CreateNotificationParams
-	finalizeCalls         int
-	finalizedAttemptID    string
-	ensureErr             error
-	finalizeErr           error
-	existingByKey         map[string]store.Notification
-	createNotificationErr error
-	fallbackExisting      *store.Notification
-	lookupCalls           int
-	fallbackAfterLookup   int
-	initialAttemptMissing bool
-	ensureInitialErr      error
-	templates             map[string]store.Template
+	deadLetters            map[string]store.DeadLetter
+	attempt                store.DeliveryAttempt
+	notification           store.Notification
+	ensureCalls            int
+	ensureInitialCalls     int
+	markEnqueuedCalls      int
+	createAttemptCalls     int
+	createNotifyCalls      int
+	createdAttempt         *store.CreateDeliveryAttemptParams
+	createdNotification    *store.CreateNotificationParams
+	finalizeCalls          int
+	finalizedAttemptID     string
+	ensureErr              error
+	finalizeErr            error
+	existingByKey          map[string]store.Notification
+	createNotificationErr  error
+	fallbackExisting       *store.Notification
+	lookupCalls            int
+	fallbackAfterLookup    int
+	initialAttemptMissing  bool
+	ensureInitialErr       error
+	templates              map[string]store.Template
+	attemptsByNotification map[string][]store.DeliveryAttempt
 }
 
 func (f *fakeAPIStore) CreateTenant(context.Context, store.CreateTenantParams) (store.Tenant, error) {
@@ -162,6 +163,31 @@ func (f *fakeAPIStore) FinalizeReplayEnqueue(_ context.Context, id, attemptID st
 func (f *fakeAPIStore) GetNotificationByID(context.Context, string) (store.Notification, error) {
 	return f.notification, nil
 }
+func (f *fakeAPIStore) GetDeliveryAttemptByID(_ context.Context, id string) (store.DeliveryAttempt, error) {
+	for _, attempts := range f.attemptsByNotification {
+		for _, attempt := range attempts {
+			if attempt.ID == id {
+				return attempt, nil
+			}
+		}
+	}
+	if f.createdAttempt != nil && f.createdAttempt.ID == id {
+		return store.DeliveryAttempt{ID: id, NotificationID: f.createdAttempt.NotificationID, Channel: f.createdAttempt.Channel, AttemptNumber: f.createdAttempt.AttemptNumber, Status: f.createdAttempt.Status, EnqueueKind: f.createdAttempt.EnqueueKind}, nil
+	}
+	return store.DeliveryAttempt{}, store.ErrNotFound
+}
+func (f *fakeAPIStore) ListDeliveryAttemptsByNotificationID(_ context.Context, notificationID string) ([]store.DeliveryAttempt, error) {
+	if attempts, ok := f.attemptsByNotification[notificationID]; ok {
+		return attempts, nil
+	}
+	if f.createdAttempt != nil && f.createdAttempt.NotificationID == notificationID {
+		return []store.DeliveryAttempt{{ID: f.createdAttempt.ID, NotificationID: notificationID, Channel: f.createdAttempt.Channel, AttemptNumber: f.createdAttempt.AttemptNumber, Status: f.createdAttempt.Status, EnqueueKind: f.createdAttempt.EnqueueKind}}, nil
+	}
+	return []store.DeliveryAttempt{}, nil
+}
+func (f *fakeAPIStore) RecordAuditEvent(context.Context, string, string, string, string, string, string, map[string]any) error {
+	return nil
+}
 
 type fakeDispatchQueue struct {
 	jobs []queue.DispatchJob
@@ -184,6 +210,9 @@ func newDeadLetterTestAPI() (*fakeAPIStore, *fakeDispatchQueue, *API) {
 		templates: map[string]store.Template{
 			"tpl-1": {ID: "tpl-1", TenantID: "tenant-1", Channel: "email", Name: "welcome"},
 			"tpl-2": {ID: "tpl-2", TenantID: "tenant-1", Channel: "webhook", Name: "webhook"},
+		},
+		attemptsByNotification: map[string][]store.DeliveryAttempt{
+			"notif-1": {{ID: "attempt-old", NotificationID: "notif-1", Channel: "email", AttemptNumber: 4, Status: "pending", EnqueueKind: "initial"}},
 		},
 	}
 	q := &fakeDispatchQueue{}
@@ -316,6 +345,39 @@ func TestIdempotentRetryRecoversPendingInitialAttempt(t *testing.T) {
 	}
 	if len(q.jobs) != 1 {
 		t.Fatalf("jobs=%d", len(q.jobs))
+	}
+}
+
+func TestInspectionEndpoints(t *testing.T) {
+	st, _, api := newDeadLetterTestAPI()
+	st.notification = store.Notification{ID: "notif-1", TenantID: "tenant-1", TemplateID: "tpl-1", Status: "processing"}
+	st.attemptsByNotification["notif-1"] = []store.DeliveryAttempt{
+		{ID: "attempt-1", NotificationID: "notif-1", Channel: "email", AttemptNumber: 1, Status: "retry_scheduled", EnqueueKind: "initial"},
+		{ID: "attempt-2", NotificationID: "notif-1", Channel: "email", AttemptNumber: 2, Status: "pending", EnqueueKind: "retry"},
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/notifications/notif-1", nil)
+	req.SetPathValue("id", "notif-1")
+	res := httptest.NewRecorder()
+	api.GetNotification().ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/v1/notifications/notif-1/attempts", nil)
+	req.SetPathValue("id", "notif-1")
+	res = httptest.NewRecorder()
+	api.ListNotificationAttempts().ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/v1/attempts/attempt-2", nil)
+	req.SetPathValue("id", "attempt-2")
+	res = httptest.NewRecorder()
+	api.GetAttempt().ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
 	}
 }
 

@@ -13,8 +13,10 @@ import (
 )
 
 type WebhookRequest struct {
-	URL  string
-	Body string
+	URL            string
+	Body           string
+	AttemptID      string
+	NotificationID string
 }
 
 type WebhookSender struct {
@@ -35,6 +37,13 @@ func (s *WebhookSender) Send(ctx context.Context, req WebhookRequest) (string, e
 		return "", fmt.Errorf("build webhook request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", contentTypeForBody(req.Body))
+	if strings.TrimSpace(req.AttemptID) != "" {
+		httpReq.Header.Set("Idempotency-Key", req.AttemptID)
+		httpReq.Header.Set("X-Notification-Attempt-ID", req.AttemptID)
+	}
+	if strings.TrimSpace(req.NotificationID) != "" {
+		httpReq.Header.Set("X-Notification-ID", req.NotificationID)
+	}
 
 	resp, err := s.client.Do(httpReq)
 	if err != nil {

@@ -12,8 +12,11 @@ import (
 )
 
 var (
-	ErrNotFound = errors.New("store: not found")
-	ErrConflict = errors.New("store: conflict")
+	ErrNotFound                 = errors.New("store: not found")
+	ErrConflict                 = errors.New("store: conflict")
+	ErrAttemptAlreadyFinalized  = errors.New("store: attempt already finalized")
+	ErrAttemptAlreadyProcessing = errors.New("store: attempt already processing")
+	ErrInvalidStateTransition   = errors.New("store: invalid state transition")
 )
 
 type Postgres struct {
@@ -72,8 +75,21 @@ type DeliveryAttempt struct {
 	FailedAt           *time.Time `json:"failed_at"`
 	DispatchEnqueuedAt *time.Time `json:"dispatch_enqueued_at"`
 	EnqueueKind        string     `json:"enqueue_kind"`
+	DeadLetterID       *string    `json:"dead_letter_id,omitempty"`
+	ReplayOfDeadLetter *string    `json:"replay_of_dead_letter_id,omitempty"`
 	CreatedAt          time.Time  `json:"created_at"`
 	UpdatedAt          time.Time  `json:"updated_at"`
+}
+
+type AuditEvent struct {
+	ID           string         `json:"id"`
+	TenantID     string         `json:"tenant_id"`
+	Actor        string         `json:"actor"`
+	Action       string         `json:"action"`
+	ResourceType string         `json:"resource_type"`
+	ResourceID   string         `json:"resource_id"`
+	Metadata     map[string]any `json:"metadata"`
+	CreatedAt    time.Time      `json:"created_at"`
 }
 
 type CreateTenantParams struct {
@@ -438,6 +454,76 @@ func unmarshalVariables(raw []byte) (map[string]any, error) {
 	return variables, nil
 }
 
+func IsAttemptAlreadyFinalized(err error) bool {
+	return errors.Is(err, ErrAttemptAlreadyFinalized)
+}
+
+func IsAttemptAlreadyProcessing(err error) bool {
+	return errors.Is(err, ErrAttemptAlreadyProcessing)
+}
+
+func IsInvalidStateTransition(err error) bool {
+	return errors.Is(err, ErrInvalidStateTransition)
+}
+
+func isAttemptTerminalState(status string) bool {
+	switch status {
+	case "sent", "failed", "retry_scheduled", "dead_lettered":
+		return true
+	default:
+		return false
+	}
+}
+
+func deriveNotificationStatus(attempts []DeliveryAttempt) string {
+	if len(attempts) == 0 {
+		return "accepted"
+	}
+
+	hasSent := false
+	hasDeadLettered := false
+	hasFailed := false
+	hasActive := false
+	for _, attempt := range attempts {
+		switch attempt.Status {
+		case "sent":
+			hasSent = true
+		case "dead_lettered":
+			hasDeadLettered = true
+		case "failed":
+			hasFailed = true
+		case "pending", "in_progress", "retry_scheduled":
+			hasActive = true
+		}
+	}
+
+	switch {
+	case hasSent && (hasDeadLettered || hasFailed || hasActive):
+		return "partially_delivered"
+	case hasSent:
+		return "delivered"
+	case hasDeadLettered:
+		return "dead_lettered"
+	case hasActive:
+		return "processing"
+	case hasFailed:
+		return "failed"
+	default:
+		return "accepted"
+	}
+}
+
+func (p *Postgres) notificationIDForAttempt(ctx context.Context, attemptID string) (string, error) {
+	var notificationID string
+	if err := p.DB.QueryRowContext(ctx, `SELECT notification_id FROM delivery_attempts WHERE id = $1`, attemptID).Scan(&notificationID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", ErrNotFound
+		}
+		return "", err
+	}
+	return notificationID, nil
+}
+
 func (p *Postgres) GetInitialAttemptByNotificationID(ctx context.Context, notificationID string) (DeliveryAttempt, error) {
 	const query = `
 		SELECT id, notification_id, channel, attempt_number, status, error_code, error_message, provider_message_id, last_error, next_retry_at, started_at, completed_at, sent_at, failed_at, dispatch_enqueued_at, enqueue_kind, created_at, updated_at
@@ -622,11 +708,64 @@ func (p *Postgres) GetDeliveryAttemptByID(ctx context.Context, id string) (Deliv
 	return attempt, nil
 }
 
+func (p *Postgres) ListDeliveryAttemptsByNotificationID(ctx context.Context, notificationID string) ([]DeliveryAttempt, error) {
+	rows, err := p.DB.QueryContext(ctx, `
+		SELECT da.id, da.notification_id, da.channel, da.attempt_number, da.status, da.error_code, da.error_message, da.provider_message_id, da.last_error, da.next_retry_at, da.started_at, da.completed_at, da.sent_at, da.failed_at, da.dispatch_enqueued_at, da.enqueue_kind, dl.id, replay_dl.id, da.created_at, da.updated_at
+		FROM delivery_attempts da
+		LEFT JOIN dead_letters dl ON dl.notification_id = da.notification_id AND dl.channel = da.channel AND da.status = 'dead_lettered'
+		LEFT JOIN dead_letters replay_dl ON replay_dl.replay_attempt_id = da.id
+		WHERE da.notification_id = $1
+		ORDER BY da.attempt_number ASC, da.created_at ASC
+	`, notificationID)
+	if err != nil {
+		return nil, fmt.Errorf("list delivery attempts: %w", err)
+	}
+	defer rows.Close()
+
+	var attempts []DeliveryAttempt
+	for rows.Next() {
+		var attempt DeliveryAttempt
+		if err := rows.Scan(&attempt.ID, &attempt.NotificationID, &attempt.Channel, &attempt.AttemptNumber, &attempt.Status, &attempt.ErrorCode, &attempt.ErrorMessage, &attempt.ProviderMessageID, &attempt.LastError, &attempt.NextRetryAt, &attempt.StartedAt, &attempt.CompletedAt, &attempt.SentAt, &attempt.FailedAt, &attempt.DispatchEnqueuedAt, &attempt.EnqueueKind, &attempt.DeadLetterID, &attempt.ReplayOfDeadLetter, &attempt.CreatedAt, &attempt.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("list delivery attempts: %w", err)
+		}
+		attempts = append(attempts, attempt)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list delivery attempts: %w", err)
+	}
+	return attempts, nil
+}
+
+func (p *Postgres) RecalculateNotificationStatus(ctx context.Context, notificationID string) error {
+	attempts, err := p.ListDeliveryAttemptsByNotificationID(ctx, notificationID)
+	if err != nil {
+		return fmt.Errorf("recalculate notification status: %w", err)
+	}
+
+	status := deriveNotificationStatus(attempts)
+	result, err := p.DB.ExecContext(ctx, `
+		UPDATE notifications
+		SET status = $2, updated_at = NOW()
+		WHERE id = $1
+	`, notificationID, status)
+	if err != nil {
+		return fmt.Errorf("recalculate notification status: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("recalculate notification status: rows affected: %w", err)
+	}
+	if rows == 0 {
+		return fmt.Errorf("recalculate notification status: %w", ErrNotFound)
+	}
+	return nil
+}
+
 func (p *Postgres) MarkAttemptInProgress(ctx context.Context, attemptID string) error {
 	const query = `
 		UPDATE delivery_attempts
 		SET status = 'in_progress', started_at = COALESCE(started_at, NOW()), completed_at = NULL, updated_at = NOW()
-		WHERE id = $1 AND status IN ('pending', 'in_progress')
+		WHERE id = $1 AND status = 'pending'
 	`
 	result, err := p.DB.ExecContext(ctx, query, attemptID)
 	if err != nil {
@@ -637,7 +776,21 @@ func (p *Postgres) MarkAttemptInProgress(ctx context.Context, attemptID string) 
 		return fmt.Errorf("mark attempt in progress: rows affected: %w", err)
 	}
 	if rows == 0 {
-		return fmt.Errorf("mark attempt in progress: %w", ErrNotFound)
+		attempt, loadErr := p.GetDeliveryAttemptByID(ctx, attemptID)
+		if loadErr != nil {
+			return fmt.Errorf("mark attempt in progress: %w", loadErr)
+		}
+		switch {
+		case attempt.Status == "in_progress":
+			return fmt.Errorf("mark attempt in progress: %w", ErrAttemptAlreadyProcessing)
+		case isAttemptTerminalState(attempt.Status):
+			return fmt.Errorf("mark attempt in progress: %w", ErrAttemptAlreadyFinalized)
+		default:
+			return fmt.Errorf("mark attempt in progress: %w", ErrInvalidStateTransition)
+		}
+	}
+	if notificationID, err := p.notificationIDForAttempt(ctx, attemptID); err == nil {
+		_ = p.RecalculateNotificationStatus(ctx, notificationID)
 	}
 	return nil
 }
@@ -646,7 +799,7 @@ func (p *Postgres) MarkAttemptSent(ctx context.Context, attemptID string, provid
 	const query = `
 		UPDATE delivery_attempts
 		SET status = 'sent', provider_message_id = $2, last_error = NULL, error_message = NULL, sent_at = NOW(), failed_at = NULL, completed_at = NOW(), updated_at = NOW()
-		WHERE id = $1
+		WHERE id = $1 AND status = 'in_progress'
 	`
 	result, err := p.DB.ExecContext(ctx, query, attemptID, providerMessageID)
 	if err != nil {
@@ -657,16 +810,20 @@ func (p *Postgres) MarkAttemptSent(ctx context.Context, attemptID string, provid
 		return fmt.Errorf("mark attempt sent: rows affected: %w", err)
 	}
 	if rows == 0 {
-		return fmt.Errorf("mark attempt sent: %w", ErrNotFound)
+		return fmt.Errorf("mark attempt sent: %w", ErrInvalidStateTransition)
 	}
-	return nil
+	notificationID, err := p.notificationIDForAttempt(ctx, attemptID)
+	if err != nil {
+		return fmt.Errorf("mark attempt sent: notification lookup: %w", err)
+	}
+	return p.RecalculateNotificationStatus(ctx, notificationID)
 }
 
 func (p *Postgres) MarkAttemptFailed(ctx context.Context, attemptID string, lastError string) error {
 	const query = `
 		UPDATE delivery_attempts
 		SET status = 'failed', last_error = $2, error_message = $2, provider_message_id = NULL, failed_at = NOW(), completed_at = NOW(), updated_at = NOW()
-		WHERE id = $1
+		WHERE id = $1 AND status = 'in_progress'
 	`
 	result, err := p.DB.ExecContext(ctx, query, attemptID, lastError)
 	if err != nil {
@@ -677,9 +834,13 @@ func (p *Postgres) MarkAttemptFailed(ctx context.Context, attemptID string, last
 		return fmt.Errorf("mark attempt failed: rows affected: %w", err)
 	}
 	if rows == 0 {
-		return fmt.Errorf("mark attempt failed: %w", ErrNotFound)
+		return fmt.Errorf("mark attempt failed: %w", ErrInvalidStateTransition)
 	}
-	return nil
+	notificationID, err := p.notificationIDForAttempt(ctx, attemptID)
+	if err != nil {
+		return fmt.Errorf("mark attempt failed: notification lookup: %w", err)
+	}
+	return p.RecalculateNotificationStatus(ctx, notificationID)
 }
 
 type ReplayDeadLetterResult struct {
@@ -691,7 +852,7 @@ func (p *Postgres) ScheduleRetry(ctx context.Context, attemptID, lastError strin
 	const query = `
 		UPDATE delivery_attempts
 		SET status = 'retry_scheduled', last_error = $2, error_message = $2, next_retry_at = $3, provider_message_id = NULL, failed_at = NOW(), completed_at = NOW(), updated_at = NOW()
-		WHERE id = $1
+		WHERE id = $1 AND status = 'in_progress'
 	`
 	result, err := p.DB.ExecContext(ctx, query, attemptID, lastError, nextRetryAt)
 	if err != nil {
@@ -702,16 +863,20 @@ func (p *Postgres) ScheduleRetry(ctx context.Context, attemptID, lastError strin
 		return fmt.Errorf("schedule retry: rows affected: %w", err)
 	}
 	if rows == 0 {
-		return fmt.Errorf("schedule retry: %w", ErrNotFound)
+		return fmt.Errorf("schedule retry: %w", ErrInvalidStateTransition)
 	}
-	return nil
+	notificationID, err := p.notificationIDForAttempt(ctx, attemptID)
+	if err != nil {
+		return fmt.Errorf("schedule retry: notification lookup: %w", err)
+	}
+	return p.RecalculateNotificationStatus(ctx, notificationID)
 }
 
 func (p *Postgres) MarkAttemptDeadLettered(ctx context.Context, attemptID, lastError string) error {
 	const query = `
 		UPDATE delivery_attempts
 		SET status = 'dead_lettered', last_error = $2, error_message = $2, next_retry_at = NULL, provider_message_id = NULL, failed_at = NOW(), completed_at = NOW(), updated_at = NOW()
-		WHERE id = $1
+		WHERE id = $1 AND status = 'in_progress'
 	`
 	result, err := p.DB.ExecContext(ctx, query, attemptID, lastError)
 	if err != nil {
@@ -722,9 +887,13 @@ func (p *Postgres) MarkAttemptDeadLettered(ctx context.Context, attemptID, lastE
 		return fmt.Errorf("mark attempt dead lettered: rows affected: %w", err)
 	}
 	if rows == 0 {
-		return fmt.Errorf("mark attempt dead lettered: %w", ErrNotFound)
+		return fmt.Errorf("mark attempt dead lettered: %w", ErrInvalidStateTransition)
 	}
-	return nil
+	notificationID, err := p.notificationIDForAttempt(ctx, attemptID)
+	if err != nil {
+		return fmt.Errorf("mark attempt dead lettered: notification lookup: %w", err)
+	}
+	return p.RecalculateNotificationStatus(ctx, notificationID)
 }
 
 func (p *Postgres) InsertDeadLetter(ctx context.Context, id, notificationID, channel, finalError string) (DeadLetter, error) {
@@ -978,7 +1147,7 @@ func (p *Postgres) EnsureRetryAttempt(ctx context.Context, scheduledAttemptID, n
 		}
 		if err := tx.QueryRowContext(ctx, `
 			INSERT INTO delivery_attempts (id, notification_id, channel, attempt_number, status, dispatch_enqueued_at, enqueue_kind)
-			VALUES ($1, $2, $3, $4, 'pending', NULL, 'replay')
+			VALUES ($1, $2, $3, $4, 'pending', NULL, 'retry')
 			RETURNING id, notification_id, channel, attempt_number, status, error_code, error_message, provider_message_id, last_error, next_retry_at, started_at, completed_at, sent_at, failed_at, dispatch_enqueued_at, enqueue_kind, created_at, updated_at
 		`, newAttemptID, item.Attempt.NotificationID, item.Attempt.Channel, item.Attempt.AttemptNumber+1).Scan(&attempt.ID, &attempt.NotificationID, &attempt.Channel, &attempt.AttemptNumber, &attempt.Status, &attempt.ErrorCode, &attempt.ErrorMessage, &attempt.ProviderMessageID, &attempt.LastError, &attempt.NextRetryAt, &attempt.StartedAt, &attempt.CompletedAt, &attempt.SentAt, &attempt.FailedAt, &attempt.DispatchEnqueuedAt, &attempt.EnqueueKind, &attempt.CreatedAt, &attempt.UpdatedAt); err != nil {
 			return RetryDueAttempt{}, wrapStoreError("ensure retry attempt", err)
@@ -1036,7 +1205,7 @@ func (p *Postgres) EnsureReplayAttempt(ctx context.Context, deadLetterID, newAtt
 		}
 		if err := tx.QueryRowContext(ctx, `
 			INSERT INTO delivery_attempts (id, notification_id, channel, attempt_number, status, dispatch_enqueued_at, enqueue_kind)
-			VALUES ($1, $2, $3, $4, 'pending', NULL, 'retry')
+			VALUES ($1, $2, $3, $4, 'pending', NULL, 'replay')
 			RETURNING id, notification_id, channel, attempt_number, status, error_code, error_message, provider_message_id, last_error, next_retry_at, started_at, completed_at, sent_at, failed_at, dispatch_enqueued_at, enqueue_kind, created_at, updated_at
 		`, attemptID, dl.NotificationID, dl.Channel, attemptNumber).Scan(&attempt.ID, &attempt.NotificationID, &attempt.Channel, &attempt.AttemptNumber, &attempt.Status, &attempt.ErrorCode, &attempt.ErrorMessage, &attempt.ProviderMessageID, &attempt.LastError, &attempt.NextRetryAt, &attempt.StartedAt, &attempt.CompletedAt, &attempt.SentAt, &attempt.FailedAt, &attempt.DispatchEnqueuedAt, &attempt.EnqueueKind, &attempt.CreatedAt, &attempt.UpdatedAt); err != nil {
 			return ReplayDeadLetterResult{}, wrapStoreError("ensure replay attempt", err)
@@ -1114,6 +1283,20 @@ func (p *Postgres) FinalizeReplayEnqueue(ctx context.Context, deadLetterID, atte
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("finalize replay enqueue: commit: %w", err)
+	}
+	return nil
+}
+
+func (p *Postgres) RecordAuditEvent(ctx context.Context, id, tenantID, actor, action, resourceType, resourceID string, metadata map[string]any) error {
+	rawMetadata, err := marshalVariables(metadata)
+	if err != nil {
+		return fmt.Errorf("record audit event: %w", err)
+	}
+	if _, err := p.DB.ExecContext(ctx, `
+		INSERT INTO audit_events (id, tenant_id, actor, action, resource_type, resource_id, metadata)
+		VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+	`, id, tenantID, actor, action, resourceType, resourceID, rawMetadata); err != nil {
+		return wrapStoreError("record audit event", err)
 	}
 	return nil
 }

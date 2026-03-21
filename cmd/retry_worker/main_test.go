@@ -39,6 +39,9 @@ func (f *fakeRetryStore) FinalizeReplayEnqueue(_ context.Context, deadLetterID, 
 	f.finalizedReplay = append(f.finalizedReplay, deadLetterID+"->"+attemptID)
 	return nil
 }
+func (f *fakeRetryStore) RecordAuditEvent(context.Context, string, string, string, string, string, string, map[string]any) error {
+	return nil
+}
 
 type fakeRetryQueue struct {
 	jobs []queue.DispatchJob

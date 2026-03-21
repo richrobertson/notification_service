@@ -28,6 +28,7 @@ type stubStore struct {
 	scheduledAt      *time.Time
 	deadLetterMsg    string
 	insertedDead     *store.DeadLetter
+	auditActions     []string
 }
 
 func (s *stubStore) LoadDeliveryJob(context.Context, string, string) (store.Notification, store.Template, store.DeliveryAttempt, error) {
@@ -39,6 +40,9 @@ func (s *stubStore) LoadDeliveryJob(context.Context, string, string) (store.Noti
 func (s *stubStore) MarkAttemptInProgress(context.Context, string) error {
 	s.inProgressCall++
 	return s.inProgressErr
+}
+func (s *stubStore) GetDeliveryAttemptByID(context.Context, string) (store.DeliveryAttempt, error) {
+	return s.attempt, nil
 }
 func (s *stubStore) MarkAttemptSent(context.Context, string, *string) error { return s.sentErr }
 func (s *stubStore) MarkAttemptFailed(context.Context, string, string) error {
@@ -63,6 +67,10 @@ func (s *stubStore) InsertDeadLetter(_ context.Context, id, notificationID, chan
 	dl := store.DeadLetter{ID: id, NotificationID: notificationID, Channel: channel, FinalError: finalError, DeadLetteredAt: time.Unix(100, 0).UTC()}
 	s.insertedDead = &dl
 	return dl, nil
+}
+func (s *stubStore) RecordAuditEvent(_ context.Context, _, _, _, action, _, _ string, _ map[string]any) error {
+	s.auditActions = append(s.auditActions, action)
+	return nil
 }
 
 type stubWebhookSender struct {
@@ -143,5 +151,44 @@ func TestServiceDeadLettersWhenRetryBudgetExhausted(t *testing.T) {
 	}
 	if st.insertedDead == nil || st.insertedDead.ID != "dead-1" {
 		t.Fatalf("inserted dead letter=%+v", st.insertedDead)
+	}
+}
+
+func TestServiceSuppressesDuplicateWhenAlreadyFinalized(t *testing.T) {
+	to := "to@example.test"
+	st := &stubStore{
+		notification:  store.Notification{ID: "notif-1", RecipientEmail: &to, Variables: map[string]any{"name": "Ada"}},
+		template:      store.Template{Name: "welcome", Body: "hello {{.name}}"},
+		attempt:       store.DeliveryAttempt{ID: "attempt-1", NotificationID: "notif-1", AttemptNumber: 1, Status: "sent"},
+		inProgressErr: store.ErrAttemptAlreadyFinalized,
+	}
+	svc := newTestService(t, st)
+	result, err := svc.ProcessEmail(context.Background(), queue.DispatchJob{AttemptID: "attempt-1", NotificationID: "notif-1", TenantID: "tenant-1", Channel: "email"})
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if result.Outcome != OutcomeDuplicateSuppressed {
+		t.Fatalf("Outcome=%v", result.Outcome)
+	}
+	if st.inProgressCall != 1 {
+		t.Fatalf("inProgressCall=%d", st.inProgressCall)
+	}
+}
+
+func TestServiceSuppressesDuplicateWhileInProgress(t *testing.T) {
+	to := "to@example.test"
+	st := &stubStore{
+		notification:  store.Notification{ID: "notif-1", RecipientEmail: &to, Variables: map[string]any{"name": "Ada"}},
+		template:      store.Template{Name: "welcome", Body: "hello {{.name}}"},
+		attempt:       store.DeliveryAttempt{ID: "attempt-1", NotificationID: "notif-1", AttemptNumber: 1, Status: "in_progress"},
+		inProgressErr: store.ErrAttemptAlreadyProcessing,
+	}
+	svc := newTestService(t, st)
+	result, err := svc.ProcessEmail(context.Background(), queue.DispatchJob{AttemptID: "attempt-1", NotificationID: "notif-1", TenantID: "tenant-1", Channel: "email"})
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if result.Outcome != OutcomeDuplicateSuppressed {
+		t.Fatalf("Outcome=%v", result.Outcome)
 	}
 }
