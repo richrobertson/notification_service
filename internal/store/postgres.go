@@ -707,12 +707,20 @@ func (p *Postgres) GetInitialAttemptByNotificationID(ctx context.Context, notifi
 	return attempt, nil
 }
 
-func (p *Postgres) EnsureInitialAttempt(ctx context.Context, notificationID, tenantID, channel, attemptID, intentID string) (DeliveryAttempt, DispatchIntent, error) {
+func (p *Postgres) EnsureInitialAttempt(ctx context.Context, notificationID, channel, attemptID, intentID string) (DeliveryAttempt, DispatchIntent, error) {
 	tx, err := p.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return DeliveryAttempt{}, DispatchIntent{}, fmt.Errorf("ensure initial attempt: begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	var tenantID string
+	if err := tx.QueryRowContext(ctx, `SELECT tenant_id FROM notifications WHERE id = $1`, notificationID).Scan(&tenantID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return DeliveryAttempt{}, DispatchIntent{}, fmt.Errorf("ensure initial attempt: %w", ErrNotFound)
+		}
+		return DeliveryAttempt{}, DispatchIntent{}, fmt.Errorf("ensure initial attempt: tenant lookup: %w", err)
+	}
 
 	const insertQuery = `
 		INSERT INTO delivery_attempts (

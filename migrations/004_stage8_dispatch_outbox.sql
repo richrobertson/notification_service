@@ -13,10 +13,10 @@ END$$;
 
 CREATE TABLE IF NOT EXISTS dispatch_outbox (
     id TEXT PRIMARY KEY,
-    notification_id UUID NOT NULL REFERENCES notifications(id) ON DELETE CASCADE,
-    attempt_id UUID NOT NULL REFERENCES delivery_attempts(id) ON DELETE CASCADE,
+    notification_id TEXT NOT NULL REFERENCES notifications(id) ON DELETE CASCADE,
+    attempt_id TEXT NOT NULL REFERENCES delivery_attempts(id) ON DELETE CASCADE,
     tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
-    channel channel_type NOT NULL,
+    channel TEXT NOT NULL CHECK (channel IN ('email', 'webhook')),
     source TEXT NOT NULL,
     status dispatch_outbox_status NOT NULL DEFAULT 'pending',
     last_error TEXT,

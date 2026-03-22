@@ -22,7 +22,7 @@ type apiStore interface {
 	GetTemplateByID(ctx context.Context, id string) (store.Template, error)
 	GetNotificationByTenantAndIdempotencyKey(ctx context.Context, tenantID, idempotencyKey string) (store.Notification, error)
 	GetInitialAttemptByNotificationID(ctx context.Context, notificationID string) (store.DeliveryAttempt, error)
-	EnsureInitialAttempt(ctx context.Context, notificationID, tenantID, channel, attemptID, intentID string) (store.DeliveryAttempt, store.DispatchIntent, error)
+	EnsureInitialAttempt(ctx context.Context, notificationID, channel, attemptID, intentID string) (store.DeliveryAttempt, store.DispatchIntent, error)
 	CreateNotification(ctx context.Context, params store.CreateNotificationParams) (store.Notification, error)
 	CreateNotificationWithInitialDispatch(ctx context.Context, params store.CreateNotificationDispatchParams) (store.Notification, store.DeliveryAttempt, store.DispatchIntent, error)
 	CreateDeliveryAttempt(ctx context.Context, params store.CreateDeliveryAttemptParams) (store.DeliveryAttempt, error)
@@ -155,19 +155,14 @@ func (a *API) ensureInitialAttempt(ctx context.Context, w http.ResponseWriter, e
 		return
 	}
 	slog.Default().Info("idempotent retry recovering existing notification using stored template channel", slog.String("notification_id", existing.ID), slog.String("template_id", existing.TemplateID), slog.String("channel", template.Channel))
-	attempt, attemptErr := a.store.GetInitialAttemptByNotificationID(ctx, existing.ID)
+	attempt, _, attemptErr := a.store.EnsureInitialAttempt(ctx, existing.ID, template.Channel, generateID("attempt"), generateID("intent"))
 	if attemptErr != nil {
 		if errors.Is(attemptErr, store.ErrNotFound) {
-			slog.Default().Warn("existing notification found without initial attempt; creating missing initial attempt from stored template", slog.String("notification_id", existing.ID), slog.String("template_id", existing.TemplateID), slog.String("channel", template.Channel))
-			attempt, _, attemptErr = a.store.EnsureInitialAttempt(ctx, existing.ID, existing.TenantID, template.Channel, generateID("attempt"), generateID("intent"))
-			if attemptErr != nil {
-				writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
-				return
-			}
-		} else {
-			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
+			writeError(w, http.StatusNotFound, "not_found", "notification not found")
 			return
 		}
+		writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
+		return
 	}
 	if attempt.DispatchEnqueuedAt != nil {
 		writeJSON(w, http.StatusOK, existing)

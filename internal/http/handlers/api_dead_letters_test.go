@@ -125,16 +125,15 @@ func (f *fakeAPIStore) GetInitialAttemptByNotificationID(_ context.Context, noti
 	}
 	if f.createdAttempt != nil && f.createdAttempt.NotificationID == notificationID {
 		attempt := store.DeliveryAttempt{ID: f.createdAttempt.ID, NotificationID: notificationID, Channel: f.createdAttempt.Channel, AttemptNumber: f.createdAttempt.AttemptNumber, Status: f.createdAttempt.Status, EnqueueKind: f.createdAttempt.EnqueueKind}
-		if f.createdIntent == nil {
-			now := time.Unix(300, 0).UTC()
-			attempt.DispatchEnqueuedAt = &now
+		if f.createdAttempt.DispatchEnqueuedAt != nil {
+			attempt.DispatchEnqueuedAt = f.createdAttempt.DispatchEnqueuedAt
 		}
 		return attempt, nil
 	}
 	return store.DeliveryAttempt{}, store.ErrNotFound
 }
 
-func (f *fakeAPIStore) EnsureInitialAttempt(_ context.Context, notificationID, tenantID, channel, attemptID, intentID string) (store.DeliveryAttempt, store.DispatchIntent, error) {
+func (f *fakeAPIStore) EnsureInitialAttempt(_ context.Context, notificationID, channel, attemptID, intentID string) (store.DeliveryAttempt, store.DispatchIntent, error) {
 	f.ensureInitialCalls++
 	if f.ensureInitialErr != nil {
 		return store.DeliveryAttempt{}, store.DispatchIntent{}, f.ensureInitialErr
@@ -144,10 +143,12 @@ func (f *fakeAPIStore) EnsureInitialAttempt(_ context.Context, notificationID, t
 		params := store.CreateDeliveryAttemptParams{ID: attemptID, NotificationID: notificationID, Channel: channel, AttemptNumber: 1, Status: "pending", EnqueueKind: "initial"}
 		f.createAttemptCalls++
 		f.createdAttempt = &params
-		f.createdIntent = &store.CreateDispatchIntentParams{ID: intentID, NotificationID: notificationID, AttemptID: attemptID, TenantID: tenantID, Channel: channel, Source: "initial"}
+		f.createdIntent = &store.CreateDispatchIntentParams{ID: intentID, NotificationID: notificationID, AttemptID: attemptID, TenantID: f.notification.TenantID, Channel: channel, Source: "initial"}
 		f.notification.ID = notificationID
 		f.notification.Status = "processing"
 		created = true
+	} else if f.createdIntent == nil {
+		f.createdIntent = &store.CreateDispatchIntentParams{ID: intentID, NotificationID: notificationID, AttemptID: f.createdAttempt.ID, TenantID: f.notification.TenantID, Channel: channel, Source: "initial"}
 	}
 	if created {
 		f.recalculateCalls++
@@ -161,7 +162,7 @@ func (f *fakeAPIStore) EnsureInitialAttempt(_ context.Context, notificationID, t
 	if err != nil {
 		return store.DeliveryAttempt{}, store.DispatchIntent{}, err
 	}
-	return attempt, store.DispatchIntent{ID: intentID, NotificationID: notificationID, AttemptID: attempt.ID, TenantID: tenantID, Channel: channel, Source: "initial", Status: "pending"}, nil
+	return attempt, store.DispatchIntent{ID: f.createdIntent.ID, NotificationID: notificationID, AttemptID: attempt.ID, TenantID: f.notification.TenantID, Channel: channel, Source: "initial", Status: "pending"}, nil
 }
 func (f *fakeAPIStore) CreateDeliveryAttempt(_ context.Context, params store.CreateDeliveryAttemptParams) (store.DeliveryAttempt, error) {
 	f.createAttemptCalls++
@@ -500,7 +501,7 @@ func TestIdempotentRetryRecoversPendingInitialAttempt(t *testing.T) {
 	if st.createAttemptCalls != 1 {
 		t.Fatalf("createAttemptCalls=%d", st.createAttemptCalls)
 	}
-	if st.ensureInitialCalls != 0 {
+	if st.ensureInitialCalls != 1 {
 		t.Fatalf("ensureInitialCalls=%d", st.ensureInitialCalls)
 	}
 	assertStatusRefresh(t, st, "notif-1")
@@ -572,7 +573,7 @@ func TestIdempotentConflictRecoversPendingInitialAttempt(t *testing.T) {
 	if st.createAttemptCalls != 1 {
 		t.Fatalf("createAttemptCalls=%d", st.createAttemptCalls)
 	}
-	if st.ensureInitialCalls != 0 {
+	if st.ensureInitialCalls != 1 {
 		t.Fatalf("ensureInitialCalls=%d", st.ensureInitialCalls)
 	}
 	assertStatusRefresh(t, st, "notif-1")
@@ -645,7 +646,8 @@ func TestIdempotentRetryReturnsExistingNotificationWhenInitialAlreadyEnqueued(t 
 	key := "stable-key"
 	existing := store.Notification{ID: "notif-1", TenantID: "tenant-1", TemplateID: "tpl-1"}
 	st.existingByKey = map[string]store.Notification{"tenant-1/" + key: existing}
-	st.createdAttempt = &store.CreateDeliveryAttemptParams{ID: "attempt-1", NotificationID: "notif-1", Channel: "email", AttemptNumber: 1, Status: "pending", EnqueueKind: "initial"}
+	enqueuedAt := time.Unix(300, 0).UTC()
+	st.createdAttempt = &store.CreateDeliveryAttemptParams{ID: "attempt-1", NotificationID: "notif-1", Channel: "email", AttemptNumber: 1, Status: "pending", DispatchEnqueuedAt: &enqueuedAt, EnqueueKind: "initial"}
 	st.createdIntent = nil
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/notifications", bytes.NewReader([]byte(`{"id":"notif-2","tenant_id":"tenant-1","template_id":"tpl-1","recipient_email":"user@example.test","variables":{},"idempotency_key":"`+key+`"}`)))
@@ -655,7 +657,7 @@ func TestIdempotentRetryReturnsExistingNotificationWhenInitialAlreadyEnqueued(t 
 	if res.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
 	}
-	if st.ensureInitialCalls != 0 {
+	if st.ensureInitialCalls != 1 {
 		t.Fatalf("ensureInitialCalls=%d", st.ensureInitialCalls)
 	}
 	if st.createNotifyCalls != 0 {
@@ -678,7 +680,7 @@ func TestIdempotentRetryWithChangedRequestTemplateReusesPendingStoredChannelAtte
 	if res.Code != http.StatusAccepted {
 		t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
 	}
-	if st.ensureInitialCalls != 0 {
+	if st.ensureInitialCalls != 1 {
 		t.Fatalf("ensureInitialCalls=%d", st.ensureInitialCalls)
 	}
 	if st.createdIntent == nil || st.createdIntent.Channel != "email" {

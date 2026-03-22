@@ -108,8 +108,8 @@ CREATE INDEX delivery_attempts_dispatch_pending_idx
 
 CREATE TABLE dispatch_outbox (
     id TEXT PRIMARY KEY,
-    notification_id UUID NOT NULL REFERENCES notifications(id) ON DELETE CASCADE,
-    attempt_id UUID NOT NULL REFERENCES delivery_attempts(id) ON DELETE CASCADE,
+    notification_id TEXT NOT NULL REFERENCES notifications(id) ON DELETE CASCADE,
+    attempt_id TEXT NOT NULL REFERENCES delivery_attempts(id) ON DELETE CASCADE,
     tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
     channel channel_type NOT NULL,
     source TEXT NOT NULL,
