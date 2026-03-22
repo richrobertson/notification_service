@@ -81,6 +81,20 @@ type DeliveryAttempt struct {
 	UpdatedAt          time.Time  `json:"updated_at"`
 }
 
+type DispatchIntent struct {
+	ID             string     `json:"id"`
+	NotificationID string     `json:"notification_id"`
+	AttemptID      string     `json:"attempt_id"`
+	TenantID       string     `json:"tenant_id"`
+	Channel        string     `json:"channel"`
+	Source         string     `json:"source"`
+	Status         string     `json:"status"`
+	LastError      *string    `json:"last_error"`
+	CreatedAt      time.Time  `json:"created_at"`
+	ClaimedAt      *time.Time `json:"claimed_at"`
+	PublishedAt    *time.Time `json:"published_at"`
+}
+
 type AuditEvent struct {
 	ID           string         `json:"id"`
 	TenantID     string         `json:"tenant_id"`
@@ -129,6 +143,24 @@ type CreateDeliveryAttemptParams struct {
 	EnqueueKind        string
 }
 
+type CreateDispatchIntentParams struct {
+	ID             string
+	NotificationID string
+	AttemptID      string
+	TenantID       string
+	Channel        string
+	Source         string
+	Status         string
+	PublishedAt    *time.Time
+}
+
+type CreateNotificationDispatchParams struct {
+	Notification CreateNotificationParams
+	Channel      string
+	AttemptID    string
+	IntentID     string
+}
+
 type DeadLetter struct {
 	ID              string     `json:"id"`
 	NotificationID  string     `json:"notification_id"`
@@ -143,6 +175,11 @@ type RetryDueAttempt struct {
 	Attempt        DeliveryAttempt
 	NotificationID string
 	TenantID       string
+}
+
+type PendingDispatchIntent struct {
+	Intent       DispatchIntent
+	DeadLetterID *string
 }
 
 func NewPostgres(ctx context.Context, databaseURL string) (*Postgres, error) {
@@ -296,6 +333,16 @@ func (p *Postgres) GetTemplateByID(ctx context.Context, id string) (Template, er
 }
 
 func (p *Postgres) CreateNotification(ctx context.Context, params CreateNotificationParams) (Notification, error) {
+	notification, err := createNotificationTx(ctx, p.DB, params)
+	if err != nil {
+		return Notification{}, err
+	}
+	return notification, nil
+}
+
+func createNotificationTx(ctx context.Context, querier interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, params CreateNotificationParams) (Notification, error) {
 	const query = `
 		INSERT INTO notifications (
 			id,
@@ -328,7 +375,7 @@ func (p *Postgres) CreateNotification(ctx context.Context, params CreateNotifica
 
 	var notification Notification
 	var rawVariables []byte
-	err = p.DB.QueryRowContext(
+	err = querier.QueryRowContext(
 		ctx,
 		query,
 		params.ID,
@@ -360,6 +407,56 @@ func (p *Postgres) CreateNotification(ctx context.Context, params CreateNotifica
 	}
 
 	return notification, nil
+}
+
+func (p *Postgres) CreateNotificationWithInitialDispatch(ctx context.Context, params CreateNotificationDispatchParams) (Notification, DeliveryAttempt, DispatchIntent, error) {
+	tx, err := p.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return Notification{}, DeliveryAttempt{}, DispatchIntent{}, fmt.Errorf("create notification with initial dispatch: begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	notification, err := createNotificationTx(ctx, tx, params.Notification)
+	if err != nil {
+		return Notification{}, DeliveryAttempt{}, DispatchIntent{}, fmt.Errorf("create notification with initial dispatch: %w", err)
+	}
+
+	attempt, err := createDeliveryAttemptTx(ctx, tx, CreateDeliveryAttemptParams{
+		ID:             params.AttemptID,
+		NotificationID: notification.ID,
+		Channel:        params.Channel,
+		AttemptNumber:  1,
+		Status:         "pending",
+		EnqueueKind:    "initial",
+	})
+	if err != nil {
+		return Notification{}, DeliveryAttempt{}, DispatchIntent{}, fmt.Errorf("create notification with initial dispatch: create delivery attempt: %w", err)
+	}
+
+	intent, err := createDispatchIntentTx(ctx, tx, CreateDispatchIntentParams{
+		ID:             params.IntentID,
+		NotificationID: notification.ID,
+		AttemptID:      attempt.ID,
+		TenantID:       notification.TenantID,
+		Channel:        params.Channel,
+		Source:         "initial",
+	})
+	if err != nil {
+		return Notification{}, DeliveryAttempt{}, DispatchIntent{}, fmt.Errorf("create notification with initial dispatch: create dispatch intent: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return Notification{}, DeliveryAttempt{}, DispatchIntent{}, fmt.Errorf("create notification with initial dispatch: commit: %w", err)
+	}
+	if err := p.RecalculateNotificationStatus(ctx, notification.ID); err != nil {
+		return Notification{}, DeliveryAttempt{}, DispatchIntent{}, err
+	}
+	notification, err = p.GetNotificationByID(ctx, notification.ID)
+	if err != nil {
+		return Notification{}, DeliveryAttempt{}, DispatchIntent{}, fmt.Errorf("create notification with initial dispatch: reload notification: %w", err)
+	}
+
+	return notification, attempt, intent, nil
 }
 
 func (p *Postgres) GetNotificationByTenantAndIdempotencyKey(ctx context.Context, tenantID, idempotencyKey string) (Notification, error) {
@@ -454,6 +551,49 @@ func unmarshalVariables(raw []byte) (map[string]any, error) {
 	return variables, nil
 }
 
+func scanDeliveryAttempt(scanner interface {
+	Scan(dest ...any) error
+}, attempt *DeliveryAttempt) error {
+	return scanner.Scan(
+		&attempt.ID,
+		&attempt.NotificationID,
+		&attempt.Channel,
+		&attempt.AttemptNumber,
+		&attempt.Status,
+		&attempt.ErrorCode,
+		&attempt.ErrorMessage,
+		&attempt.ProviderMessageID,
+		&attempt.LastError,
+		&attempt.NextRetryAt,
+		&attempt.StartedAt,
+		&attempt.CompletedAt,
+		&attempt.SentAt,
+		&attempt.FailedAt,
+		&attempt.DispatchEnqueuedAt,
+		&attempt.EnqueueKind,
+		&attempt.CreatedAt,
+		&attempt.UpdatedAt,
+	)
+}
+
+func scanDispatchIntent(scanner interface {
+	Scan(dest ...any) error
+}, intent *DispatchIntent) error {
+	return scanner.Scan(
+		&intent.ID,
+		&intent.NotificationID,
+		&intent.AttemptID,
+		&intent.TenantID,
+		&intent.Channel,
+		&intent.Source,
+		&intent.Status,
+		&intent.LastError,
+		&intent.CreatedAt,
+		&intent.ClaimedAt,
+		&intent.PublishedAt,
+	)
+}
+
 func IsAttemptAlreadyFinalized(err error) bool {
 	return errors.Is(err, ErrAttemptAlreadyFinalized)
 }
@@ -533,7 +673,7 @@ func (p *Postgres) GetInitialAttemptByNotificationID(ctx context.Context, notifi
 		LIMIT 1
 	`
 	var attempt DeliveryAttempt
-	if err := p.DB.QueryRowContext(ctx, query, notificationID).Scan(&attempt.ID, &attempt.NotificationID, &attempt.Channel, &attempt.AttemptNumber, &attempt.Status, &attempt.ErrorCode, &attempt.ErrorMessage, &attempt.ProviderMessageID, &attempt.LastError, &attempt.NextRetryAt, &attempt.StartedAt, &attempt.CompletedAt, &attempt.SentAt, &attempt.FailedAt, &attempt.DispatchEnqueuedAt, &attempt.EnqueueKind, &attempt.CreatedAt, &attempt.UpdatedAt); err != nil {
+	if err := scanDeliveryAttempt(p.DB.QueryRowContext(ctx, query, notificationID), &attempt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return DeliveryAttempt{}, fmt.Errorf("get initial attempt: %w", ErrNotFound)
 		}
@@ -542,7 +682,21 @@ func (p *Postgres) GetInitialAttemptByNotificationID(ctx context.Context, notifi
 	return attempt, nil
 }
 
-func (p *Postgres) EnsureInitialAttempt(ctx context.Context, notificationID, channel, attemptID string) (DeliveryAttempt, error) {
+func (p *Postgres) EnsureInitialAttempt(ctx context.Context, notificationID, channel, attemptID, intentID string) (DeliveryAttempt, DispatchIntent, error) {
+	tx, err := p.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return DeliveryAttempt{}, DispatchIntent{}, fmt.Errorf("ensure initial attempt: begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	var tenantID string
+	if err := tx.QueryRowContext(ctx, `SELECT tenant_id FROM notifications WHERE id = $1`, notificationID).Scan(&tenantID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return DeliveryAttempt{}, DispatchIntent{}, fmt.Errorf("ensure initial attempt: %w", ErrNotFound)
+		}
+		return DeliveryAttempt{}, DispatchIntent{}, fmt.Errorf("ensure initial attempt: tenant lookup: %w", err)
+	}
+
 	const insertQuery = `
 		INSERT INTO delivery_attempts (
 			id,
@@ -556,18 +710,8 @@ func (p *Postgres) EnsureInitialAttempt(ctx context.Context, notificationID, cha
 		VALUES ($1, $2, $3, 1, 'pending', NULL, 'initial')
 		ON CONFLICT (notification_id, channel, attempt_number) DO NOTHING
 	`
-	result, err := p.DB.ExecContext(ctx, insertQuery, attemptID, notificationID, channel)
-	if err != nil {
-		return DeliveryAttempt{}, wrapStoreError("ensure initial attempt", err)
-	}
-	rowsAffected, err := result.RowsAffected()
-	if err != nil {
-		return DeliveryAttempt{}, wrapStoreError("ensure initial attempt", err)
-	}
-	if rowsAffected > 0 {
-		if err := p.RecalculateNotificationStatus(ctx, notificationID); err != nil {
-			return DeliveryAttempt{}, err
-		}
+	if _, err := tx.ExecContext(ctx, insertQuery, attemptID, notificationID, channel); err != nil {
+		return DeliveryAttempt{}, DispatchIntent{}, wrapStoreError("ensure initial attempt", err)
 	}
 	const selectQuery = `
 		SELECT id, notification_id, channel, attempt_number, status, error_code, error_message, provider_message_id, last_error, next_retry_at, started_at, completed_at, sent_at, failed_at, dispatch_enqueued_at, enqueue_kind, created_at, updated_at
@@ -576,16 +720,46 @@ func (p *Postgres) EnsureInitialAttempt(ctx context.Context, notificationID, cha
 		LIMIT 1
 	`
 	var attempt DeliveryAttempt
-	if err := p.DB.QueryRowContext(ctx, selectQuery, notificationID, channel).Scan(&attempt.ID, &attempt.NotificationID, &attempt.Channel, &attempt.AttemptNumber, &attempt.Status, &attempt.ErrorCode, &attempt.ErrorMessage, &attempt.ProviderMessageID, &attempt.LastError, &attempt.NextRetryAt, &attempt.StartedAt, &attempt.CompletedAt, &attempt.SentAt, &attempt.FailedAt, &attempt.DispatchEnqueuedAt, &attempt.EnqueueKind, &attempt.CreatedAt, &attempt.UpdatedAt); err != nil {
+	if err := scanDeliveryAttempt(tx.QueryRowContext(ctx, selectQuery, notificationID, channel), &attempt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return DeliveryAttempt{}, fmt.Errorf("ensure initial attempt: %w", ErrNotFound)
+			return DeliveryAttempt{}, DispatchIntent{}, fmt.Errorf("ensure initial attempt: %w", ErrNotFound)
 		}
-		return DeliveryAttempt{}, fmt.Errorf("ensure initial attempt: %w", err)
+		return DeliveryAttempt{}, DispatchIntent{}, fmt.Errorf("ensure initial attempt: %w", err)
 	}
-	return attempt, nil
+	intent, err := createDispatchIntentTx(ctx, tx, CreateDispatchIntentParams{
+		ID:             intentID,
+		NotificationID: attempt.NotificationID,
+		AttemptID:      attempt.ID,
+		TenantID:       tenantID,
+		Channel:        attempt.Channel,
+		Source:         "initial",
+		Status:         publishedIntentStatus(attempt.DispatchEnqueuedAt),
+		PublishedAt:    attempt.DispatchEnqueuedAt,
+	})
+	if err != nil {
+		return DeliveryAttempt{}, DispatchIntent{}, wrapStoreError("ensure initial attempt: create dispatch intent", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return DeliveryAttempt{}, DispatchIntent{}, fmt.Errorf("ensure initial attempt: commit: %w", err)
+	}
+	if err := p.RecalculateNotificationStatus(ctx, notificationID); err != nil {
+		return DeliveryAttempt{}, DispatchIntent{}, err
+	}
+	return attempt, intent, nil
 }
 
 func (p *Postgres) CreateDeliveryAttempt(ctx context.Context, params CreateDeliveryAttemptParams) (DeliveryAttempt, error) {
+	attempt, err := createDeliveryAttemptTx(ctx, p.DB, params)
+	if err != nil {
+		return DeliveryAttempt{}, err
+	}
+
+	return attempt, nil
+}
+
+func createDeliveryAttemptTx(ctx context.Context, querier interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, params CreateDeliveryAttemptParams) (DeliveryAttempt, error) {
 	const query = `
 		INSERT INTO delivery_attempts (
 			id,
@@ -621,7 +795,7 @@ func (p *Postgres) CreateDeliveryAttempt(ctx context.Context, params CreateDeliv
 	`
 
 	var attempt DeliveryAttempt
-	err := p.DB.QueryRowContext(
+	err := scanDeliveryAttempt(querier.QueryRowContext(
 		ctx,
 		query,
 		params.ID,
@@ -633,31 +807,81 @@ func (p *Postgres) CreateDeliveryAttempt(ctx context.Context, params CreateDeliv
 		params.LastError,
 		params.DispatchEnqueuedAt,
 		params.EnqueueKind,
-	).Scan(
-		&attempt.ID,
-		&attempt.NotificationID,
-		&attempt.Channel,
-		&attempt.AttemptNumber,
-		&attempt.Status,
-		&attempt.ErrorCode,
-		&attempt.ErrorMessage,
-		&attempt.ProviderMessageID,
-		&attempt.LastError,
-		&attempt.NextRetryAt,
-		&attempt.StartedAt,
-		&attempt.CompletedAt,
-		&attempt.SentAt,
-		&attempt.FailedAt,
-		&attempt.DispatchEnqueuedAt,
-		&attempt.EnqueueKind,
-		&attempt.CreatedAt,
-		&attempt.UpdatedAt,
-	)
+	), &attempt)
 	if err != nil {
 		return DeliveryAttempt{}, wrapStoreError("create delivery attempt", err)
 	}
 
 	return attempt, nil
+}
+
+func (p *Postgres) CreateDispatchIntent(ctx context.Context, params CreateDispatchIntentParams) (DispatchIntent, error) {
+	intent, err := createDispatchIntentTx(ctx, p.DB, params)
+	if err != nil {
+		return DispatchIntent{}, err
+	}
+	return intent, nil
+}
+
+func createDispatchIntentTx(ctx context.Context, querier interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, params CreateDispatchIntentParams) (DispatchIntent, error) {
+	const insertQuery = `
+		INSERT INTO dispatch_outbox (
+			id,
+			notification_id,
+			attempt_id,
+			tenant_id,
+			channel,
+			source,
+			status,
+			published_at
+		)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		ON CONFLICT (attempt_id) DO NOTHING
+		RETURNING id, notification_id, attempt_id, tenant_id, channel, source, status, last_error, created_at, claimed_at, published_at
+	`
+	const selectQuery = `
+		SELECT id, notification_id, attempt_id, tenant_id, channel, source, status, last_error, created_at, claimed_at, published_at
+		FROM dispatch_outbox
+		WHERE attempt_id = $1
+	`
+
+	var intent DispatchIntent
+	if err := scanDispatchIntent(querier.QueryRowContext(
+		ctx,
+		insertQuery,
+		params.ID,
+		params.NotificationID,
+		params.AttemptID,
+		params.TenantID,
+		params.Channel,
+		params.Source,
+		dispatchIntentStatusOrDefault(params.Status),
+		params.PublishedAt,
+	), &intent); err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			return DispatchIntent{}, wrapStoreError("create dispatch intent", err)
+		}
+		if err := scanDispatchIntent(querier.QueryRowContext(ctx, selectQuery, params.AttemptID), &intent); err != nil {
+			return DispatchIntent{}, wrapStoreError("create dispatch intent", err)
+		}
+	}
+	return intent, nil
+}
+
+func dispatchIntentStatusOrDefault(status string) string {
+	if status == "" {
+		return "pending"
+	}
+	return status
+}
+
+func publishedIntentStatus(publishedAt *time.Time) string {
+	if publishedAt != nil {
+		return "published"
+	}
+	return "pending"
 }
 
 func (p *Postgres) LoadDeliveryJob(ctx context.Context, notificationID, attemptID string) (Notification, Template, DeliveryAttempt, error) {
@@ -1159,11 +1383,11 @@ func (p *Postgres) FinalizeRetryDispatch(ctx context.Context, scheduledAttemptID
 
 func getAttemptByIDTx(ctx context.Context, tx *sql.Tx, id string) (DeliveryAttempt, error) {
 	var attempt DeliveryAttempt
-	if err := tx.QueryRowContext(ctx, `
+	if err := scanDeliveryAttempt(tx.QueryRowContext(ctx, `
 		SELECT id, notification_id, channel, attempt_number, status, error_code, error_message, provider_message_id, last_error, next_retry_at, started_at, completed_at, sent_at, failed_at, dispatch_enqueued_at, enqueue_kind, created_at, updated_at
 		FROM delivery_attempts
 		WHERE id = $1
-	`, id).Scan(&attempt.ID, &attempt.NotificationID, &attempt.Channel, &attempt.AttemptNumber, &attempt.Status, &attempt.ErrorCode, &attempt.ErrorMessage, &attempt.ProviderMessageID, &attempt.LastError, &attempt.NextRetryAt, &attempt.StartedAt, &attempt.CompletedAt, &attempt.SentAt, &attempt.FailedAt, &attempt.DispatchEnqueuedAt, &attempt.EnqueueKind, &attempt.CreatedAt, &attempt.UpdatedAt); err != nil {
+	`, id), &attempt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return DeliveryAttempt{}, ErrNotFound
 		}
@@ -1207,14 +1431,30 @@ func (p *Postgres) EnsureRetryAttempt(ctx context.Context, scheduledAttemptID, n
 		if item.Attempt.Status != "retry_scheduled" || item.Attempt.NextRetryAt == nil || item.Attempt.NextRetryAt.After(time.Now().UTC()) {
 			return RetryDueAttempt{}, fmt.Errorf("ensure retry attempt: %w", ErrNotFound)
 		}
-		if err := tx.QueryRowContext(ctx, `
-			INSERT INTO delivery_attempts (id, notification_id, channel, attempt_number, status, dispatch_enqueued_at, enqueue_kind)
-			VALUES ($1, $2, $3, $4, 'pending', NULL, 'retry')
-			RETURNING id, notification_id, channel, attempt_number, status, error_code, error_message, provider_message_id, last_error, next_retry_at, started_at, completed_at, sent_at, failed_at, dispatch_enqueued_at, enqueue_kind, created_at, updated_at
-		`, newAttemptID, item.Attempt.NotificationID, item.Attempt.Channel, item.Attempt.AttemptNumber+1).Scan(&attempt.ID, &attempt.NotificationID, &attempt.Channel, &attempt.AttemptNumber, &attempt.Status, &attempt.ErrorCode, &attempt.ErrorMessage, &attempt.ProviderMessageID, &attempt.LastError, &attempt.NextRetryAt, &attempt.StartedAt, &attempt.CompletedAt, &attempt.SentAt, &attempt.FailedAt, &attempt.DispatchEnqueuedAt, &attempt.EnqueueKind, &attempt.CreatedAt, &attempt.UpdatedAt); err != nil {
-			return RetryDueAttempt{}, wrapStoreError("ensure retry attempt", err)
+		attempt, err = createDeliveryAttemptTx(ctx, tx, CreateDeliveryAttemptParams{
+			ID:             newAttemptID,
+			NotificationID: item.Attempt.NotificationID,
+			Channel:        item.Attempt.Channel,
+			AttemptNumber:  item.Attempt.AttemptNumber + 1,
+			Status:         "pending",
+			EnqueueKind:    "retry",
+		})
+		if err != nil {
+			return RetryDueAttempt{}, fmt.Errorf("ensure retry attempt: %w", err)
 		}
 		createdNewAttempt = true
+	}
+	if _, err := createDispatchIntentTx(ctx, tx, CreateDispatchIntentParams{
+		ID:             "intent-" + attempt.ID,
+		NotificationID: attempt.NotificationID,
+		AttemptID:      attempt.ID,
+		TenantID:       item.TenantID,
+		Channel:        attempt.Channel,
+		Source:         "retry",
+		Status:         publishedIntentStatus(attempt.DispatchEnqueuedAt),
+		PublishedAt:    attempt.DispatchEnqueuedAt,
+	}); err != nil {
+		return RetryDueAttempt{}, fmt.Errorf("ensure retry attempt: %w", err)
 	}
 	if item.Attempt.Status == "retry_scheduled" {
 		if _, err := tx.ExecContext(ctx, `UPDATE delivery_attempts SET status = 'failed', next_retry_at = NULL, updated_at = NOW() WHERE id = $1 AND status = 'retry_scheduled'`, scheduledAttemptID); err != nil {
@@ -1271,13 +1511,33 @@ func (p *Postgres) EnsureReplayAttempt(ctx context.Context, deadLetterID, newAtt
 		if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(attempt_number), 0) + 1 FROM delivery_attempts WHERE notification_id = $1 AND channel = $2`, dl.NotificationID, dl.Channel).Scan(&attemptNumber); err != nil {
 			return ReplayDeadLetterResult{}, fmt.Errorf("ensure replay attempt: next attempt number: %w", err)
 		}
-		if err := tx.QueryRowContext(ctx, `
-			INSERT INTO delivery_attempts (id, notification_id, channel, attempt_number, status, dispatch_enqueued_at, enqueue_kind)
-			VALUES ($1, $2, $3, $4, 'pending', NULL, 'replay')
-			RETURNING id, notification_id, channel, attempt_number, status, error_code, error_message, provider_message_id, last_error, next_retry_at, started_at, completed_at, sent_at, failed_at, dispatch_enqueued_at, enqueue_kind, created_at, updated_at
-		`, attemptID, dl.NotificationID, dl.Channel, attemptNumber).Scan(&attempt.ID, &attempt.NotificationID, &attempt.Channel, &attempt.AttemptNumber, &attempt.Status, &attempt.ErrorCode, &attempt.ErrorMessage, &attempt.ProviderMessageID, &attempt.LastError, &attempt.NextRetryAt, &attempt.StartedAt, &attempt.CompletedAt, &attempt.SentAt, &attempt.FailedAt, &attempt.DispatchEnqueuedAt, &attempt.EnqueueKind, &attempt.CreatedAt, &attempt.UpdatedAt); err != nil {
-			return ReplayDeadLetterResult{}, wrapStoreError("ensure replay attempt", err)
+		attempt, err = createDeliveryAttemptTx(ctx, tx, CreateDeliveryAttemptParams{
+			ID:             attemptID,
+			NotificationID: dl.NotificationID,
+			Channel:        dl.Channel,
+			AttemptNumber:  attemptNumber,
+			Status:         "pending",
+			EnqueueKind:    "replay",
+		})
+		if err != nil {
+			return ReplayDeadLetterResult{}, fmt.Errorf("ensure replay attempt: %w", err)
 		}
+	}
+	var tenantID string
+	if err := tx.QueryRowContext(ctx, `SELECT tenant_id FROM notifications WHERE id = $1`, dl.NotificationID).Scan(&tenantID); err != nil {
+		return ReplayDeadLetterResult{}, fmt.Errorf("ensure replay attempt: tenant lookup: %w", err)
+	}
+	if _, err := createDispatchIntentTx(ctx, tx, CreateDispatchIntentParams{
+		ID:             "intent-" + attempt.ID,
+		NotificationID: attempt.NotificationID,
+		AttemptID:      attempt.ID,
+		TenantID:       tenantID,
+		Channel:        attempt.Channel,
+		Source:         "replay",
+		Status:         publishedIntentStatus(attempt.DispatchEnqueuedAt),
+		PublishedAt:    attempt.DispatchEnqueuedAt,
+	}); err != nil {
+		return ReplayDeadLetterResult{}, fmt.Errorf("ensure replay attempt: %w", err)
 	}
 	if dl.ReplayAttemptID == nil {
 		if _, err := tx.ExecContext(ctx, `UPDATE dead_letters SET replay_attempt_id = $2 WHERE id = $1 AND replay_attempt_id IS NULL`, deadLetterID, attempt.ID); err != nil {
@@ -1292,6 +1552,162 @@ func (p *Postgres) EnsureReplayAttempt(ctx context.Context, deadLetterID, newAtt
 		return ReplayDeadLetterResult{}, err
 	}
 	return ReplayDeadLetterResult{DeadLetter: dl, Attempt: attempt}, nil
+}
+
+func (p *Postgres) ClaimPendingDispatchIntents(ctx context.Context, limit int, staleAfter time.Duration) ([]PendingDispatchIntent, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	if staleAfter <= 0 {
+		return nil, fmt.Errorf("claim pending dispatch intents: staleAfter must be positive")
+	}
+	staleAfterSeconds := int(staleAfter / time.Second)
+	if staleAfterSeconds == 0 {
+		staleAfterSeconds = 1
+	}
+	rows, err := p.DB.QueryContext(ctx, `
+		WITH claimed AS (
+			UPDATE dispatch_outbox AS o
+			SET status = 'publishing', claimed_at = NOW()
+			WHERE o.id IN (
+				SELECT id
+				FROM dispatch_outbox
+				WHERE status = 'pending'
+				   OR (status = 'publishing' AND claimed_at IS NOT NULL AND claimed_at <= NOW() - ($2 * INTERVAL '1 second'))
+				ORDER BY created_at ASC
+				FOR UPDATE SKIP LOCKED
+				LIMIT $1
+			)
+			RETURNING o.id, o.notification_id, o.attempt_id, o.tenant_id, o.channel, o.source, o.status, o.last_error, o.created_at, o.claimed_at, o.published_at
+		)
+		SELECT c.id, c.notification_id, c.attempt_id, c.tenant_id, c.channel, c.source, c.status, c.last_error, c.created_at, c.claimed_at, c.published_at, dl.id
+		FROM claimed c
+		LEFT JOIN dead_letters dl ON dl.replay_attempt_id = c.attempt_id
+		ORDER BY c.created_at ASC
+	`, limit, staleAfterSeconds)
+	if err != nil {
+		return nil, fmt.Errorf("claim pending dispatch intents: %w", err)
+	}
+	defer rows.Close()
+
+	var intents []PendingDispatchIntent
+	for rows.Next() {
+		var item PendingDispatchIntent
+		if err := rows.Scan(
+			&item.Intent.ID,
+			&item.Intent.NotificationID,
+			&item.Intent.AttemptID,
+			&item.Intent.TenantID,
+			&item.Intent.Channel,
+			&item.Intent.Source,
+			&item.Intent.Status,
+			&item.Intent.LastError,
+			&item.Intent.CreatedAt,
+			&item.Intent.ClaimedAt,
+			&item.Intent.PublishedAt,
+			&item.DeadLetterID,
+		); err != nil {
+			return nil, fmt.Errorf("claim pending dispatch intents: %w", err)
+		}
+		intents = append(intents, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("claim pending dispatch intents: %w", err)
+	}
+	return intents, nil
+}
+
+func (p *Postgres) MarkDispatchIntentPublished(ctx context.Context, intentID string, claimedAt time.Time) error {
+	tx, err := p.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("mark dispatch intent published: begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	var intent DispatchIntent
+	if err := scanDispatchIntent(tx.QueryRowContext(ctx, `
+		UPDATE dispatch_outbox
+		SET status = 'published', claimed_at = NULL, published_at = COALESCE(published_at, NOW()), last_error = NULL
+		WHERE id = $1 AND status = 'publishing' AND claimed_at = $2
+		RETURNING id, notification_id, attempt_id, tenant_id, channel, source, status, last_error, created_at, claimed_at, published_at
+	`, intentID, claimedAt), &intent); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			if err := scanDispatchIntent(tx.QueryRowContext(ctx, `
+				SELECT id, notification_id, attempt_id, tenant_id, channel, source, status, last_error, created_at, claimed_at, published_at
+				FROM dispatch_outbox
+				WHERE id = $1
+			`, intentID), &intent); err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					return fmt.Errorf("mark dispatch intent published: %w", ErrNotFound)
+				}
+				return fmt.Errorf("mark dispatch intent published: %w", err)
+			}
+			if intent.Status == "published" {
+				if err := tx.Commit(); err != nil {
+					return fmt.Errorf("mark dispatch intent published: commit: %w", err)
+				}
+				return nil
+			}
+			return fmt.Errorf("mark dispatch intent published: %w", ErrInvalidStateTransition)
+		}
+		return fmt.Errorf("mark dispatch intent published: %w", err)
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE delivery_attempts
+		SET dispatch_enqueued_at = COALESCE(dispatch_enqueued_at, NOW()), updated_at = NOW()
+		WHERE id = $1
+	`, intent.AttemptID); err != nil {
+		return fmt.Errorf("mark dispatch intent published: mark attempt enqueued: %w", err)
+	}
+
+	if intent.Source == "replay" {
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE dead_letters
+			SET replayed_at = COALESCE(replayed_at, NOW())
+			WHERE replay_attempt_id = $1
+		`, intent.AttemptID); err != nil {
+			return fmt.Errorf("mark dispatch intent published: mark replayed: %w", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("mark dispatch intent published: commit: %w", err)
+	}
+	return nil
+}
+
+func (p *Postgres) RecordDispatchIntentError(ctx context.Context, intentID string, claimedAt time.Time, lastError string) error {
+	result, err := p.DB.ExecContext(ctx, `
+		UPDATE dispatch_outbox
+		SET status = 'pending', claimed_at = NULL, last_error = $2
+		WHERE id = $1 AND status = 'publishing' AND claimed_at = $3
+	`, intentID, lastError, claimedAt)
+	if err != nil {
+		return fmt.Errorf("record dispatch intent error: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("record dispatch intent error: rows affected: %w", err)
+	}
+	if rows == 0 {
+		var status string
+		if err := p.DB.QueryRowContext(ctx, `
+			SELECT status
+			FROM dispatch_outbox
+			WHERE id = $1
+		`, intentID).Scan(&status); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("record dispatch intent error: %w", ErrNotFound)
+			}
+			return fmt.Errorf("record dispatch intent error: %w", err)
+		}
+		if status == "published" {
+			return nil
+		}
+		return fmt.Errorf("record dispatch intent error: %w", ErrInvalidStateTransition)
+	}
+	return nil
 }
 
 func (p *Postgres) ListAttemptsPendingEnqueue(ctx context.Context, limit int) ([]PendingEnqueueAttempt, error) {

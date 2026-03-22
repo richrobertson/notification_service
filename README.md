@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-`notification_service` is a runnable Go notification platform foundation. Stage 6 keeps the Stage 5 Redis-list + PostgreSQL architecture, and adds stronger attempt-level idempotency, duplicate suppression, notification rollups, operator inspection endpoints, and a more explicit audit trail.
+`notification_service` is a runnable Go notification platform foundation. Stage 8 keeps the Redis-list + PostgreSQL architecture, and adds a narrow transactional-outbox-lite layer so Postgres becomes the authoritative source of truth for dispatch publication.
 
 The service now provides:
 
@@ -14,7 +14,8 @@ The service now provides:
 - Redis-backed dispatch queues using Redis lists
 - a standalone dispatcher process that routes generic dispatch jobs to channel-specific queues
 - standalone webhook and email workers that consume channel-specific queues
-- a standalone retry worker that polls PostgreSQL for due retries and republishes them to the dispatch queue
+- a standalone retry worker that polls PostgreSQL for due retries and creates durable retry dispatch intents
+- a standalone outbox publisher that polls PostgreSQL for pending dispatch intents and publishes them to Redis
 - real webhook HTTP POST delivery
 - real SMTP-based email delivery
 - bounded retry scheduling for transient delivery failures
@@ -26,7 +27,7 @@ The service now provides:
 - audit events for major lifecycle transitions
 - automated best-effort recovery that drains stranded `*:processing` queues back to their source queues
 
-## Stage 6 Status
+## Stage 8 Status
 
 Implemented in this stage:
 
@@ -47,20 +48,22 @@ Implemented in this stage:
 - channel worker reserve/ack flow using per-channel `*:processing` queues
 - retry scheduling using `delivery_attempts.status = retry_scheduled` plus `next_retry_at`
 - retry execution via `cmd/retry_worker`
+- dispatch publication via `cmd/outbox_publisher`
 - durable dead-lettering using the existing `dead_letters` table
-- operator replay that reuses a durable replay attempt identity and republishes a new dispatch job
+- operator replay that reuses a durable replay attempt identity and creates a durable replay dispatch intent
 - compare-and-set attempt activation so only one worker can move `pending -> in_progress`
 - duplicate-job suppression when a queued attempt is already `in_progress`, `sent`, `failed`, `retry_scheduled`, or `dead_lettered`
 - monotonic attempt transitions guarded in SQL (`in_progress -> sent|failed|retry_scheduled|dead_lettered`)
 - webhook/email correlation headers (`Idempotency-Key`, `X-Notification-Attempt-ID`, `X-Notification-ID`, deterministic email `Message-ID`)
 - notification rollups (`accepted`, `processing`, `delivered`, `partially_delivered`, `failed`, `dead_lettered`)
-- audit events for notification acceptance, enqueue recovery, retry scheduling, retry dispatch, dead-lettering, replay, and duplicate suppression
+- dispatch intent durability in PostgreSQL via `dispatch_outbox`
+- audit events for notification acceptance, dispatch intent creation/publication, retry scheduling, dead-lettering, replay, and duplicate suppression
 - startup and periodic recovery of stranded jobs in:
   - `notify:dispatch:processing`
   - `notify:dispatch:webhook:processing`
   - `notify:dispatch:email:processing`
 
-## Stage 6 Delivery Semantics
+## Stage 8 Delivery Semantics
 
 The delivery service now uses a small explicit error model:
 
@@ -84,12 +87,23 @@ The current retry model is:
 1. the active attempt starts as `pending`
 2. exactly one worker may mark it `in_progress` via a compare-and-set update
 3. on transient failure, the same attempt is marked `retry_scheduled` with `next_retry_at`
-4. when the retry worker picks up a due retry, it first creates the next attempt durably in PostgreSQL with enqueue still pending
-5. the retry worker then enqueues Redis work only for that already-durable attempt and marks it enqueued after success
-6. if Redis is unavailable, the attempt remains pending enqueue in PostgreSQL and is retried later
+4. when API, retry, or replay creates publishable work, it writes the attempt plus one `dispatch_outbox` intent in the same PostgreSQL transaction
+5. the outbox publisher later enqueues Redis work only for that already-durable intent and marks it published after success
+6. if Redis is unavailable at outbox publish time, the intent remains pending in PostgreSQL and is retried later
 7. once the retry budget is exhausted, the final attempt is marked `dead_lettered` and a `dead_letters` row is inserted
 
-Replay uses the same model: the replay attempt is created durably first, the dead letter is only marked replayed after enqueue succeeds, and failed enqueue work remains recoverable from PostgreSQL. Normal initial API attempts are also DB-authoritative now: the notification row may exist before enqueue succeeds, the initial attempt is ensured durably before dispatch, and if enqueue fails it remains recoverable. Idempotent retries reuse the original notification and repair missing initial attempts instead of treating the existing notification as "done enough"; that repair is derived from the existing notification's stored template/channel, not from any new request payload, so reusing an idempotency key with a different template cannot create a wrong-channel first attempt. Enqueue recovery scans `enqueue_kind IN (initial, retry, replay)` but only for attempts whose `dispatch_enqueued_at` is still null. Duplicate Redis jobs are still possible underneath, but the worker now proves whether the attempt is still executable before sending and safely ACKs duplicate/stale jobs without repeating side effects. This keeps the history inspectable without introducing a full generalized outbox or lease framework.
+Replay uses the same model: the replay attempt is created durably first, the dead letter is only marked replayed after the outbox publisher successfully enqueues Redis work, and failed publish work remains recoverable from PostgreSQL. Initial API attempts and retry attempts now follow the same path, so Redis is treated as execution transport rather than the source of truth for "what still needs dispatch publication." Duplicate Redis jobs are still possible underneath, but Stage 6 attempt-level idempotency and duplicate suppression still protect execution.
+
+## Dispatch Outbox Lite
+
+`dispatch_outbox` is intentionally narrow. It is not a generalized event bus, not CDC, and not WAL streaming.
+
+- One publishable attempt gets at most one live dispatch intent.
+- Initial submission, retry creation, and replay creation all write their dispatch intent transactionally with the durable attempt state.
+- The outbox publisher polls pending intents, pushes `notify:dispatch`, and only then marks the intent `published`.
+- If Redis is down when the outbox publisher tries to publish, the intent stays `pending` with `last_error` for inspection and later recovery.
+- The API still depends on Redis for rate limiting and queue-pressure checks, so a Redis outage can still block new submissions even though already-created dispatch intents remain durable in PostgreSQL.
+- Existing attempt inspection still shows pending durable work through `status = pending` plus `dispatch_enqueued_at = null`.
 
 ## Duplicate Suppression Model
 
@@ -159,6 +173,12 @@ Run the retry worker:
 go run ./cmd/retry_worker
 ```
 
+Run the outbox publisher:
+
+```bash
+go run ./cmd/outbox_publisher
+```
+
 ## Default Local Configuration
 
 - HTTP port: `8080`
@@ -169,6 +189,7 @@ go run ./cmd/retry_worker
 - retry base delay: `5s`
 - retry max delay: `1m`
 - retry worker poll interval: `2s`
+- outbox publisher poll interval: `2s`
 - processing recovery interval: `30s`
 - Mailpit SMTP host/port: `localhost:1025`
 
@@ -195,21 +216,24 @@ New in Stage 5:
 - `RETRY_EXPONENTIAL_BACKOFF`
 - `RETRY_JITTER`
 - `RETRY_WORKER_POLL_INTERVAL`
+- `OUTBOX_POLL_INTERVAL`
 - `PROCESSING_RECOVERY_INTERVAL`
 
-## Remaining Intentional Limitations After Stage 6
+## Remaining Intentional Limitations After Stage 8
 
-Stage 6 is deliberately pragmatic. The service still does **not** provide:
+Stage 8 is deliberately pragmatic. The service still does **not** provide:
 
-- a transactional outbox pattern for PostgreSQL + Redis atomicity
 - exactly-once delivery semantics
+- a full generalized outbox or event platform
+- CDC, WAL tailing, or Debezium-style publication
+- advanced cross-region or multi-region replication guarantees
 - generalized duplicate suppression across every possible crash boundary
 - rich multi-channel fanout semantics
 - provider failover
 - advanced scheduling beyond bounded retry delays
 - rate limiting / quota enforcement beyond whatever already exists in the broader codebase
 - an operator UI
-- distributed coordination or leader election for recovery/retry workers
+- distributed coordination or leader election for recovery/retry/outbox workers
 
 Those remain future milestones.
 

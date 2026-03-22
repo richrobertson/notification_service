@@ -17,6 +17,7 @@ CREATE TYPE delivery_attempt_status AS ENUM (
     'dead_lettered'
 );
 CREATE TYPE channel_type AS ENUM ('email', 'webhook');
+CREATE TYPE dispatch_outbox_status AS ENUM ('pending', 'publishing', 'published');
 
 CREATE TABLE tenants (
     id TEXT PRIMARY KEY,
@@ -27,7 +28,7 @@ CREATE TABLE tenants (
 );
 
 CREATE TABLE api_keys (
-    id UUID PRIMARY KEY,
+    id TEXT PRIMARY KEY,
     tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
     key_hash TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -52,7 +53,7 @@ CREATE UNIQUE INDEX templates_tenant_name_channel_idx
     ON templates (tenant_id, name, channel);
 
 CREATE TABLE notifications (
-    id UUID PRIMARY KEY,
+    id TEXT PRIMARY KEY,
     tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
     template_id TEXT NOT NULL REFERENCES templates(id) ON DELETE RESTRICT,
     idempotency_key TEXT NOT NULL,
@@ -73,8 +74,8 @@ CREATE INDEX notifications_status_idx
     ON notifications (status);
 
 CREATE TABLE delivery_attempts (
-    id UUID PRIMARY KEY,
-    notification_id UUID NOT NULL REFERENCES notifications(id) ON DELETE CASCADE,
+    id TEXT PRIMARY KEY,
+    notification_id TEXT NOT NULL REFERENCES notifications(id) ON DELETE CASCADE,
     channel channel_type NOT NULL,
     attempt_number INTEGER NOT NULL CHECK (attempt_number > 0),
     status delivery_attempt_status NOT NULL,
@@ -105,9 +106,28 @@ CREATE INDEX delivery_attempts_dispatch_pending_idx
     ON delivery_attempts (status, created_at)
     WHERE dispatch_enqueued_at IS NULL AND enqueue_kind IN ('initial', 'retry', 'replay');
 
+CREATE TABLE dispatch_outbox (
+    id TEXT PRIMARY KEY,
+    notification_id TEXT NOT NULL REFERENCES notifications(id) ON DELETE CASCADE,
+    attempt_id TEXT NOT NULL REFERENCES delivery_attempts(id) ON DELETE CASCADE,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    channel channel_type NOT NULL,
+    source TEXT NOT NULL,
+    status dispatch_outbox_status NOT NULL DEFAULT 'pending',
+    last_error TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    claimed_at TIMESTAMPTZ,
+    published_at TIMESTAMPTZ,
+    UNIQUE (attempt_id)
+);
+
+CREATE INDEX dispatch_outbox_pending_idx
+    ON dispatch_outbox (status, claimed_at, created_at)
+    WHERE status IN ('pending', 'publishing');
+
 CREATE TABLE dead_letters (
-    id UUID PRIMARY KEY,
-    notification_id UUID NOT NULL REFERENCES notifications(id) ON DELETE CASCADE,
+    id TEXT PRIMARY KEY,
+    notification_id TEXT NOT NULL REFERENCES notifications(id) ON DELETE CASCADE,
     channel channel_type NOT NULL,
     final_error TEXT NOT NULL,
     dead_lettered_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -127,7 +147,7 @@ CREATE UNIQUE INDEX dead_letters_replay_attempt_id_idx
     WHERE replay_attempt_id IS NOT NULL;
 
 CREATE TABLE audit_events (
-    id UUID PRIMARY KEY,
+    id TEXT PRIMARY KEY,
     tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
     actor TEXT NOT NULL,
     action TEXT NOT NULL,

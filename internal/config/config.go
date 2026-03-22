@@ -24,6 +24,7 @@ type Config struct {
 	RetryExponentialBackoff  bool
 	RetryJitter              time.Duration
 	RetryWorkerPollInterval  time.Duration
+	OutboxPollInterval       time.Duration
 	RecoveryInterval         time.Duration
 	SMTPHost                 string
 	SMTPPort                 int
@@ -66,6 +67,7 @@ func Load() Config {
 		RetryExponentialBackoff:  envBoolOrDefault("RETRY_EXPONENTIAL_BACKOFF", true),
 		RetryJitter:              envDurationOrDefault("RETRY_JITTER", time.Second),
 		RetryWorkerPollInterval:  envDurationOrDefault("RETRY_WORKER_POLL_INTERVAL", 2*time.Second),
+		OutboxPollInterval:       envDurationOrDefault("OUTBOX_POLL_INTERVAL", 2*time.Second),
 		RecoveryInterval:         envDurationOrDefault("PROCESSING_RECOVERY_INTERVAL", 30*time.Second),
 		SMTPHost:                 envOrDefault("SMTP_HOST", "localhost"),
 		SMTPPort:                 envIntOrDefault("SMTP_PORT", 1025),
