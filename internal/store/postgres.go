@@ -79,7 +79,7 @@ type DeliveryAttempt struct {
 	FailedAt           *time.Time `json:"failed_at"`
 	DispatchEnqueuedAt *time.Time `json:"dispatch_enqueued_at"`
 	EnqueueKind        string     `json:"enqueue_kind"`
-	Provider           *string    `json:"provider,omitempty"`
+	ProviderUsed       *string    `json:"provider_used,omitempty"`
 	FailoverUsed       bool       `json:"failover_used"`
 	DeadLetterID       *string    `json:"dead_letter_id,omitempty"`
 	ReplayOfDeadLetter *string    `json:"replay_of_dead_letter_id,omitempty"`
@@ -1115,7 +1115,7 @@ func (p *Postgres) GetDeliveryAttemptByID(ctx context.Context, id string) (Deliv
 		WHERE id = $1
 	`
 	var attempt DeliveryAttempt
-	err := p.DB.QueryRowContext(ctx, query, id).Scan(&attempt.ID, &attempt.NotificationID, &attempt.Channel, &attempt.AttemptNumber, &attempt.Status, &attempt.ErrorCode, &attempt.ErrorMessage, &attempt.ProviderMessageID, &attempt.LastError, &attempt.NextRetryAt, &attempt.StartedAt, &attempt.CompletedAt, &attempt.SentAt, &attempt.FailedAt, &attempt.DispatchEnqueuedAt, &attempt.EnqueueKind, &attempt.Provider, &attempt.FailoverUsed, &attempt.CreatedAt, &attempt.UpdatedAt)
+	err := p.DB.QueryRowContext(ctx, query, id).Scan(&attempt.ID, &attempt.NotificationID, &attempt.Channel, &attempt.AttemptNumber, &attempt.Status, &attempt.ErrorCode, &attempt.ErrorMessage, &attempt.ProviderMessageID, &attempt.LastError, &attempt.NextRetryAt, &attempt.StartedAt, &attempt.CompletedAt, &attempt.SentAt, &attempt.FailedAt, &attempt.DispatchEnqueuedAt, &attempt.EnqueueKind, &attempt.ProviderUsed, &attempt.FailoverUsed, &attempt.CreatedAt, &attempt.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return DeliveryAttempt{}, fmt.Errorf("get delivery attempt: %w", ErrNotFound)
@@ -1161,7 +1161,7 @@ func (p *Postgres) ListDeliveryAttemptsByNotificationID(ctx context.Context, not
 	var attempts []DeliveryAttempt
 	for rows.Next() {
 		var attempt DeliveryAttempt
-		if err := rows.Scan(&attempt.ID, &attempt.NotificationID, &attempt.Channel, &attempt.AttemptNumber, &attempt.Status, &attempt.ErrorCode, &attempt.ErrorMessage, &attempt.ProviderMessageID, &attempt.LastError, &attempt.NextRetryAt, &attempt.StartedAt, &attempt.CompletedAt, &attempt.SentAt, &attempt.FailedAt, &attempt.DispatchEnqueuedAt, &attempt.EnqueueKind, &attempt.Provider, &attempt.FailoverUsed, &attempt.DeadLetterID, &attempt.ReplayOfDeadLetter, &attempt.CreatedAt, &attempt.UpdatedAt); err != nil {
+		if err := rows.Scan(&attempt.ID, &attempt.NotificationID, &attempt.Channel, &attempt.AttemptNumber, &attempt.Status, &attempt.ErrorCode, &attempt.ErrorMessage, &attempt.ProviderMessageID, &attempt.LastError, &attempt.NextRetryAt, &attempt.StartedAt, &attempt.CompletedAt, &attempt.SentAt, &attempt.FailedAt, &attempt.DispatchEnqueuedAt, &attempt.EnqueueKind, &attempt.ProviderUsed, &attempt.FailoverUsed, &attempt.DeadLetterID, &attempt.ReplayOfDeadLetter, &attempt.CreatedAt, &attempt.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("list delivery attempts: %w", err)
 		}
 		attempts = append(attempts, attempt)
@@ -1193,7 +1193,7 @@ func (p *Postgres) RecalculateNotificationStatus(ctx context.Context, notificati
 	status := deriveNotificationStatus(attempts)
 	if cancelledAt != nil {
 		status = "cancelled"
-	} else if scheduledFor != nil && promotedAt == nil {
+	} else if scheduledFor != nil && promotedAt == nil && scheduledFor.After(time.Now().UTC()) {
 		status = "scheduled"
 	}
 	result, err := p.DB.ExecContext(ctx, `
@@ -1770,31 +1770,31 @@ func (p *Postgres) ClaimPendingDispatchIntents(ctx context.Context, limit int, s
 			UPDATE dispatch_outbox AS o
 			SET status = 'publishing', claimed_at = NOW()
 			WHERE o.id IN (
-				SELECT id
-				FROM dispatch_outbox
+				SELECT i.id
+				FROM dispatch_outbox i
 				WHERE (
-					status = 'pending'
-					OR (status = 'publishing' AND claimed_at IS NOT NULL AND claimed_at <= NOW() - ($2 * INTERVAL '1 second'))
+					i.status = 'pending'
+					OR (i.status = 'publishing' AND i.claimed_at IS NOT NULL AND i.claimed_at <= NOW() - ($2 * INTERVAL '1 second'))
 				)
 				  AND COALESCE(
 					(
 						SELECT p_tc.paused
 						FROM delivery_policies p_tc
-						WHERE p_tc.tenant_id = o.tenant_id AND p_tc.channel = o.channel
+						WHERE p_tc.tenant_id = i.tenant_id AND p_tc.channel = i.channel
 						ORDER BY p_tc.updated_at DESC
 						LIMIT 1
 					),
 					(
 						SELECT p_t.paused
 						FROM delivery_policies p_t
-						WHERE p_t.tenant_id = o.tenant_id AND p_t.channel IS NULL
+						WHERE p_t.tenant_id = i.tenant_id AND p_t.channel IS NULL
 						ORDER BY p_t.updated_at DESC
 						LIMIT 1
 					),
 					(
 						SELECT p_gc.paused
 						FROM delivery_policies p_gc
-						WHERE p_gc.tenant_id IS NULL AND p_gc.channel = o.channel
+						WHERE p_gc.tenant_id IS NULL AND p_gc.channel = i.channel
 						ORDER BY p_gc.updated_at DESC
 						LIMIT 1
 					),
@@ -1807,7 +1807,7 @@ func (p *Postgres) ClaimPendingDispatchIntents(ctx context.Context, limit int, s
 					),
 					false
 				) = false
-				ORDER BY created_at ASC
+				ORDER BY i.created_at ASC
 				FOR UPDATE SKIP LOCKED
 				LIMIT $1
 			)
