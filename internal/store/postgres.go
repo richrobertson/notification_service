@@ -1449,16 +1449,6 @@ func (p *Postgres) EnsureRetryAttempt(ctx context.Context, scheduledAttemptID, n
 		if err != nil {
 			return RetryDueAttempt{}, fmt.Errorf("ensure retry attempt: %w", err)
 		}
-		if _, err := createDispatchIntentTx(ctx, tx, CreateDispatchIntentParams{
-			ID:             "intent-" + attempt.ID,
-			NotificationID: attempt.NotificationID,
-			AttemptID:      attempt.ID,
-			TenantID:       item.TenantID,
-			Channel:        attempt.Channel,
-			Source:         "retry",
-		}); err != nil {
-			return RetryDueAttempt{}, fmt.Errorf("ensure retry attempt: %w", err)
-		}
 		createdNewAttempt = true
 	}
 	if _, err := createDispatchIntentTx(ctx, tx, CreateDispatchIntentParams{

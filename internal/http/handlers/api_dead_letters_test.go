@@ -300,8 +300,7 @@ func newDeadLetterTestAPI() (*fakeAPIStore, *fakeDispatchQueue, *API) {
 }
 
 func TestDeadLetterHandlersListGetReplay(t *testing.T) {
-	st, q, api := newDeadLetterTestAPI()
-	_ = q
+	st, _, api := newDeadLetterTestAPI()
 	t.Run("list", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/v1/dead-letters", nil)
 		res := httptest.NewRecorder()
@@ -344,8 +343,7 @@ func TestDeadLetterHandlersListGetReplay(t *testing.T) {
 }
 
 func TestReplayDeadLetterCreatesRecoverableDispatchIntent(t *testing.T) {
-	st, q, api := newDeadLetterTestAPI()
-	q.err = errors.New("redis down")
+	st, _, api := newDeadLetterTestAPI()
 	req := httptest.NewRequest(http.MethodPost, "/v1/dead-letters/dead-1/replay", bytes.NewReader(nil))
 	req.SetPathValue("id", "dead-1")
 	res := httptest.NewRecorder()
@@ -365,8 +363,7 @@ func TestReplayDeadLetterCreatesRecoverableDispatchIntent(t *testing.T) {
 }
 
 func TestCreateNotificationUpdatesInspectionStatusWhenAttemptIsPending(t *testing.T) {
-	_, q, api := newDeadLetterTestAPI()
-	q.err = errors.New("redis down")
+	_, _, api := newDeadLetterTestAPI()
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/notifications", bytes.NewReader([]byte(`{"id":"notif-1","tenant_id":"tenant-1","template_id":"tpl-1","recipient_email":"user@example.test","variables":{}}`)))
 	req.Header.Set("Content-Type", "application/json")
@@ -396,8 +393,7 @@ func TestCreateNotificationUpdatesInspectionStatusWhenAttemptIsPending(t *testin
 }
 
 func TestReplayDeadLetterUpdatesInspectionStatusWhenReplayAttemptIsPending(t *testing.T) {
-	st, q, api := newDeadLetterTestAPI()
-	q.err = errors.New("redis down")
+	st, _, api := newDeadLetterTestAPI()
 	st.notification.Status = "dead_lettered"
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/dead-letters/dead-1/replay", bytes.NewReader(nil))
@@ -440,8 +436,7 @@ func TestReplayDeadLetterReturns500WhenStatusRefreshFails(t *testing.T) {
 }
 
 func TestCreateNotificationCreatesInitialDispatchIntent(t *testing.T) {
-	st, q, api := newDeadLetterTestAPI()
-	_ = q
+	st, _, api := newDeadLetterTestAPI()
 	req := httptest.NewRequest(http.MethodPost, "/v1/notifications", bytes.NewReader([]byte(`{"id":"notif-1","tenant_id":"tenant-1","template_id":"tpl-1","recipient_email":"user@example.test","variables":{}}`)))
 	req.Header.Set("Content-Type", "application/json")
 	res := httptest.NewRecorder()
