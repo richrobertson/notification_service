@@ -65,7 +65,7 @@ The repository is currently **through Stage 8**, with earlier Stage 6 follow-up 
 ## In progress
 
 - No separate major milestone is currently in progress
-- The system is in a **stabilized post–Stage 8 state**
+- The system is in a **stabilized post-Stage-8 state**
 - The next milestone is clearly **Stage 9**
 
 ---
