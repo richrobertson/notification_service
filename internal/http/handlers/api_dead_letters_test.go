@@ -343,7 +343,7 @@ func TestDeadLetterHandlersListGetReplay(t *testing.T) {
 	})
 }
 
-func TestReplayDeadLetterEnqueueFailureLeavesRecoverableAttempt(t *testing.T) {
+func TestReplayDeadLetterCreatesRecoverableDispatchIntent(t *testing.T) {
 	st, q, api := newDeadLetterTestAPI()
 	q.err = errors.New("redis down")
 	req := httptest.NewRequest(http.MethodPost, "/v1/dead-letters/dead-1/replay", bytes.NewReader(nil))
@@ -439,7 +439,7 @@ func TestReplayDeadLetterReturns500WhenStatusRefreshFails(t *testing.T) {
 	}
 }
 
-func TestCreateNotificationMarksInitialAttemptEnqueued(t *testing.T) {
+func TestCreateNotificationCreatesInitialDispatchIntent(t *testing.T) {
 	st, q, api := newDeadLetterTestAPI()
 	_ = q
 	req := httptest.NewRequest(http.MethodPost, "/v1/notifications", bytes.NewReader([]byte(`{"id":"notif-1","tenant_id":"tenant-1","template_id":"tpl-1","recipient_email":"user@example.test","variables":{}}`)))
