@@ -1657,7 +1657,23 @@ func (p *Postgres) MarkDispatchIntentPublished(ctx context.Context, intentID str
 		RETURNING id, notification_id, attempt_id, tenant_id, channel, source, status, last_error, created_at, claimed_at, published_at
 	`, intentID), &intent); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("mark dispatch intent published: %w", ErrNotFound)
+			if err := scanDispatchIntent(tx.QueryRowContext(ctx, `
+				SELECT id, notification_id, attempt_id, tenant_id, channel, source, status, last_error, created_at, claimed_at, published_at
+				FROM dispatch_outbox
+				WHERE id = $1
+			`, intentID), &intent); err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					return fmt.Errorf("mark dispatch intent published: %w", ErrNotFound)
+				}
+				return fmt.Errorf("mark dispatch intent published: %w", err)
+			}
+			if intent.Status == "published" {
+				if err := tx.Commit(); err != nil {
+					return fmt.Errorf("mark dispatch intent published: commit: %w", err)
+				}
+				return nil
+			}
+			return fmt.Errorf("mark dispatch intent published: %w", ErrInvalidStateTransition)
 		}
 		return fmt.Errorf("mark dispatch intent published: %w", err)
 	}
