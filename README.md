@@ -2,7 +2,9 @@
 
 ## Project Overview
 
-`notification_service` is a runnable Go notification platform foundation. Stage 8 keeps the Redis-list + PostgreSQL architecture, and adds a narrow transactional-outbox-lite layer so Postgres becomes the authoritative source of truth for dispatch publication.
+`notification_service` is a runnable Go notification platform foundation. The repository is currently through Stage 8, with PostgreSQL as the authoritative source of truth for durable dispatch publication and Redis serving as the execution transport.
+
+See [docs/roadmap.md](docs/roadmap.md) for current milestone status and next steps.
 
 The service now provides:
 
@@ -27,9 +29,11 @@ The service now provides:
 - audit events for major lifecycle transitions
 - automated best-effort recovery that drains stranded `*:processing` queues back to their source queues
 
-## Stage 8 Status
+## Current Milestone Status
 
-Implemented in this stage:
+The repository is in a stabilized post-Stage-8 state. Stages 3 through 8 are complete, and the next major milestone is Stage 9.
+
+Current baseline includes:
 
 - `GET /v1/health`
 - `GET /v1/readiness`
@@ -63,7 +67,7 @@ Implemented in this stage:
   - `notify:dispatch:webhook:processing`
   - `notify:dispatch:email:processing`
 
-## Stage 8 Delivery Semantics
+## Delivery Semantics
 
 The delivery service now uses a small explicit error model:
 
@@ -219,9 +223,9 @@ New in Stage 5:
 - `OUTBOX_POLL_INTERVAL`
 - `PROCESSING_RECOVERY_INTERVAL`
 
-## Remaining Intentional Limitations After Stage 8
+## Remaining Intentional Limitations
 
-Stage 8 is deliberately pragmatic. The service still does **not** provide:
+The roadmap remains deliberately pragmatic. The service still does **not** provide:
 
 - exactly-once delivery semantics
 - a full generalized outbox or event platform
@@ -235,7 +239,7 @@ Stage 8 is deliberately pragmatic. The service still does **not** provide:
 - an operator UI
 - distributed coordination or leader election for recovery/retry/outbox workers
 
-Those remain future milestones.
+Those remain future milestones, with the next major gap centered on advanced delivery policy and broader platform controls rather than basic durability or correctness.
 
 ## Stage 7: Backpressure, rate limiting, and tenant isolation
 
