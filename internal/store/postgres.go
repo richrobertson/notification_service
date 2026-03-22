@@ -430,7 +430,7 @@ func (p *Postgres) CreateNotificationWithInitialDispatch(ctx context.Context, pa
 		EnqueueKind:    "initial",
 	})
 	if err != nil {
-		return Notification{}, DeliveryAttempt{}, DispatchIntent{}, err
+		return Notification{}, DeliveryAttempt{}, DispatchIntent{}, fmt.Errorf("create notification with initial dispatch: create delivery attempt: %w", err)
 	}
 
 	intent, err := createDispatchIntentTx(ctx, tx, CreateDispatchIntentParams{
@@ -442,7 +442,7 @@ func (p *Postgres) CreateNotificationWithInitialDispatch(ctx context.Context, pa
 		Source:         "initial",
 	})
 	if err != nil {
-		return Notification{}, DeliveryAttempt{}, DispatchIntent{}, err
+		return Notification{}, DeliveryAttempt{}, DispatchIntent{}, fmt.Errorf("create notification with initial dispatch: create dispatch intent: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -742,7 +742,7 @@ func (p *Postgres) EnsureInitialAttempt(ctx context.Context, notificationID, cha
 		PublishedAt:    attempt.DispatchEnqueuedAt,
 	})
 	if err != nil {
-		return DeliveryAttempt{}, DispatchIntent{}, err
+		return DeliveryAttempt{}, DispatchIntent{}, wrapStoreError("ensure initial attempt: create dispatch intent", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return DeliveryAttempt{}, DispatchIntent{}, fmt.Errorf("ensure initial attempt: commit: %w", err)
@@ -1701,6 +1701,9 @@ func (p *Postgres) RecordDispatchIntentError(ctx context.Context, intentID strin
 				return fmt.Errorf("record dispatch intent error: %w", ErrNotFound)
 			}
 			return fmt.Errorf("record dispatch intent error: %w", err)
+		}
+		if status == "published" {
+			return nil
 		}
 		return fmt.Errorf("record dispatch intent error: %w", ErrInvalidStateTransition)
 	}
