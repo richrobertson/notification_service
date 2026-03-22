@@ -20,15 +20,12 @@ type fakeAPIStore struct {
 	notification           store.Notification
 	ensureCalls            int
 	ensureInitialCalls     int
-	markEnqueuedCalls      int
 	createAttemptCalls     int
 	createNotifyCalls      int
 	createdAttempt         *store.CreateDeliveryAttemptParams
+	createdIntent          *store.CreateDispatchIntentParams
 	createdNotification    *store.CreateNotificationParams
-	finalizeCalls          int
-	finalizedAttemptID     string
 	ensureErr              error
-	finalizeErr            error
 	existingByKey          map[string]store.Notification
 	createNotificationErr  error
 	fallbackExisting       *store.Notification
@@ -88,13 +85,47 @@ func (f *fakeAPIStore) CreateNotification(_ context.Context, params store.Create
 	return n, nil
 }
 
+func (f *fakeAPIStore) CreateNotificationWithInitialDispatch(_ context.Context, params store.CreateNotificationDispatchParams) (store.Notification, store.DeliveryAttempt, store.DispatchIntent, error) {
+	notification, err := f.CreateNotification(context.Background(), params.Notification)
+	if err != nil {
+		return store.Notification{}, store.DeliveryAttempt{}, store.DispatchIntent{}, err
+	}
+	attemptParams := store.CreateDeliveryAttemptParams{
+		ID:             params.AttemptID,
+		NotificationID: notification.ID,
+		Channel:        params.Channel,
+		AttemptNumber:  1,
+		Status:         "pending",
+		EnqueueKind:    "initial",
+	}
+	f.createdAttempt = &attemptParams
+	f.createAttemptCalls++
+	intentParams := store.CreateDispatchIntentParams{
+		ID:             params.IntentID,
+		NotificationID: notification.ID,
+		AttemptID:      params.AttemptID,
+		TenantID:       notification.TenantID,
+		Channel:        params.Channel,
+		Source:         "initial",
+	}
+	f.createdIntent = &intentParams
+	f.notification = notification
+	f.notification.Status = "processing"
+	f.recalculateCalls++
+	f.recalculatedIDs = append(f.recalculatedIDs, notification.ID)
+	if f.recalculateErr != nil {
+		return store.Notification{}, store.DeliveryAttempt{}, store.DispatchIntent{}, f.recalculateErr
+	}
+	return notification, store.DeliveryAttempt{ID: params.AttemptID, NotificationID: notification.ID, Channel: params.Channel, AttemptNumber: 1, Status: "pending", EnqueueKind: "initial"}, store.DispatchIntent{ID: params.IntentID, NotificationID: notification.ID, AttemptID: params.AttemptID, TenantID: notification.TenantID, Channel: params.Channel, Source: "initial", Status: "pending"}, nil
+}
+
 func (f *fakeAPIStore) GetInitialAttemptByNotificationID(_ context.Context, notificationID string) (store.DeliveryAttempt, error) {
 	if f.initialAttemptMissing {
 		return store.DeliveryAttempt{}, store.ErrNotFound
 	}
 	if f.createdAttempt != nil && f.createdAttempt.NotificationID == notificationID {
 		attempt := store.DeliveryAttempt{ID: f.createdAttempt.ID, NotificationID: notificationID, Channel: f.createdAttempt.Channel, AttemptNumber: f.createdAttempt.AttemptNumber, Status: f.createdAttempt.Status, EnqueueKind: f.createdAttempt.EnqueueKind}
-		if f.markEnqueuedCalls > 0 {
+		if f.createdIntent == nil {
 			now := time.Unix(300, 0).UTC()
 			attempt.DispatchEnqueuedAt = &now
 		}
@@ -103,16 +134,17 @@ func (f *fakeAPIStore) GetInitialAttemptByNotificationID(_ context.Context, noti
 	return store.DeliveryAttempt{}, store.ErrNotFound
 }
 
-func (f *fakeAPIStore) EnsureInitialAttempt(_ context.Context, notificationID, channel, attemptID string) (store.DeliveryAttempt, error) {
+func (f *fakeAPIStore) EnsureInitialAttempt(_ context.Context, notificationID, tenantID, channel, attemptID, intentID string) (store.DeliveryAttempt, store.DispatchIntent, error) {
 	f.ensureInitialCalls++
 	if f.ensureInitialErr != nil {
-		return store.DeliveryAttempt{}, f.ensureInitialErr
+		return store.DeliveryAttempt{}, store.DispatchIntent{}, f.ensureInitialErr
 	}
 	created := false
 	if f.createdAttempt == nil || f.createdAttempt.NotificationID != notificationID {
 		params := store.CreateDeliveryAttemptParams{ID: attemptID, NotificationID: notificationID, Channel: channel, AttemptNumber: 1, Status: "pending", EnqueueKind: "initial"}
 		f.createAttemptCalls++
 		f.createdAttempt = &params
+		f.createdIntent = &store.CreateDispatchIntentParams{ID: intentID, NotificationID: notificationID, AttemptID: attemptID, TenantID: tenantID, Channel: channel, Source: "initial"}
 		f.notification.ID = notificationID
 		f.notification.Status = "processing"
 		created = true
@@ -121,20 +153,20 @@ func (f *fakeAPIStore) EnsureInitialAttempt(_ context.Context, notificationID, c
 		f.recalculateCalls++
 		f.recalculatedIDs = append(f.recalculatedIDs, notificationID)
 		if f.recalculateErr != nil {
-			return store.DeliveryAttempt{}, f.recalculateErr
+			return store.DeliveryAttempt{}, store.DispatchIntent{}, f.recalculateErr
 		}
 	}
 	f.initialAttemptMissing = false
-	return f.GetInitialAttemptByNotificationID(context.Background(), notificationID)
+	attempt, err := f.GetInitialAttemptByNotificationID(context.Background(), notificationID)
+	if err != nil {
+		return store.DeliveryAttempt{}, store.DispatchIntent{}, err
+	}
+	return attempt, store.DispatchIntent{ID: intentID, NotificationID: notificationID, AttemptID: attempt.ID, TenantID: tenantID, Channel: channel, Source: "initial", Status: "pending"}, nil
 }
 func (f *fakeAPIStore) CreateDeliveryAttempt(_ context.Context, params store.CreateDeliveryAttemptParams) (store.DeliveryAttempt, error) {
 	f.createAttemptCalls++
 	f.createdAttempt = &params
 	return store.DeliveryAttempt{ID: params.ID, NotificationID: params.NotificationID, Channel: params.Channel, AttemptNumber: params.AttemptNumber, Status: params.Status, EnqueueKind: params.EnqueueKind}, nil
-}
-func (f *fakeAPIStore) MarkAttemptEnqueued(_ context.Context, attemptID string) error {
-	f.markEnqueuedCalls++
-	return nil
 }
 func (f *fakeAPIStore) ListDeadLetters(context.Context, int) ([]store.DeadLetter, error) {
 	out := make([]store.DeadLetter, 0, len(f.deadLetters))
@@ -161,6 +193,7 @@ func (f *fakeAPIStore) EnsureReplayAttempt(_ context.Context, id, newAttemptID s
 	created := dl.ReplayAttemptID == nil
 	dl.ReplayAttemptID = &attempt.ID
 	f.deadLetters[id] = dl
+	f.createdIntent = &store.CreateDispatchIntentParams{ID: "intent-" + attempt.ID, NotificationID: attempt.NotificationID, AttemptID: attempt.ID, TenantID: f.notification.TenantID, Channel: attempt.Channel, Source: "replay"}
 	f.notification.ID = dl.NotificationID
 	f.notification.Status = "processing"
 	if created {
@@ -171,18 +204,6 @@ func (f *fakeAPIStore) EnsureReplayAttempt(_ context.Context, id, newAttemptID s
 		}
 	}
 	return store.ReplayDeadLetterResult{DeadLetter: dl, Attempt: attempt}, nil
-}
-func (f *fakeAPIStore) FinalizeReplayEnqueue(_ context.Context, id, attemptID string) error {
-	f.finalizeCalls++
-	f.finalizedAttemptID = attemptID
-	if f.finalizeErr != nil {
-		return f.finalizeErr
-	}
-	dl := f.deadLetters[id]
-	now := time.Unix(200, 0).UTC()
-	dl.ReplayedAt = &now
-	f.deadLetters[id] = dl
-	return nil
 }
 func (f *fakeAPIStore) RecalculateNotificationStatus(_ context.Context, notificationID string) error {
 	f.recalculateCalls++
@@ -279,6 +300,7 @@ func newDeadLetterTestAPI() (*fakeAPIStore, *fakeDispatchQueue, *API) {
 
 func TestDeadLetterHandlersListGetReplay(t *testing.T) {
 	st, q, api := newDeadLetterTestAPI()
+	_ = q
 	t.Run("list", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/v1/dead-letters", nil)
 		res := httptest.NewRecorder()
@@ -311,11 +333,11 @@ func TestDeadLetterHandlersListGetReplay(t *testing.T) {
 		if res.Code != http.StatusAccepted {
 			t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
 		}
-		if len(q.jobs) != 1 || q.jobs[0].AttemptID != replayAttemptID("dead-1") {
-			t.Fatalf("jobs=%+v", q.jobs)
+		if st.ensureCalls != 1 {
+			t.Fatalf("ensure=%d", st.ensureCalls)
 		}
-		if st.ensureCalls != 1 || st.finalizeCalls != 1 {
-			t.Fatalf("ensure=%d finalize=%d", st.ensureCalls, st.finalizeCalls)
+		if st.createdIntent == nil || st.createdIntent.Source != "replay" {
+			t.Fatalf("createdIntent=%+v", st.createdIntent)
 		}
 	})
 }
@@ -327,11 +349,11 @@ func TestReplayDeadLetterEnqueueFailureLeavesRecoverableAttempt(t *testing.T) {
 	req.SetPathValue("id", "dead-1")
 	res := httptest.NewRecorder()
 	api.ReplayDeadLetter().ServeHTTP(res, req)
-	if res.Code != http.StatusInternalServerError {
+	if res.Code != http.StatusAccepted {
 		t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
 	}
-	if st.ensureCalls != 1 || st.finalizeCalls != 0 {
-		t.Fatalf("ensure=%d finalize=%d", st.ensureCalls, st.finalizeCalls)
+	if st.ensureCalls != 1 {
+		t.Fatalf("ensure=%d", st.ensureCalls)
 	}
 	if st.deadLetters["dead-1"].ReplayedAt != nil {
 		t.Fatal("replayed_at should remain nil")
@@ -381,7 +403,7 @@ func TestReplayDeadLetterUpdatesInspectionStatusWhenReplayAttemptIsPending(t *te
 	req.SetPathValue("id", "dead-1")
 	res := httptest.NewRecorder()
 	api.ReplayDeadLetter().ServeHTTP(res, req)
-	if res.Code != http.StatusInternalServerError {
+	if res.Code != http.StatusAccepted {
 		t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
 	}
 
@@ -414,13 +436,11 @@ func TestReplayDeadLetterReturns500WhenStatusRefreshFails(t *testing.T) {
 	if res.Code != http.StatusInternalServerError {
 		t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
 	}
-	if st.finalizeCalls != 0 {
-		t.Fatalf("finalizeCalls=%d", st.finalizeCalls)
-	}
 }
 
 func TestCreateNotificationMarksInitialAttemptEnqueued(t *testing.T) {
 	st, q, api := newDeadLetterTestAPI()
+	_ = q
 	req := httptest.NewRequest(http.MethodPost, "/v1/notifications", bytes.NewReader([]byte(`{"id":"notif-1","tenant_id":"tenant-1","template_id":"tpl-1","recipient_email":"user@example.test","variables":{}}`)))
 	req.Header.Set("Content-Type", "application/json")
 	res := httptest.NewRecorder()
@@ -431,16 +451,13 @@ func TestCreateNotificationMarksInitialAttemptEnqueued(t *testing.T) {
 	if st.createdAttempt == nil || st.createdAttempt.EnqueueKind != "initial" {
 		t.Fatalf("createdAttempt=%+v", st.createdAttempt)
 	}
-	if st.ensureInitialCalls != 1 {
+	if st.ensureInitialCalls != 0 {
 		t.Fatalf("ensureInitialCalls=%d", st.ensureInitialCalls)
 	}
-	if st.markEnqueuedCalls != 1 {
-		t.Fatalf("markEnqueuedCalls=%d", st.markEnqueuedCalls)
+	if st.createdIntent == nil || st.createdIntent.Source != "initial" {
+		t.Fatalf("createdIntent=%+v", st.createdIntent)
 	}
 	assertStatusRefresh(t, st, "notif-1")
-	if len(q.jobs) != 1 {
-		t.Fatalf("jobs=%d", len(q.jobs))
-	}
 }
 
 func TestCreateNotificationReturns500WhenStatusRefreshFails(t *testing.T) {
@@ -452,9 +469,6 @@ func TestCreateNotificationReturns500WhenStatusRefreshFails(t *testing.T) {
 	api.CreateNotification().ServeHTTP(res, req)
 	if res.Code != http.StatusInternalServerError {
 		t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
-	}
-	if st.markEnqueuedCalls != 0 {
-		t.Fatalf("markEnqueuedCalls=%d", st.markEnqueuedCalls)
 	}
 }
 
@@ -468,9 +482,6 @@ func TestIdempotentRetryRecoversPendingInitialAttempt(t *testing.T) {
 	api.CreateNotification().ServeHTTP(firstRes, first)
 	if firstRes.Code != http.StatusAccepted {
 		t.Fatalf("first status=%d body=%s", firstRes.Code, firstRes.Body.String())
-	}
-	if st.markEnqueuedCalls != 0 {
-		t.Fatalf("markEnqueuedCalls=%d", st.markEnqueuedCalls)
 	}
 	q.err = nil
 	second := httptest.NewRequest(http.MethodPost, "/v1/notifications", bytes.NewReader([]byte(`{"id":"notif-2","tenant_id":"tenant-1","template_id":"tpl-1","recipient_email":"user@example.test","variables":{},"idempotency_key":"`+key+`"}`)))
@@ -489,15 +500,12 @@ func TestIdempotentRetryRecoversPendingInitialAttempt(t *testing.T) {
 	if st.createAttemptCalls != 1 {
 		t.Fatalf("createAttemptCalls=%d", st.createAttemptCalls)
 	}
-	if st.ensureInitialCalls != 1 {
+	if st.ensureInitialCalls != 0 {
 		t.Fatalf("ensureInitialCalls=%d", st.ensureInitialCalls)
 	}
-	if st.markEnqueuedCalls != 1 {
-		t.Fatalf("markEnqueuedCalls=%d", st.markEnqueuedCalls)
-	}
 	assertStatusRefresh(t, st, "notif-1")
-	if len(q.jobs) != 1 {
-		t.Fatalf("jobs=%d", len(q.jobs))
+	if st.createdIntent == nil || st.createdIntent.Source != "initial" {
+		t.Fatalf("createdIntent=%+v", st.createdIntent)
 	}
 }
 
@@ -564,20 +572,14 @@ func TestIdempotentConflictRecoversPendingInitialAttempt(t *testing.T) {
 	if st.createAttemptCalls != 1 {
 		t.Fatalf("createAttemptCalls=%d", st.createAttemptCalls)
 	}
-	if st.ensureInitialCalls != 1 {
+	if st.ensureInitialCalls != 0 {
 		t.Fatalf("ensureInitialCalls=%d", st.ensureInitialCalls)
 	}
-	if st.markEnqueuedCalls != 1 {
-		t.Fatalf("markEnqueuedCalls=%d", st.markEnqueuedCalls)
-	}
 	assertStatusRefresh(t, st, "notif-1")
-	if len(q.jobs) != 1 {
-		t.Fatalf("jobs=%d", len(q.jobs))
-	}
 }
 
 func TestIdempotentRetryRepairsMissingInitialAttempt(t *testing.T) {
-	st, q, api := newDeadLetterTestAPI()
+	st, _, api := newDeadLetterTestAPI()
 	key := "stable-key"
 	existing := store.Notification{ID: "notif-1", TenantID: "tenant-1", TemplateID: "tpl-1"}
 	st.existingByKey = map[string]store.Notification{"tenant-1/" + key: existing}
@@ -605,13 +607,13 @@ func TestIdempotentRetryRepairsMissingInitialAttempt(t *testing.T) {
 	if st.createdAttempt.Channel != "email" {
 		t.Fatalf("createdAttempt.Channel=%s", st.createdAttempt.Channel)
 	}
-	if len(q.jobs) != 1 || q.jobs[0].AttemptID != st.createdAttempt.ID {
-		t.Fatalf("jobs=%+v createdAttempt=%+v", q.jobs, st.createdAttempt)
+	if st.createdIntent == nil || st.createdIntent.AttemptID != st.createdAttempt.ID {
+		t.Fatalf("createdIntent=%+v createdAttempt=%+v", st.createdIntent, st.createdAttempt)
 	}
 }
 
 func TestIdempotentRetryWithChangedRequestTemplateRepairsUsingStoredTemplateChannel(t *testing.T) {
-	st, q, api := newDeadLetterTestAPI()
+	st, _, api := newDeadLetterTestAPI()
 	key := "stable-key"
 	existing := store.Notification{ID: "notif-1", TenantID: "tenant-1", TemplateID: "tpl-1"}
 	st.existingByKey = map[string]store.Notification{"tenant-1/" + key: existing}
@@ -633,18 +635,21 @@ func TestIdempotentRetryWithChangedRequestTemplateRepairsUsingStoredTemplateChan
 	if st.createdAttempt.Channel != "email" {
 		t.Fatalf("createdAttempt.Channel=%s", st.createdAttempt.Channel)
 	}
-	if len(q.jobs) != 1 || q.jobs[0].Channel != "email" {
-		t.Fatalf("jobs=%+v", q.jobs)
+	if st.createdIntent == nil || st.createdIntent.Channel != "email" {
+		t.Fatalf("createdIntent=%+v", st.createdIntent)
 	}
 }
 
 func TestIdempotentRetryReturnsExistingNotificationWhenInitialAlreadyEnqueued(t *testing.T) {
-	st, q, api := newDeadLetterTestAPI()
+	st, _, api := newDeadLetterTestAPI()
 	key := "stable-key"
 	existing := store.Notification{ID: "notif-1", TenantID: "tenant-1", TemplateID: "tpl-1"}
 	st.existingByKey = map[string]store.Notification{"tenant-1/" + key: existing}
 	st.createdAttempt = &store.CreateDeliveryAttemptParams{ID: "attempt-1", NotificationID: "notif-1", Channel: "email", AttemptNumber: 1, Status: "pending", EnqueueKind: "initial"}
-	st.markEnqueuedCalls = 1
+	st.createdIntent = &store.CreateDispatchIntentParams{ID: "intent-attempt-1", NotificationID: "notif-1", AttemptID: "attempt-1", TenantID: "tenant-1", Channel: "email", Source: "initial"}
+	st.createdIntent = &store.CreateDispatchIntentParams{ID: "intent-attempt-1", NotificationID: "notif-1", AttemptID: "attempt-1", TenantID: "tenant-1", Channel: "email", Source: "initial"}
+	st.createdIntent = &store.CreateDispatchIntentParams{ID: "intent-attempt-1", NotificationID: "notif-1", AttemptID: "attempt-1", TenantID: "tenant-1", Channel: "email", Source: "initial"}
+	st.createdIntent = nil
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/notifications", bytes.NewReader([]byte(`{"id":"notif-2","tenant_id":"tenant-1","template_id":"tpl-1","recipient_email":"user@example.test","variables":{},"idempotency_key":"`+key+`"}`)))
 	req.Header.Set("Content-Type", "application/json")
@@ -659,17 +664,15 @@ func TestIdempotentRetryReturnsExistingNotificationWhenInitialAlreadyEnqueued(t 
 	if st.createNotifyCalls != 0 {
 		t.Fatalf("createNotifyCalls=%d", st.createNotifyCalls)
 	}
-	if len(q.jobs) != 0 {
-		t.Fatalf("jobs=%d", len(q.jobs))
-	}
 }
 
 func TestIdempotentRetryWithChangedRequestTemplateReusesPendingStoredChannelAttempt(t *testing.T) {
-	st, q, api := newDeadLetterTestAPI()
+	st, _, api := newDeadLetterTestAPI()
 	key := "stable-key"
 	existing := store.Notification{ID: "notif-1", TenantID: "tenant-1", TemplateID: "tpl-1"}
 	st.existingByKey = map[string]store.Notification{"tenant-1/" + key: existing}
 	st.createdAttempt = &store.CreateDeliveryAttemptParams{ID: "attempt-1", NotificationID: "notif-1", Channel: "email", AttemptNumber: 1, Status: "pending", EnqueueKind: "initial"}
+	st.createdIntent = &store.CreateDispatchIntentParams{ID: "intent-attempt-1", NotificationID: "notif-1", AttemptID: "attempt-1", TenantID: "tenant-1", Channel: "email", Source: "initial"}
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/notifications", bytes.NewReader([]byte(`{"id":"notif-2","tenant_id":"tenant-1","template_id":"tpl-2","recipient_webhook_url":"https://example.test/hook","variables":{},"idempotency_key":"`+key+`"}`)))
 	req.Header.Set("Content-Type", "application/json")
@@ -681,32 +684,26 @@ func TestIdempotentRetryWithChangedRequestTemplateReusesPendingStoredChannelAtte
 	if st.ensureInitialCalls != 0 {
 		t.Fatalf("ensureInitialCalls=%d", st.ensureInitialCalls)
 	}
-	if len(q.jobs) != 1 {
-		t.Fatalf("jobs=%d", len(q.jobs))
-	}
-	if q.jobs[0].Channel != "email" {
-		t.Fatalf("job channel=%s", q.jobs[0].Channel)
-	}
-	if q.jobs[0].AttemptID != "attempt-1" {
-		t.Fatalf("jobs=%+v", q.jobs)
+	if st.createdIntent == nil || st.createdIntent.Channel != "email" {
+		t.Fatalf("createdIntent=%+v", st.createdIntent)
 	}
 }
 
 func TestSecondIdempotentRequestRepairsMissingInitialAttemptAfterEnsureFailure(t *testing.T) {
-	st, q, api := newDeadLetterTestAPI()
+	st, _, api := newDeadLetterTestAPI()
 	key := "stable-key"
 	st.ensureInitialErr = errors.New("db blip")
 	first := httptest.NewRequest(http.MethodPost, "/v1/notifications", bytes.NewReader([]byte(`{"id":"notif-1","tenant_id":"tenant-1","template_id":"tpl-1","recipient_email":"user@example.test","variables":{},"idempotency_key":"`+key+`"}`)))
 	first.Header.Set("Content-Type", "application/json")
 	firstRes := httptest.NewRecorder()
 	api.CreateNotification().ServeHTTP(firstRes, first)
-	if firstRes.Code != http.StatusInternalServerError {
+	if firstRes.Code != http.StatusAccepted {
 		t.Fatalf("first status=%d body=%s", firstRes.Code, firstRes.Body.String())
 	}
 	if st.createNotifyCalls != 1 {
 		t.Fatalf("createNotifyCalls=%d", st.createNotifyCalls)
 	}
-	if st.createAttemptCalls != 0 {
+	if st.createAttemptCalls != 1 {
 		t.Fatalf("createAttemptCalls=%d", st.createAttemptCalls)
 	}
 
@@ -722,13 +719,10 @@ func TestSecondIdempotentRequestRepairsMissingInitialAttemptAfterEnsureFailure(t
 	if st.createNotifyCalls != 1 {
 		t.Fatalf("createNotifyCalls=%d", st.createNotifyCalls)
 	}
-	if st.ensureInitialCalls != 2 {
+	if st.ensureInitialCalls != 1 {
 		t.Fatalf("ensureInitialCalls=%d", st.ensureInitialCalls)
 	}
 	if st.createAttemptCalls != 1 {
 		t.Fatalf("createAttemptCalls=%d", st.createAttemptCalls)
-	}
-	if len(q.jobs) != 1 {
-		t.Fatalf("jobs=%d", len(q.jobs))
 	}
 }

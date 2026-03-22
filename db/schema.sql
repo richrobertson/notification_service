@@ -17,6 +17,7 @@ CREATE TYPE delivery_attempt_status AS ENUM (
     'dead_lettered'
 );
 CREATE TYPE channel_type AS ENUM ('email', 'webhook');
+CREATE TYPE dispatch_outbox_status AS ENUM ('pending', 'published');
 
 CREATE TABLE tenants (
     id TEXT PRIMARY KEY,
@@ -104,6 +105,24 @@ CREATE INDEX delivery_attempts_retry_idx
 CREATE INDEX delivery_attempts_dispatch_pending_idx
     ON delivery_attempts (status, created_at)
     WHERE dispatch_enqueued_at IS NULL AND enqueue_kind IN ('initial', 'retry', 'replay');
+
+CREATE TABLE dispatch_outbox (
+    id TEXT PRIMARY KEY,
+    notification_id UUID NOT NULL REFERENCES notifications(id) ON DELETE CASCADE,
+    attempt_id UUID NOT NULL REFERENCES delivery_attempts(id) ON DELETE CASCADE,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    channel channel_type NOT NULL,
+    source TEXT NOT NULL,
+    status dispatch_outbox_status NOT NULL DEFAULT 'pending',
+    last_error TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    published_at TIMESTAMPTZ,
+    UNIQUE (attempt_id)
+);
+
+CREATE INDEX dispatch_outbox_pending_idx
+    ON dispatch_outbox (status, created_at)
+    WHERE status = 'pending';
 
 CREATE TABLE dead_letters (
     id UUID PRIMARY KEY,
