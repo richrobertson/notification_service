@@ -12,8 +12,8 @@ import (
 
 type Store interface {
 	ClaimPendingDispatchIntents(ctx context.Context, limit int, staleBefore time.Time) ([]store.PendingDispatchIntent, error)
-	MarkDispatchIntentPublished(ctx context.Context, intentID string) error
-	RecordDispatchIntentError(ctx context.Context, intentID, lastError string) error
+	MarkDispatchIntentPublished(ctx context.Context, intentID string, claimedAt time.Time) error
+	RecordDispatchIntentError(ctx context.Context, intentID string, claimedAt time.Time, lastError string) error
 	RecordAuditEvent(ctx context.Context, id, tenantID, actor, action, resourceType, resourceID string, metadata map[string]any) error
 }
 
@@ -47,6 +47,9 @@ func RunOnce(ctx context.Context, logger *slog.Logger, st Store, q Queue, softLi
 		return err
 	}
 	for _, item := range pending {
+		if item.Intent.ClaimedAt == nil {
+			return fmt.Errorf("claimed dispatch intent missing claimed_at: %s", item.Intent.ID)
+		}
 		job := queue.DispatchJob{
 			JobID:          generateID("job"),
 			NotificationID: item.Intent.NotificationID,
@@ -57,12 +60,12 @@ func RunOnce(ctx context.Context, logger *slog.Logger, st Store, q Queue, softLi
 		}
 		if err := q.EnqueueDispatch(ctx, job); err != nil {
 			logger.Error("dispatch intent publish failed; intent remains pending", slog.Any("error", err), slog.String("intent_id", item.Intent.ID), slog.String("attempt_id", item.Intent.AttemptID), slog.String("source", item.Intent.Source))
-			if recErr := st.RecordDispatchIntentError(ctx, item.Intent.ID, err.Error()); recErr != nil {
+			if recErr := st.RecordDispatchIntentError(ctx, item.Intent.ID, *item.Intent.ClaimedAt, err.Error()); recErr != nil {
 				logger.Error("failed to record dispatch intent error", slog.Any("error", recErr), slog.String("intent_id", item.Intent.ID), slog.String("attempt_id", item.Intent.AttemptID), slog.String("source", item.Intent.Source))
 			}
 			continue
 		}
-		if err := st.MarkDispatchIntentPublished(ctx, item.Intent.ID); err != nil {
+		if err := st.MarkDispatchIntentPublished(ctx, item.Intent.ID, *item.Intent.ClaimedAt); err != nil {
 			return err
 		}
 		_ = st.RecordAuditEvent(ctx, generateID("audit"), item.Intent.TenantID, "outbox-publisher", "dispatch_published", "dispatch_intent", item.Intent.ID, map[string]any{

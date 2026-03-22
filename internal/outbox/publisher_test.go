@@ -25,7 +25,9 @@ func (f *fakeStore) ClaimPendingDispatchIntents(_ context.Context, _ int, _ time
 	var out []store.PendingDispatchIntent
 	for _, item := range f.pending {
 		if !f.publishedByID[item.Intent.ID] && item.Intent.Status == "pending" {
+			claimedAt := time.Now().UTC()
 			item.Intent.Status = "publishing"
+			item.Intent.ClaimedAt = &claimedAt
 			out = append(out, item)
 			f.claimed = append(f.claimed, item.Intent.ID)
 		}
@@ -33,7 +35,7 @@ func (f *fakeStore) ClaimPendingDispatchIntents(_ context.Context, _ int, _ time
 	return out, nil
 }
 
-func (f *fakeStore) MarkDispatchIntentPublished(_ context.Context, intentID string) error {
+func (f *fakeStore) MarkDispatchIntentPublished(_ context.Context, intentID string, _ time.Time) error {
 	f.published = append(f.published, intentID)
 	if f.publishedByID == nil {
 		f.publishedByID = map[string]bool{}
@@ -42,7 +44,7 @@ func (f *fakeStore) MarkDispatchIntentPublished(_ context.Context, intentID stri
 	return nil
 }
 
-func (f *fakeStore) RecordDispatchIntentError(_ context.Context, intentID, lastError string) error {
+func (f *fakeStore) RecordDispatchIntentError(_ context.Context, intentID string, _ time.Time, lastError string) error {
 	f.recordedErrors = append(f.recordedErrors, intentID+":"+lastError)
 	return nil
 }

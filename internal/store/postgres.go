@@ -1613,7 +1613,7 @@ func (p *Postgres) ClaimPendingDispatchIntents(ctx context.Context, limit int, s
 	return intents, nil
 }
 
-func (p *Postgres) MarkDispatchIntentPublished(ctx context.Context, intentID string) error {
+func (p *Postgres) MarkDispatchIntentPublished(ctx context.Context, intentID string, claimedAt time.Time) error {
 	tx, err := p.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("mark dispatch intent published: begin tx: %w", err)
@@ -1624,9 +1624,9 @@ func (p *Postgres) MarkDispatchIntentPublished(ctx context.Context, intentID str
 	if err := scanDispatchIntent(tx.QueryRowContext(ctx, `
 		UPDATE dispatch_outbox
 		SET status = 'published', claimed_at = NULL, published_at = COALESCE(published_at, NOW()), last_error = NULL
-		WHERE id = $1 AND status = 'publishing'
+		WHERE id = $1 AND status = 'publishing' AND claimed_at = $2
 		RETURNING id, notification_id, attempt_id, tenant_id, channel, source, status, last_error, created_at, claimed_at, published_at
-	`, intentID), &intent); err != nil {
+	`, intentID, claimedAt), &intent); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			if err := scanDispatchIntent(tx.QueryRowContext(ctx, `
 				SELECT id, notification_id, attempt_id, tenant_id, channel, source, status, last_error, created_at, claimed_at, published_at
@@ -1673,12 +1673,12 @@ func (p *Postgres) MarkDispatchIntentPublished(ctx context.Context, intentID str
 	return nil
 }
 
-func (p *Postgres) RecordDispatchIntentError(ctx context.Context, intentID, lastError string) error {
+func (p *Postgres) RecordDispatchIntentError(ctx context.Context, intentID string, claimedAt time.Time, lastError string) error {
 	result, err := p.DB.ExecContext(ctx, `
 		UPDATE dispatch_outbox
 		SET status = 'pending', claimed_at = NULL, last_error = $2
-		WHERE id = $1 AND status = 'publishing'
-	`, intentID, lastError)
+		WHERE id = $1 AND status = 'publishing' AND claimed_at = $3
+	`, intentID, lastError, claimedAt)
 	if err != nil {
 		return fmt.Errorf("record dispatch intent error: %w", err)
 	}
