@@ -484,6 +484,10 @@ func (p *Postgres) CreateNotificationWithInitialDispatch(ctx context.Context, pa
 	if err := p.RecalculateNotificationStatus(ctx, notification.ID); err != nil {
 		return Notification{}, DeliveryAttempt{}, DispatchIntent{}, err
 	}
+	notification, err = p.GetNotificationByID(ctx, notification.ID)
+	if err != nil {
+		return Notification{}, DeliveryAttempt{}, DispatchIntent{}, fmt.Errorf("create notification with initial dispatch: reload notification: %w", err)
+	}
 
 	return notification, attempt, intent, nil
 }
@@ -1716,7 +1720,18 @@ func (p *Postgres) RecordDispatchIntentError(ctx context.Context, intentID, last
 		return fmt.Errorf("record dispatch intent error: rows affected: %w", err)
 	}
 	if rows == 0 {
-		return fmt.Errorf("record dispatch intent error: %w", ErrNotFound)
+		var status string
+		if err := p.DB.QueryRowContext(ctx, `
+			SELECT status
+			FROM dispatch_outbox
+			WHERE id = $1
+		`, intentID).Scan(&status); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("record dispatch intent error: %w", ErrNotFound)
+			}
+			return fmt.Errorf("record dispatch intent error: %w", err)
+		}
+		return fmt.Errorf("record dispatch intent error: %w", ErrInvalidStateTransition)
 	}
 	return nil
 }
