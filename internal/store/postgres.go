@@ -150,6 +150,8 @@ type CreateDispatchIntentParams struct {
 	TenantID       string
 	Channel        string
 	Source         string
+	Status         string
+	PublishedAt    *time.Time
 }
 
 type CreateNotificationDispatchParams struct {
@@ -765,6 +767,8 @@ func (p *Postgres) EnsureInitialAttempt(ctx context.Context, notificationID, cha
 		TenantID:       tenantID,
 		Channel:        attempt.Channel,
 		Source:         "initial",
+		Status:         publishedIntentStatus(attempt.DispatchEnqueuedAt),
+		PublishedAt:    attempt.DispatchEnqueuedAt,
 	})
 	if err != nil {
 		return DeliveryAttempt{}, DispatchIntent{}, err
@@ -865,9 +869,11 @@ func createDispatchIntentTx(ctx context.Context, querier interface {
 			attempt_id,
 			tenant_id,
 			channel,
-			source
+			source,
+			status,
+			published_at
 		)
-		VALUES ($1, $2, $3, $4, $5, $6)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		ON CONFLICT (attempt_id) DO NOTHING
 		RETURNING id, notification_id, attempt_id, tenant_id, channel, source, status, last_error, created_at, claimed_at, published_at
 	`
@@ -887,6 +893,8 @@ func createDispatchIntentTx(ctx context.Context, querier interface {
 		params.TenantID,
 		params.Channel,
 		params.Source,
+		dispatchIntentStatusOrDefault(params.Status),
+		params.PublishedAt,
 	), &intent); err != nil {
 		if !errors.Is(err, sql.ErrNoRows) {
 			return DispatchIntent{}, wrapStoreError("create dispatch intent", err)
@@ -896,6 +904,20 @@ func createDispatchIntentTx(ctx context.Context, querier interface {
 		}
 	}
 	return intent, nil
+}
+
+func dispatchIntentStatusOrDefault(status string) string {
+	if status == "" {
+		return "pending"
+	}
+	return status
+}
+
+func publishedIntentStatus(publishedAt *time.Time) string {
+	if publishedAt != nil {
+		return "published"
+	}
+	return "pending"
 }
 
 func (p *Postgres) LoadDeliveryJob(ctx context.Context, notificationID, attemptID string) (Notification, Template, DeliveryAttempt, error) {

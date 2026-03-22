@@ -57,7 +57,9 @@ func RunOnce(ctx context.Context, logger *slog.Logger, st Store, q Queue, softLi
 		}
 		if err := q.EnqueueDispatch(ctx, job); err != nil {
 			logger.Error("dispatch intent publish failed; intent remains pending", slog.Any("error", err), slog.String("intent_id", item.Intent.ID), slog.String("attempt_id", item.Intent.AttemptID), slog.String("source", item.Intent.Source))
-			_ = st.RecordDispatchIntentError(ctx, item.Intent.ID, err.Error())
+			if recErr := st.RecordDispatchIntentError(ctx, item.Intent.ID, err.Error()); recErr != nil {
+				logger.Error("failed to record dispatch intent error", slog.Any("error", recErr), slog.String("intent_id", item.Intent.ID), slog.String("attempt_id", item.Intent.AttemptID), slog.String("source", item.Intent.Source))
+			}
 			continue
 		}
 		if err := st.MarkDispatchIntentPublished(ctx, item.Intent.ID); err != nil {
