@@ -314,6 +314,7 @@ The roadmap remains deliberately pragmatic. The service still does **not** provi
 - generalized duplicate suppression across every possible crash boundary
 - fully pluggable provider ecosystems or marketplace-style provider routing
 - full RBAC/IAM or a full auth system
+- richer tenant/platform quotas and policy controls beyond the current Stage 9 model
 - an admin UI or operator console
 - distributed coordination or leader election for recovery/retry/outbox workers
 
