@@ -18,6 +18,7 @@ type fakeAPIStore struct {
 	deadLetters            map[string]store.DeadLetter
 	attempt                store.DeliveryAttempt
 	notification           store.Notification
+	cancelErr              error
 	ensureCalls            int
 	ensureInitialCalls     int
 	createAttemptCalls     int
@@ -38,6 +39,9 @@ type fakeAPIStore struct {
 	recalculateCalls       int
 	recalculateErr         error
 	recalculatedIDs        []string
+	resolvedPolicy         store.ResolvedDeliveryPolicy
+	policies               map[string]store.DeliveryPolicy
+	auditActions           []string
 }
 
 func (f *fakeAPIStore) CreateTenant(context.Context, store.CreateTenantParams) (store.Tenant, error) {
@@ -100,6 +104,15 @@ func (f *fakeAPIStore) CreateNotificationWithInitialDispatch(_ context.Context, 
 	}
 	f.createdAttempt = &attemptParams
 	f.createAttemptCalls++
+	f.notification = notification
+	if params.Notification.ScheduledFor != nil && params.Notification.ScheduledFor.After(time.Now().UTC()) {
+		f.createdIntent = nil
+		f.notification.Status = "scheduled"
+		f.notification.ScheduledFor = params.Notification.ScheduledFor
+		notification.Status = "scheduled"
+		notification.ScheduledFor = params.Notification.ScheduledFor
+		return notification, store.DeliveryAttempt{ID: params.AttemptID, NotificationID: notification.ID, Channel: params.Channel, AttemptNumber: 1, Status: "pending", EnqueueKind: "initial"}, store.DispatchIntent{}, nil
+	}
 	intentParams := store.CreateDispatchIntentParams{
 		ID:             params.IntentID,
 		NotificationID: notification.ID,
@@ -109,7 +122,6 @@ func (f *fakeAPIStore) CreateNotificationWithInitialDispatch(_ context.Context, 
 		Source:         "initial",
 	}
 	f.createdIntent = &intentParams
-	f.notification = notification
 	f.notification.Status = "processing"
 	f.recalculateCalls++
 	f.recalculatedIDs = append(f.recalculatedIDs, notification.ID)
@@ -211,6 +223,68 @@ func (f *fakeAPIStore) RecalculateNotificationStatus(_ context.Context, notifica
 	f.recalculatedIDs = append(f.recalculatedIDs, notificationID)
 	return f.recalculateErr
 }
+func (f *fakeAPIStore) CancelScheduledNotification(_ context.Context, notificationID string) (store.Notification, error) {
+	if f.cancelErr != nil {
+		return store.Notification{}, f.cancelErr
+	}
+	f.notification.ID = notificationID
+	now := time.Now().UTC()
+	f.notification.CancelledAt = &now
+	f.notification.Status = "cancelled"
+	return f.notification, nil
+}
+func (f *fakeAPIStore) RedriveNotification(_ context.Context, notificationID string) (store.PromotedScheduledNotification, error) {
+	intent := store.DispatchIntent{ID: "intent-redrive-" + notificationID, NotificationID: notificationID, AttemptID: "attempt-redrive-" + notificationID, TenantID: f.notification.TenantID, Channel: "email", Source: "manual_redrive", Status: "pending"}
+	return store.PromotedScheduledNotification{
+		Notification: f.notification,
+		Attempt:      store.DeliveryAttempt{ID: intent.AttemptID, NotificationID: notificationID, Channel: "email", AttemptNumber: 1, Status: "pending", EnqueueKind: "initial"},
+		Intent:       intent,
+	}, nil
+}
+func (f *fakeAPIStore) ResolveDeliveryPolicy(_ context.Context, tenantID, channel string) (store.ResolvedDeliveryPolicy, error) {
+	policy := f.resolvedPolicy
+	if policy.TenantID == "" {
+		policy.TenantID = tenantID
+	}
+	if policy.Channel == "" {
+		policy.Channel = channel
+	}
+	if !policy.SchedulingEnabled && !policy.ReplayAllowed && !policy.FailoverEnabled && !policy.Paused && policy.MaxAttemptsOverride == nil && policy.RetryBaseDelaySeconds == nil && policy.RetryMaxDelaySeconds == nil {
+		policy.SchedulingEnabled = true
+		policy.ReplayAllowed = true
+	}
+	return policy, nil
+}
+func (f *fakeAPIStore) ListDeliveryPolicies(context.Context) ([]store.DeliveryPolicy, error) {
+	var policies []store.DeliveryPolicy
+	for _, policy := range f.policies {
+		policies = append(policies, policy)
+	}
+	return policies, nil
+}
+func (f *fakeAPIStore) GetDeliveryPolicyByID(_ context.Context, id string) (store.DeliveryPolicy, error) {
+	if policy, ok := f.policies[id]; ok {
+		return policy, nil
+	}
+	return store.DeliveryPolicy{}, store.ErrNotFound
+}
+func (f *fakeAPIStore) UpsertDeliveryPolicy(_ context.Context, params store.UpsertDeliveryPolicyParams) (store.DeliveryPolicy, error) {
+	policy := store.DeliveryPolicy{ID: params.ID, TenantID: params.TenantID, Channel: params.Channel, Paused: params.Paused, FailoverEnabled: params.FailoverEnabled, SchedulingEnabled: params.SchedulingEnabled, ReplayAllowed: params.ReplayAllowed, MaxAttemptsOverride: params.MaxAttemptsOverride, RetryBaseDelaySeconds: params.RetryBaseDelaySeconds, RetryMaxDelaySeconds: params.RetryMaxDelaySeconds}
+	if f.policies == nil {
+		f.policies = map[string]store.DeliveryPolicy{}
+	}
+	f.policies[params.ID] = policy
+	return policy, nil
+}
+func (f *fakeAPIStore) SetDeliveryPolicyPaused(_ context.Context, id string, paused bool) (store.DeliveryPolicy, error) {
+	policy, ok := f.policies[id]
+	if !ok {
+		return store.DeliveryPolicy{}, store.ErrNotFound
+	}
+	policy.Paused = &paused
+	f.policies[id] = policy
+	return policy, nil
+}
 func (f *fakeAPIStore) GetNotificationByID(context.Context, string) (store.Notification, error) {
 	return f.notification, nil
 }
@@ -236,7 +310,8 @@ func (f *fakeAPIStore) ListDeliveryAttemptsByNotificationID(_ context.Context, n
 	}
 	return []store.DeliveryAttempt{}, nil
 }
-func (f *fakeAPIStore) RecordAuditEvent(context.Context, string, string, string, string, string, string, map[string]any) error {
+func (f *fakeAPIStore) RecordAuditEvent(_ context.Context, _ string, _ string, _ string, action string, _ string, _ string, _ map[string]any) error {
+	f.auditActions = append(f.auditActions, action)
 	return nil
 }
 

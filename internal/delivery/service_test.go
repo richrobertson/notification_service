@@ -12,24 +12,28 @@ import (
 )
 
 type stubStore struct {
-	notification     store.Notification
-	template         store.Template
-	attempt          store.DeliveryAttempt
-	loadErr          error
-	inProgressErr    error
-	sentErr          error
-	failedErr        error
-	scheduleRetryErr error
-	deadLetterErr    error
-	insertDeadErr    error
-	inProgressCall   int
-	failedMsg        string
-	scheduledMsg     string
-	scheduledAt      *time.Time
-	deadLetterMsg    string
-	insertedDead     *store.DeadLetter
-	auditActions     []string
-	auditTenantIDs   map[string]string
+	notification      store.Notification
+	template          store.Template
+	attempt           store.DeliveryAttempt
+	loadErr           error
+	inProgressErr     error
+	updateProviderErr error
+	sentErr           error
+	failedErr         error
+	scheduleRetryErr  error
+	deadLetterErr     error
+	insertDeadErr     error
+	inProgressCall    int
+	failedMsg         string
+	scheduledMsg      string
+	scheduledAt       *time.Time
+	deadLetterMsg     string
+	insertedDead      *store.DeadLetter
+	auditActions      []string
+	auditTenantIDs    map[string]string
+	resolvedPolicy    store.ResolvedDeliveryPolicy
+	providerUsed      string
+	failoverUsed      bool
 }
 
 func (s *stubStore) LoadDeliveryJob(context.Context, string, string) (store.Notification, store.Template, store.DeliveryAttempt, error) {
@@ -44,6 +48,19 @@ func (s *stubStore) MarkAttemptInProgress(context.Context, string) error {
 }
 func (s *stubStore) GetDeliveryAttemptByID(context.Context, string) (store.DeliveryAttempt, error) {
 	return s.attempt, nil
+}
+func (s *stubStore) ResolveDeliveryPolicy(context.Context, string, string) (store.ResolvedDeliveryPolicy, error) {
+	policy := s.resolvedPolicy
+	if !policy.SchedulingEnabled && !policy.ReplayAllowed && !policy.FailoverEnabled && !policy.Paused && policy.MaxAttemptsOverride == nil && policy.RetryBaseDelaySeconds == nil && policy.RetryMaxDelaySeconds == nil {
+		policy.SchedulingEnabled = true
+		policy.ReplayAllowed = true
+	}
+	return policy, nil
+}
+func (s *stubStore) UpdateAttemptProvider(_ context.Context, _ string, provider string, failoverUsed bool) error {
+	s.providerUsed = provider
+	s.failoverUsed = failoverUsed
+	return s.updateProviderErr
 }
 func (s *stubStore) MarkAttemptSent(context.Context, string, *string) error { return s.sentErr }
 func (s *stubStore) MarkAttemptFailed(context.Context, string, string) error {
@@ -93,7 +110,7 @@ func (s stubEmailSender) Send(context.Context, EmailRequest) error { return s.er
 
 func newTestService(t *testing.T, st *stubStore) *Service {
 	t.Helper()
-	svc, err := NewService(st, stubWebhookSender{}, stubEmailSender{}, RetryPolicy{MaxAttempts: 3, BaseDelay: 5 * time.Second, MaxDelay: time.Minute, ExponentialBackoff: true, Jitter: 0, Now: func() time.Time { return time.Unix(10, 0).UTC() }, IDGenerator: func() string { return "dead-1" }, RandSource: rand.New(rand.NewSource(1))})
+	svc, err := NewService(st, stubWebhookSender{}, stubWebhookSender{}, stubEmailSender{}, stubEmailSender{}, RetryPolicy{MaxAttempts: 3, BaseDelay: 5 * time.Second, MaxDelay: time.Minute, ExponentialBackoff: true, Jitter: 0, Now: func() time.Time { return time.Unix(10, 0).UTC() }, IDGenerator: func() string { return "dead-1" }, RandSource: rand.New(rand.NewSource(1))})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -103,7 +120,7 @@ func newTestService(t *testing.T, st *stubStore) *Service {
 func TestServiceSchedulesRetryOnTransientEmailFailure(t *testing.T) {
 	to := "to@example.test"
 	st := &stubStore{notification: store.Notification{ID: "notif-1", RecipientEmail: &to, Variables: map[string]any{"name": "Ada"}}, template: store.Template{Name: "welcome", Body: "hello {{.name}}"}, attempt: store.DeliveryAttempt{ID: "attempt-1", AttemptNumber: 1}}
-	svc, err := NewService(st, stubWebhookSender{}, stubEmailSender{err: &RetryableError{Err: errors.New("smtp down")}}, RetryPolicy{MaxAttempts: 3, BaseDelay: 5 * time.Second, MaxDelay: time.Minute, ExponentialBackoff: true, Now: func() time.Time { return time.Unix(10, 0).UTC() }, IDGenerator: func() string { return "dead-1" }, RandSource: rand.New(rand.NewSource(1))})
+	svc, err := NewService(st, stubWebhookSender{}, stubWebhookSender{}, stubEmailSender{err: &RetryableError{Err: errors.New("smtp down")}}, stubEmailSender{}, RetryPolicy{MaxAttempts: 3, BaseDelay: 5 * time.Second, MaxDelay: time.Minute, ExponentialBackoff: true, Now: func() time.Time { return time.Unix(10, 0).UTC() }, IDGenerator: func() string { return "dead-1" }, RandSource: rand.New(rand.NewSource(1))})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,7 +160,7 @@ func TestServiceDoesNotScheduleRetryOnTerminalFailure(t *testing.T) {
 func TestServiceDeadLettersWhenRetryBudgetExhausted(t *testing.T) {
 	to := "to@example.test"
 	st := &stubStore{notification: store.Notification{ID: "notif-1", RecipientEmail: &to, Variables: map[string]any{"name": "Ada"}}, template: store.Template{Name: "welcome", Body: "hello {{.name}}"}, attempt: store.DeliveryAttempt{ID: "attempt-3", AttemptNumber: 3}}
-	svc, err := NewService(st, stubWebhookSender{}, stubEmailSender{err: &RetryableError{Err: errors.New("smtp down")}}, RetryPolicy{MaxAttempts: 3, BaseDelay: 5 * time.Second, MaxDelay: time.Minute, ExponentialBackoff: true, Now: time.Now, IDGenerator: func() string { return "dead-1" }, RandSource: rand.New(rand.NewSource(1))})
+	svc, err := NewService(st, stubWebhookSender{}, stubWebhookSender{}, stubEmailSender{err: &RetryableError{Err: errors.New("smtp down")}}, stubEmailSender{}, RetryPolicy{MaxAttempts: 3, BaseDelay: 5 * time.Second, MaxDelay: time.Minute, ExponentialBackoff: true, Now: time.Now, IDGenerator: func() string { return "dead-1" }, RandSource: rand.New(rand.NewSource(1))})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -198,5 +215,105 @@ func TestServiceSuppressesDuplicateWhileInProgress(t *testing.T) {
 	}
 	if result.Outcome != OutcomeDuplicateSuppressed {
 		t.Fatalf("Outcome=%v", result.Outcome)
+	}
+}
+
+func TestServiceUsesWebhookFailoverOnRetryableError(t *testing.T) {
+	url := "https://primary.example.test"
+	secondary := "https://secondary.example.test"
+	st := &stubStore{
+		notification:   store.Notification{ID: "notif-1", TenantID: "tenant-1", RecipientWebhookURL: &url, SecondaryWebhookURL: &secondary, Variables: map[string]any{"name": "Ada"}},
+		template:       store.Template{Body: "hello {{.name}}"},
+		attempt:        store.DeliveryAttempt{ID: "attempt-1", NotificationID: "notif-1", AttemptNumber: 1},
+		resolvedPolicy: store.ResolvedDeliveryPolicy{FailoverEnabled: true, SchedulingEnabled: true, ReplayAllowed: true},
+	}
+	svc, err := NewService(st, stubWebhookSender{err: &RetryableError{Err: errors.New("primary down")}}, stubWebhookSender{providerID: "secondary-req"}, stubEmailSender{}, stubEmailSender{}, RetryPolicy{MaxAttempts: 3, BaseDelay: 5 * time.Second, MaxDelay: time.Minute, Now: time.Now, IDGenerator: func() string { return "audit-1" }, RandSource: rand.New(rand.NewSource(1))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := svc.ProcessWebhook(context.Background(), queue.DispatchJob{AttemptID: "attempt-1", NotificationID: "notif-1", TenantID: "tenant-1", Channel: "webhook"})
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if result.Outcome != OutcomeSent {
+		t.Fatalf("Outcome=%v", result.Outcome)
+	}
+	if st.providerUsed != "webhook_secondary" || !st.failoverUsed {
+		t.Fatalf("provider=%q failover=%v", st.providerUsed, st.failoverUsed)
+	}
+	if got := st.auditTenantIDs["provider_failover_used"]; got != "tenant-1" {
+		t.Fatalf("provider_failover_used tenant_id=%q", got)
+	}
+}
+
+func TestServiceUsesEmailFailoverOnRetryableError(t *testing.T) {
+	to := "to@example.test"
+	st := &stubStore{
+		notification:   store.Notification{ID: "notif-1", TenantID: "tenant-1", RecipientEmail: &to, Variables: map[string]any{"name": "Ada"}},
+		template:       store.Template{Name: "welcome", Body: "hello {{.name}}"},
+		attempt:        store.DeliveryAttempt{ID: "attempt-1", NotificationID: "notif-1", AttemptNumber: 1},
+		resolvedPolicy: store.ResolvedDeliveryPolicy{FailoverEnabled: true, SchedulingEnabled: true, ReplayAllowed: true},
+	}
+	svc, err := NewService(st, stubWebhookSender{}, stubWebhookSender{}, stubEmailSender{err: &RetryableError{Err: errors.New("smtp primary down")}}, stubEmailSender{}, RetryPolicy{MaxAttempts: 3, BaseDelay: 5 * time.Second, MaxDelay: time.Minute, Now: time.Now, IDGenerator: func() string { return "audit-1" }, RandSource: rand.New(rand.NewSource(1))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := svc.ProcessEmail(context.Background(), queue.DispatchJob{AttemptID: "attempt-1", NotificationID: "notif-1", TenantID: "tenant-1", Channel: "email"})
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if result.Outcome != OutcomeSent {
+		t.Fatalf("Outcome=%v", result.Outcome)
+	}
+	if st.providerUsed != "smtp_secondary" || !st.failoverUsed {
+		t.Fatalf("provider=%q failover=%v", st.providerUsed, st.failoverUsed)
+	}
+}
+
+func TestServiceDoesNotFailSentDeliveryWhenProviderMetadataUpdateFails(t *testing.T) {
+	to := "to@example.test"
+	st := &stubStore{
+		notification:      store.Notification{ID: "notif-1", TenantID: "tenant-1", RecipientEmail: &to, Variables: map[string]any{"name": "Ada"}},
+		template:          store.Template{Name: "welcome", Body: "hello {{.name}}"},
+		attempt:           store.DeliveryAttempt{ID: "attempt-1", NotificationID: "notif-1", AttemptNumber: 1},
+		resolvedPolicy:    store.ResolvedDeliveryPolicy{SchedulingEnabled: true, ReplayAllowed: true},
+		updateProviderErr: errors.New("transient metadata write failure"),
+	}
+	svc, err := NewService(st, stubWebhookSender{}, stubWebhookSender{}, stubEmailSender{}, stubEmailSender{}, RetryPolicy{MaxAttempts: 3, BaseDelay: 5 * time.Second, MaxDelay: time.Minute, Now: time.Now, IDGenerator: func() string { return "audit-1" }, RandSource: rand.New(rand.NewSource(1))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := svc.ProcessEmail(context.Background(), queue.DispatchJob{AttemptID: "attempt-1", NotificationID: "notif-1", TenantID: "tenant-1", Channel: "email"})
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if result.Outcome != OutcomeSent {
+		t.Fatalf("Outcome=%v", result.Outcome)
+	}
+	if st.providerUsed != "smtp_primary" || st.failoverUsed {
+		t.Fatalf("provider=%q failover=%v", st.providerUsed, st.failoverUsed)
+	}
+}
+
+func TestServiceDoesNotFailoverOnTerminalValidationError(t *testing.T) {
+	st := &stubStore{
+		notification:   store.Notification{ID: "notif-1", TenantID: "tenant-1", Variables: map[string]any{"name": "Ada"}},
+		template:       store.Template{Body: "hello {{.name}}"},
+		attempt:        store.DeliveryAttempt{ID: "attempt-1", NotificationID: "notif-1", AttemptNumber: 1},
+		resolvedPolicy: store.ResolvedDeliveryPolicy{FailoverEnabled: true, SchedulingEnabled: true, ReplayAllowed: true},
+	}
+	svc, err := NewService(st, stubWebhookSender{providerID: "should-not-run"}, stubWebhookSender{providerID: "backup-should-not-run"}, stubEmailSender{}, stubEmailSender{}, RetryPolicy{MaxAttempts: 3, BaseDelay: 5 * time.Second, MaxDelay: time.Minute, Now: time.Now, IDGenerator: func() string { return "audit-1" }, RandSource: rand.New(rand.NewSource(1))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := svc.ProcessWebhook(context.Background(), queue.DispatchJob{AttemptID: "attempt-1", NotificationID: "notif-1", TenantID: "tenant-1", Channel: "webhook"})
+	if !IsTerminal(err) {
+		t.Fatalf("expected terminal error, got %v", err)
+	}
+	if result.Outcome != OutcomeFailedTerminal {
+		t.Fatalf("Outcome=%v", result.Outcome)
+	}
+	if st.providerUsed != "" || st.failoverUsed {
+		t.Fatalf("provider=%q failover=%v", st.providerUsed, st.failoverUsed)
 	}
 }

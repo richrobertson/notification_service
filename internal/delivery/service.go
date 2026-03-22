@@ -19,6 +19,8 @@ import (
 type NotificationStore interface {
 	LoadDeliveryJob(ctx context.Context, notificationID, attemptID string) (store.Notification, store.Template, store.DeliveryAttempt, error)
 	GetDeliveryAttemptByID(ctx context.Context, attemptID string) (store.DeliveryAttempt, error)
+	ResolveDeliveryPolicy(ctx context.Context, tenantID, channel string) (store.ResolvedDeliveryPolicy, error)
+	UpdateAttemptProvider(ctx context.Context, attemptID, provider string, failoverUsed bool) error
 	MarkAttemptInProgress(ctx context.Context, attemptID string) error
 	MarkAttemptSent(ctx context.Context, attemptID string, providerMessageID *string) error
 	MarkAttemptFailed(ctx context.Context, attemptID string, lastError string) error
@@ -96,13 +98,15 @@ func MaybeRetryable(err error) error {
 type Service struct {
 	store         NotificationStore
 	webhookSender webhookSender
+	webhookBackup webhookSender
 	emailSender   emailSender
+	emailBackup   emailSender
 	policy        RetryPolicy
 	sentCounter   metric.Int64Counter
 	failCounter   metric.Int64Counter
 }
 
-func NewService(store NotificationStore, webhookSender webhookSender, emailSender emailSender, policy RetryPolicy) (*Service, error) {
+func NewService(store NotificationStore, webhookSender webhookSender, webhookBackup webhookSender, emailSender emailSender, emailBackup emailSender, policy RetryPolicy) (*Service, error) {
 	if policy.MaxAttempts <= 0 {
 		policy.MaxAttempts = 3
 	}
@@ -133,50 +137,61 @@ func NewService(store NotificationStore, webhookSender webhookSender, emailSende
 	if err != nil {
 		return nil, fmt.Errorf("create failed counter: %w", err)
 	}
-	return &Service{store: store, webhookSender: webhookSender, emailSender: emailSender, policy: policy, sentCounter: sentCounter, failCounter: failCounter}, nil
+	return &Service{store: store, webhookSender: webhookSender, webhookBackup: webhookBackup, emailSender: emailSender, emailBackup: emailBackup, policy: policy, sentCounter: sentCounter, failCounter: failCounter}, nil
 }
 
 func (s *Service) ProcessWebhook(ctx context.Context, job queue.DispatchJob) (Result, error) {
-	return s.process(ctx, job, func(ctx context.Context, notification store.Notification, template store.Template) (*string, error) {
+	return s.process(ctx, job, func(ctx context.Context, notification store.Notification, template store.Template, policy store.ResolvedDeliveryPolicy) (*string, string, bool, error) {
 		if notification.RecipientWebhookURL == nil || strings.TrimSpace(*notification.RecipientWebhookURL) == "" {
-			return nil, terminalErrorf("recipient_webhook_url is required")
+			return nil, "", false, terminalErrorf("recipient_webhook_url is required")
 		}
 		body, err := RenderTemplate(template.Body, notification.Variables)
 		if err != nil {
-			return nil, &TerminalError{Err: err}
+			return nil, "", false, &TerminalError{Err: err}
 		}
 		providerID, err := s.webhookSender.Send(ctx, WebhookRequest{URL: *notification.RecipientWebhookURL, Body: body, AttemptID: job.AttemptID, NotificationID: notification.ID})
 		if err != nil {
-			return nil, MaybeRetryable(err)
+			if IsRetryable(MaybeRetryable(err)) && policy.FailoverEnabled && s.webhookBackup != nil && notification.SecondaryWebhookURL != nil && strings.TrimSpace(*notification.SecondaryWebhookURL) != "" {
+				backupProviderID, backupErr := s.webhookBackup.Send(ctx, WebhookRequest{URL: *notification.SecondaryWebhookURL, Body: body, AttemptID: job.AttemptID, NotificationID: notification.ID})
+				if backupErr == nil {
+					return stringPtrOrNil(backupProviderID), "webhook_secondary", true, nil
+				}
+			}
+			return nil, "webhook_primary", false, MaybeRetryable(err)
 		}
 		if providerID == "" {
-			return nil, nil
+			return nil, "webhook_primary", false, nil
 		}
-		return &providerID, nil
+		return &providerID, "webhook_primary", false, nil
 	})
 }
 
 func (s *Service) ProcessEmail(ctx context.Context, job queue.DispatchJob) (Result, error) {
-	return s.process(ctx, job, func(ctx context.Context, notification store.Notification, template store.Template) (*string, error) {
+	return s.process(ctx, job, func(ctx context.Context, notification store.Notification, template store.Template, policy store.ResolvedDeliveryPolicy) (*string, string, bool, error) {
 		if notification.RecipientEmail == nil || strings.TrimSpace(*notification.RecipientEmail) == "" {
-			return nil, terminalErrorf("recipient_email is required")
+			return nil, "", false, terminalErrorf("recipient_email is required")
 		}
 		body, err := RenderTemplate(template.Body, notification.Variables)
 		if err != nil {
-			return nil, &TerminalError{Err: err}
+			return nil, "", false, &TerminalError{Err: err}
 		}
 		subject := strings.TrimSpace(template.Name)
 		if subject == "" {
 			subject = fmt.Sprintf("notification %s", notification.ID)
 		}
 		if err := s.emailSender.Send(ctx, EmailRequest{To: *notification.RecipientEmail, Subject: subject, Body: body, AttemptID: job.AttemptID, NotificationID: notification.ID}); err != nil {
-			return nil, MaybeRetryable(err)
+			if IsRetryable(MaybeRetryable(err)) && policy.FailoverEnabled && s.emailBackup != nil {
+				if backupErr := s.emailBackup.Send(ctx, EmailRequest{To: *notification.RecipientEmail, Subject: subject, Body: body, AttemptID: job.AttemptID, NotificationID: notification.ID}); backupErr == nil {
+					return nil, "smtp_secondary", true, nil
+				}
+			}
+			return nil, "smtp_primary", false, MaybeRetryable(err)
 		}
-		return nil, nil
+		return nil, "smtp_primary", false, nil
 	})
 }
 
-func (s *Service) process(ctx context.Context, job queue.DispatchJob, sender func(context.Context, store.Notification, store.Template) (*string, error)) (Result, error) {
+func (s *Service) process(ctx context.Context, job queue.DispatchJob, sender func(context.Context, store.Notification, store.Template, store.ResolvedDeliveryPolicy) (*string, string, bool, error)) (Result, error) {
 	ctx, span := otel.Tracer("notification-platform/delivery").Start(ctx, "delivery.process")
 	defer span.End()
 	span.SetAttributes(attribute.String("job.id", job.JobID), attribute.String("notification.id", job.NotificationID), attribute.String("attempt.id", job.AttemptID), attribute.String("channel", job.Channel))
@@ -198,23 +213,39 @@ func (s *Service) process(ctx context.Context, job queue.DispatchJob, sender fun
 	if err != nil {
 		return Result{}, err
 	}
-	providerID, err := sender(ctx, notification, template)
+	resolvedPolicy, err := s.store.ResolveDeliveryPolicy(ctx, notification.TenantID, job.Channel)
+	if err != nil {
+		return Result{}, err
+	}
+	providerID, providerName, failoverUsed, err := sender(ctx, notification, template, resolvedPolicy)
 	if err == nil {
 		if err := s.store.MarkAttemptSent(ctx, job.AttemptID, providerID); err != nil {
 			return Result{}, err
+		}
+		if providerName != "" {
+			if updateErr := s.store.UpdateAttemptProvider(ctx, job.AttemptID, providerName, failoverUsed); updateErr != nil {
+				slog.Default().Warn("failed to update attempt provider metadata", slog.String("attempt_id", job.AttemptID), slog.String("notification_id", job.NotificationID), slog.String("channel", job.Channel), slog.String("provider_name", providerName), slog.Bool("failover_used", failoverUsed), slog.Any("error", updateErr))
+			}
+		}
+		if failoverUsed {
+			_ = s.store.RecordAuditEvent(ctx, s.policy.IDGenerator(), job.TenantID, "worker", "provider_failover_used", "delivery_attempt", job.AttemptID, map[string]any{"notification_id": job.NotificationID, "channel": job.Channel, "provider": providerName})
 		}
 		_ = s.store.RecordAuditEvent(ctx, s.policy.IDGenerator(), job.TenantID, "worker", "attempt_sent", "delivery_attempt", job.AttemptID, map[string]any{"notification_id": job.NotificationID, "channel": job.Channel})
 		s.recordSent(ctx, job.Channel)
 		return Result{Outcome: OutcomeSent}, nil
 	}
 	if IsRetryable(err) {
-		return s.handleRetryable(ctx, notification, attempt, job.Channel, err)
+		return s.handleRetryable(ctx, notification, attempt, job.Channel, resolvedPolicy, err)
 	}
 	return s.failTerminal(ctx, notification.TenantID, attempt.ID, job.Channel, err)
 }
 
-func (s *Service) handleRetryable(ctx context.Context, notification store.Notification, attempt store.DeliveryAttempt, channel string, cause error) (Result, error) {
-	if attempt.AttemptNumber >= s.policy.MaxAttempts {
+func (s *Service) handleRetryable(ctx context.Context, notification store.Notification, attempt store.DeliveryAttempt, channel string, resolvedPolicy store.ResolvedDeliveryPolicy, cause error) (Result, error) {
+	maxAttempts := s.policy.MaxAttempts
+	if resolvedPolicy.MaxAttemptsOverride != nil && *resolvedPolicy.MaxAttemptsOverride > 0 {
+		maxAttempts = *resolvedPolicy.MaxAttemptsOverride
+	}
+	if attempt.AttemptNumber >= maxAttempts {
 		if err := s.store.MarkAttemptDeadLettered(ctx, attempt.ID, cause.Error()); err != nil {
 			return Result{}, err
 		}
@@ -226,7 +257,7 @@ func (s *Service) handleRetryable(ctx context.Context, notification store.Notifi
 		s.failCounter.Add(ctx, 1, metric.WithAttributes(attribute.String("channel", channel), attribute.String("final_state", "dead_lettered")))
 		return Result{Outcome: OutcomeDeadLettered, DeadLetter: &dl}, cause
 	}
-	nextRetryAt := s.nextRetryAt(channel, attempt.AttemptNumber)
+	nextRetryAt := s.nextRetryAt(channel, attempt.AttemptNumber, resolvedPolicy)
 	if err := s.store.ScheduleRetry(ctx, attempt.ID, cause.Error(), nextRetryAt); err != nil {
 		return Result{}, err
 	}
@@ -247,13 +278,20 @@ func (s *Service) failTerminal(ctx context.Context, tenantID, attemptID, channel
 	return Result{Outcome: OutcomeFailedTerminal}, cause
 }
 
-func (s *Service) nextRetryAt(channel string, attemptNumber int) time.Time {
+func (s *Service) nextRetryAt(channel string, attemptNumber int, resolvedPolicy store.ResolvedDeliveryPolicy) time.Time {
 	delay := s.policy.BaseDelay
+	maxDelay := s.policy.MaxDelay
+	if resolvedPolicy.RetryBaseDelaySeconds != nil && *resolvedPolicy.RetryBaseDelaySeconds > 0 {
+		delay = time.Duration(*resolvedPolicy.RetryBaseDelaySeconds) * time.Second
+	}
+	if resolvedPolicy.RetryMaxDelaySeconds != nil && *resolvedPolicy.RetryMaxDelaySeconds > 0 {
+		maxDelay = time.Duration(*resolvedPolicy.RetryMaxDelaySeconds) * time.Second
+	}
 	if s.policy.ExponentialBackoff {
 		for i := 1; i < attemptNumber; i++ {
 			delay *= 2
-			if delay >= s.policy.MaxDelay {
-				delay = s.policy.MaxDelay
+			if delay >= maxDelay {
+				delay = maxDelay
 				break
 			}
 		}
@@ -283,6 +321,13 @@ func (s *Service) nextRetryAt(channel string, attemptNumber int) time.Time {
 		}
 	}
 	return s.policy.Now().Add(delay)
+}
+
+func stringPtrOrNil(v string) *string {
+	if strings.TrimSpace(v) == "" {
+		return nil
+	}
+	return &v
 }
 
 func (s *Service) recordSent(ctx context.Context, channel string) {

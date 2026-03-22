@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-`notification_service` is a runnable Go notification platform foundation. The repository is currently through Stage 8, with PostgreSQL as the authoritative source of truth for durable dispatch publication and Redis serving as the execution transport.
+`notification_service` is a runnable Go notification platform foundation. The repository is currently through Stage 9, with PostgreSQL as the authoritative source of truth for durable dispatch publication, Redis serving as the execution transport, and explicit delivery policy controls layered on top.
 
 See [docs/roadmap.md](docs/roadmap.md) for current milestone status and next steps.
 
@@ -31,7 +31,7 @@ The service now provides:
 
 ## Current Milestone Status
 
-The repository is in a stabilized post-Stage-8 state. Stages 3 through 8 are complete, and the next major milestone is Stage 9.
+The repository is in a stabilized post-Stage-9 state. Stages 3 through 9 are complete, and the next major milestone is Stage 10.
 
 Current baseline includes:
 
@@ -66,6 +66,11 @@ Current baseline includes:
   - `notify:dispatch:processing`
   - `notify:dispatch:webhook:processing`
   - `notify:dispatch:email:processing`
+- future scheduled notification creation and durable promotion via `cmd/scheduler`
+- delivery policy controls for tenant/channel pause, replay gating, scheduling gating, failover enablement, and retry overrides
+- manual cancellation for scheduled notifications before promotion
+- manual redrive of not-yet-promoted notification work
+- narrow provider failover for webhook and SMTP delivery, with audit visibility
 
 ## Delivery Semantics
 
@@ -97,6 +102,17 @@ The current retry model is:
 7. once the retry budget is exhausted, the final attempt is marked `dead_lettered` and a `dead_letters` row is inserted
 
 Replay uses the same model: the replay attempt is created durably first, the dead letter is only marked replayed after the outbox publisher successfully enqueues Redis work, and failed publish work remains recoverable from PostgreSQL. Initial API attempts and retry attempts now follow the same path, so Redis is treated as execution transport rather than the source of truth for "what still needs dispatch publication." Duplicate Redis jobs are still possible underneath, but Stage 6 attempt-level idempotency and duplicate suppression still protect execution.
+
+## Stage 9 Delivery Controls
+
+- Notifications may be created with `scheduled_for`; they stay durable in PostgreSQL and are promoted later by `cmd/scheduler`.
+- Delivery policies are durable and explicit, with predictable tenant/channel override behavior on top of system defaults.
+- Policy controls include pause/resume, scheduling enablement, replay enablement, failover enablement, and retry overrides.
+- Paused work is not discarded; scheduled promotion and outbox publication both respect paused policy state.
+- Manual operator controls now distinguish replay of dead letters from redrive of scheduled or deferred notification work.
+- Webhook delivery supports primary plus secondary endpoint fallback when failover is enabled and the failure is retryable.
+- Email delivery supports primary plus secondary SMTP fallback when failover is enabled and the failure is retryable.
+- Failover remains visible through audit events and attempt inspection rather than being hidden behind a generalized provider abstraction.
 
 ## Dispatch Outbox Lite
 
@@ -183,6 +199,12 @@ Run the outbox publisher:
 go run ./cmd/outbox_publisher
 ```
 
+Run the scheduler/promoter:
+
+```bash
+go run ./cmd/scheduler
+```
+
 ## Default Local Configuration
 
 - HTTP port: `8080`
@@ -194,6 +216,7 @@ go run ./cmd/outbox_publisher
 - retry max delay: `1m`
 - retry worker poll interval: `2s`
 - outbox publisher poll interval: `2s`
+- scheduler poll interval: `2s`
 - processing recovery interval: `30s`
 - Mailpit SMTP host/port: `localhost:1025`
 
@@ -221,7 +244,16 @@ New in Stage 5:
 - `RETRY_JITTER`
 - `RETRY_WORKER_POLL_INTERVAL`
 - `OUTBOX_POLL_INTERVAL`
+- `SCHEDULER_POLL_INTERVAL`
 - `PROCESSING_RECOVERY_INTERVAL`
+- `SMTP_SECONDARY_HOST`
+- `SMTP_SECONDARY_PORT`
+- `SMTP_SECONDARY_USERNAME`
+- `SMTP_SECONDARY_PASSWORD`
+- `SMTP_SECONDARY_FROM`
+- `SMTP_SECONDARY_USE_TLS`
+- `SMTP_SECONDARY_STARTTLS`
+- `SMTP_SECONDARY_INSECURE_SKIP_VERIFY`
 
 ## Remaining Intentional Limitations
 
@@ -229,17 +261,16 @@ The roadmap remains deliberately pragmatic. The service still does **not** provi
 
 - exactly-once delivery semantics
 - a full generalized outbox or event platform
+- a generalized workflow or orchestration engine
 - CDC, WAL tailing, or Debezium-style publication
 - advanced cross-region or multi-region replication guarantees
 - generalized duplicate suppression across every possible crash boundary
-- rich multi-channel fanout semantics
-- provider failover
-- advanced scheduling beyond bounded retry delays
+- fully pluggable provider ecosystems or marketplace-style provider routing
 - rate limiting / quota enforcement beyond whatever already exists in the broader codebase
-- an operator UI
+- an admin UI or operator console
 - distributed coordination or leader election for recovery/retry/outbox workers
 
-Those remain future milestones, with the next major gap centered on advanced delivery policy and broader platform controls rather than basic durability or correctness.
+Those remain future milestones, with the next major gap centered on production/platform polish rather than basic durability, policy control, or survivability under load.
 
 ## Stage 7: Backpressure, rate limiting, and tenant isolation
 

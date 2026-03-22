@@ -53,7 +53,11 @@ type Notification struct {
 	Status              string         `json:"status"`
 	RecipientEmail      *string        `json:"recipient_email"`
 	RecipientWebhookURL *string        `json:"recipient_webhook_url"`
+	SecondaryWebhookURL *string        `json:"secondary_webhook_url,omitempty"`
 	Variables           map[string]any `json:"variables"`
+	ScheduledFor        *time.Time     `json:"scheduled_for,omitempty"`
+	PromotedAt          *time.Time     `json:"promoted_at,omitempty"`
+	CancelledAt         *time.Time     `json:"cancelled_at,omitempty"`
 	SubmittedAt         time.Time      `json:"submitted_at"`
 	UpdatedAt           time.Time      `json:"updated_at"`
 }
@@ -75,6 +79,8 @@ type DeliveryAttempt struct {
 	FailedAt           *time.Time `json:"failed_at"`
 	DispatchEnqueuedAt *time.Time `json:"dispatch_enqueued_at"`
 	EnqueueKind        string     `json:"enqueue_kind"`
+	ProviderUsed       *string    `json:"provider_used,omitempty"`
+	FailoverUsed       bool       `json:"failover_used"`
 	DeadLetterID       *string    `json:"dead_letter_id,omitempty"`
 	ReplayOfDeadLetter *string    `json:"replay_of_dead_letter_id,omitempty"`
 	CreatedAt          time.Time  `json:"created_at"`
@@ -128,7 +134,9 @@ type CreateNotificationParams struct {
 	IdempotencyKey      *string
 	RecipientEmail      *string
 	RecipientWebhookURL *string
+	SecondaryWebhookURL *string
 	Variables           map[string]any
+	ScheduledFor        *time.Time
 }
 
 type CreateDeliveryAttemptParams struct {
@@ -159,6 +167,52 @@ type CreateNotificationDispatchParams struct {
 	Channel      string
 	AttemptID    string
 	IntentID     string
+}
+
+type DeliveryPolicy struct {
+	ID                    string    `json:"id"`
+	TenantID              *string   `json:"tenant_id,omitempty"`
+	Channel               *string   `json:"channel,omitempty"`
+	Paused                *bool     `json:"paused,omitempty"`
+	FailoverEnabled       *bool     `json:"failover_enabled,omitempty"`
+	SchedulingEnabled     *bool     `json:"scheduling_enabled,omitempty"`
+	ReplayAllowed         *bool     `json:"replay_allowed,omitempty"`
+	MaxAttemptsOverride   *int      `json:"max_attempts_override,omitempty"`
+	RetryBaseDelaySeconds *int      `json:"retry_base_delay_seconds,omitempty"`
+	RetryMaxDelaySeconds  *int      `json:"retry_max_delay_seconds,omitempty"`
+	CreatedAt             time.Time `json:"created_at"`
+	UpdatedAt             time.Time `json:"updated_at"`
+}
+
+type ResolvedDeliveryPolicy struct {
+	TenantID              string `json:"tenant_id"`
+	Channel               string `json:"channel"`
+	Paused                bool   `json:"paused"`
+	FailoverEnabled       bool   `json:"failover_enabled"`
+	SchedulingEnabled     bool   `json:"scheduling_enabled"`
+	ReplayAllowed         bool   `json:"replay_allowed"`
+	MaxAttemptsOverride   *int   `json:"max_attempts_override,omitempty"`
+	RetryBaseDelaySeconds *int   `json:"retry_base_delay_seconds,omitempty"`
+	RetryMaxDelaySeconds  *int   `json:"retry_max_delay_seconds,omitempty"`
+}
+
+type UpsertDeliveryPolicyParams struct {
+	ID                    string
+	TenantID              *string
+	Channel               *string
+	Paused                *bool
+	FailoverEnabled       *bool
+	SchedulingEnabled     *bool
+	ReplayAllowed         *bool
+	MaxAttemptsOverride   *int
+	RetryBaseDelaySeconds *int
+	RetryMaxDelaySeconds  *int
+}
+
+type PromotedScheduledNotification struct {
+	Notification Notification
+	Attempt      DeliveryAttempt
+	Intent       DispatchIntent
 }
 
 type DeadLetter struct {
@@ -343,6 +397,10 @@ func (p *Postgres) CreateNotification(ctx context.Context, params CreateNotifica
 func createNotificationTx(ctx context.Context, querier interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 }, params CreateNotificationParams) (Notification, error) {
+	status := "accepted"
+	if params.ScheduledFor != nil && params.ScheduledFor.After(time.Now().UTC()) {
+		status = "scheduled"
+	}
 	const query = `
 		INSERT INTO notifications (
 			id,
@@ -352,9 +410,11 @@ func createNotificationTx(ctx context.Context, querier interface {
 			status,
 			recipient_email,
 			recipient_webhook_url,
-			variables
+			secondary_webhook_url,
+			variables,
+			scheduled_for
 		)
-		VALUES ($1, $2, $3, $4, 'accepted', $5, $6, $7::jsonb)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10)
 		RETURNING
 			id,
 			tenant_id,
@@ -363,7 +423,11 @@ func createNotificationTx(ctx context.Context, querier interface {
 			status,
 			recipient_email,
 			recipient_webhook_url,
+			secondary_webhook_url,
 			variables,
+			scheduled_for,
+			promoted_at,
+			cancelled_at,
 			submitted_at,
 			updated_at
 	`
@@ -382,9 +446,12 @@ func createNotificationTx(ctx context.Context, querier interface {
 		params.TenantID,
 		params.TemplateID,
 		params.IdempotencyKey,
+		status,
 		params.RecipientEmail,
 		params.RecipientWebhookURL,
+		params.SecondaryWebhookURL,
 		variablesJSON,
+		params.ScheduledFor,
 	).Scan(
 		&notification.ID,
 		&notification.TenantID,
@@ -393,7 +460,11 @@ func createNotificationTx(ctx context.Context, querier interface {
 		&notification.Status,
 		&notification.RecipientEmail,
 		&notification.RecipientWebhookURL,
+		&notification.SecondaryWebhookURL,
 		&rawVariables,
+		&notification.ScheduledFor,
+		&notification.PromotedAt,
+		&notification.CancelledAt,
 		&notification.SubmittedAt,
 		&notification.UpdatedAt,
 	)
@@ -433,23 +504,28 @@ func (p *Postgres) CreateNotificationWithInitialDispatch(ctx context.Context, pa
 		return Notification{}, DeliveryAttempt{}, DispatchIntent{}, fmt.Errorf("create notification with initial dispatch: create delivery attempt: %w", err)
 	}
 
-	intent, err := createDispatchIntentTx(ctx, tx, CreateDispatchIntentParams{
-		ID:             params.IntentID,
-		NotificationID: notification.ID,
-		AttemptID:      attempt.ID,
-		TenantID:       notification.TenantID,
-		Channel:        params.Channel,
-		Source:         "initial",
-	})
-	if err != nil {
-		return Notification{}, DeliveryAttempt{}, DispatchIntent{}, fmt.Errorf("create notification with initial dispatch: create dispatch intent: %w", err)
+	var intent DispatchIntent
+	if notification.ScheduledFor == nil || !notification.ScheduledFor.After(time.Now().UTC()) {
+		intent, err = createDispatchIntentTx(ctx, tx, CreateDispatchIntentParams{
+			ID:             params.IntentID,
+			NotificationID: notification.ID,
+			AttemptID:      attempt.ID,
+			TenantID:       notification.TenantID,
+			Channel:        params.Channel,
+			Source:         "initial",
+		})
+		if err != nil {
+			return Notification{}, DeliveryAttempt{}, DispatchIntent{}, fmt.Errorf("create notification with initial dispatch: create dispatch intent: %w", err)
+		}
 	}
 
 	if err := tx.Commit(); err != nil {
 		return Notification{}, DeliveryAttempt{}, DispatchIntent{}, fmt.Errorf("create notification with initial dispatch: commit: %w", err)
 	}
-	if err := p.RecalculateNotificationStatus(ctx, notification.ID); err != nil {
-		return Notification{}, DeliveryAttempt{}, DispatchIntent{}, err
+	if intent.ID != "" {
+		if err := p.RecalculateNotificationStatus(ctx, notification.ID); err != nil {
+			return Notification{}, DeliveryAttempt{}, DispatchIntent{}, err
+		}
 	}
 	notification, err = p.GetNotificationByID(ctx, notification.ID)
 	if err != nil {
@@ -469,7 +545,11 @@ func (p *Postgres) GetNotificationByTenantAndIdempotencyKey(ctx context.Context,
 			status,
 			recipient_email,
 			recipient_webhook_url,
+			secondary_webhook_url,
 			variables,
+			scheduled_for,
+			promoted_at,
+			cancelled_at,
 			submitted_at,
 			updated_at
 		FROM notifications
@@ -486,7 +566,11 @@ func (p *Postgres) GetNotificationByTenantAndIdempotencyKey(ctx context.Context,
 		&notification.Status,
 		&notification.RecipientEmail,
 		&notification.RecipientWebhookURL,
+		&notification.SecondaryWebhookURL,
 		&rawVariables,
+		&notification.ScheduledFor,
+		&notification.PromotedAt,
+		&notification.CancelledAt,
 		&notification.SubmittedAt,
 		&notification.UpdatedAt,
 	)
@@ -592,6 +676,105 @@ func scanDispatchIntent(scanner interface {
 		&intent.ClaimedAt,
 		&intent.PublishedAt,
 	)
+}
+
+func scanDeliveryPolicy(scanner interface {
+	Scan(dest ...any) error
+}, policy *DeliveryPolicy) error {
+	var tenantID, channel sql.NullString
+	var paused, failoverEnabled, schedulingEnabled, replayAllowed sql.NullBool
+	var maxAttempts, retryBaseDelay, retryMaxDelay sql.NullInt64
+	if err := scanner.Scan(
+		&policy.ID,
+		&tenantID,
+		&channel,
+		&paused,
+		&failoverEnabled,
+		&schedulingEnabled,
+		&replayAllowed,
+		&maxAttempts,
+		&retryBaseDelay,
+		&retryMaxDelay,
+		&policy.CreatedAt,
+		&policy.UpdatedAt,
+	); err != nil {
+		return err
+	}
+	policy.TenantID = nullStringPtr(tenantID)
+	policy.Channel = nullStringPtr(channel)
+	policy.Paused = nullBoolPtr(paused)
+	policy.FailoverEnabled = nullBoolPtr(failoverEnabled)
+	policy.SchedulingEnabled = nullBoolPtr(schedulingEnabled)
+	policy.ReplayAllowed = nullBoolPtr(replayAllowed)
+	policy.MaxAttemptsOverride = nullIntPtr(maxAttempts)
+	policy.RetryBaseDelaySeconds = nullIntPtr(retryBaseDelay)
+	policy.RetryMaxDelaySeconds = nullIntPtr(retryMaxDelay)
+	return nil
+}
+
+func nullStringPtr(v sql.NullString) *string {
+	if !v.Valid {
+		return nil
+	}
+	s := v.String
+	return &s
+}
+
+func nullBoolPtr(v sql.NullBool) *bool {
+	if !v.Valid {
+		return nil
+	}
+	b := v.Bool
+	return &b
+}
+
+func nullIntPtr(v sql.NullInt64) *int {
+	if !v.Valid {
+		return nil
+	}
+	n := int(v.Int64)
+	return &n
+}
+
+func nullableBool(v *bool) any {
+	if v == nil {
+		return nil
+	}
+	return *v
+}
+
+func nullableInt(v *int) any {
+	if v == nil {
+		return nil
+	}
+	return *v
+}
+
+func applyPolicyRow(resolved *ResolvedDeliveryPolicy, row DeliveryPolicy) {
+	if row.Paused != nil {
+		resolved.Paused = *row.Paused
+	}
+	if row.FailoverEnabled != nil {
+		resolved.FailoverEnabled = *row.FailoverEnabled
+	}
+	if row.SchedulingEnabled != nil {
+		resolved.SchedulingEnabled = *row.SchedulingEnabled
+	}
+	if row.ReplayAllowed != nil {
+		resolved.ReplayAllowed = *row.ReplayAllowed
+	}
+	if row.MaxAttemptsOverride != nil {
+		value := *row.MaxAttemptsOverride
+		resolved.MaxAttemptsOverride = &value
+	}
+	if row.RetryBaseDelaySeconds != nil {
+		value := *row.RetryBaseDelaySeconds
+		resolved.RetryBaseDelaySeconds = &value
+	}
+	if row.RetryMaxDelaySeconds != nil {
+		value := *row.RetryMaxDelaySeconds
+		resolved.RetryMaxDelaySeconds = &value
+	}
 }
 
 func IsAttemptAlreadyFinalized(err error) bool {
@@ -905,13 +1088,13 @@ func (p *Postgres) LoadDeliveryJob(ctx context.Context, notificationID, attemptI
 
 func (p *Postgres) GetNotificationByID(ctx context.Context, id string) (Notification, error) {
 	const query = `
-		SELECT id, tenant_id, template_id, idempotency_key, status, recipient_email, recipient_webhook_url, variables, submitted_at, updated_at
+		SELECT id, tenant_id, template_id, idempotency_key, status, recipient_email, recipient_webhook_url, secondary_webhook_url, variables, scheduled_for, promoted_at, cancelled_at, submitted_at, updated_at
 		FROM notifications
 		WHERE id = $1
 	`
 	var notification Notification
 	var rawVariables []byte
-	err := p.DB.QueryRowContext(ctx, query, id).Scan(&notification.ID, &notification.TenantID, &notification.TemplateID, &notification.IdempotencyKey, &notification.Status, &notification.RecipientEmail, &notification.RecipientWebhookURL, &rawVariables, &notification.SubmittedAt, &notification.UpdatedAt)
+	err := p.DB.QueryRowContext(ctx, query, id).Scan(&notification.ID, &notification.TenantID, &notification.TemplateID, &notification.IdempotencyKey, &notification.Status, &notification.RecipientEmail, &notification.RecipientWebhookURL, &notification.SecondaryWebhookURL, &rawVariables, &notification.ScheduledFor, &notification.PromotedAt, &notification.CancelledAt, &notification.SubmittedAt, &notification.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Notification{}, fmt.Errorf("get notification: %w", ErrNotFound)
@@ -927,12 +1110,12 @@ func (p *Postgres) GetNotificationByID(ctx context.Context, id string) (Notifica
 
 func (p *Postgres) GetDeliveryAttemptByID(ctx context.Context, id string) (DeliveryAttempt, error) {
 	const query = `
-		SELECT id, notification_id, channel, attempt_number, status, error_code, error_message, provider_message_id, last_error, next_retry_at, started_at, completed_at, sent_at, failed_at, dispatch_enqueued_at, enqueue_kind, created_at, updated_at
+		SELECT id, notification_id, channel, attempt_number, status, error_code, error_message, provider_message_id, last_error, next_retry_at, started_at, completed_at, sent_at, failed_at, dispatch_enqueued_at, enqueue_kind, provider_used, failover_used, created_at, updated_at
 		FROM delivery_attempts
 		WHERE id = $1
 	`
 	var attempt DeliveryAttempt
-	err := p.DB.QueryRowContext(ctx, query, id).Scan(&attempt.ID, &attempt.NotificationID, &attempt.Channel, &attempt.AttemptNumber, &attempt.Status, &attempt.ErrorCode, &attempt.ErrorMessage, &attempt.ProviderMessageID, &attempt.LastError, &attempt.NextRetryAt, &attempt.StartedAt, &attempt.CompletedAt, &attempt.SentAt, &attempt.FailedAt, &attempt.DispatchEnqueuedAt, &attempt.EnqueueKind, &attempt.CreatedAt, &attempt.UpdatedAt)
+	err := p.DB.QueryRowContext(ctx, query, id).Scan(&attempt.ID, &attempt.NotificationID, &attempt.Channel, &attempt.AttemptNumber, &attempt.Status, &attempt.ErrorCode, &attempt.ErrorMessage, &attempt.ProviderMessageID, &attempt.LastError, &attempt.NextRetryAt, &attempt.StartedAt, &attempt.CompletedAt, &attempt.SentAt, &attempt.FailedAt, &attempt.DispatchEnqueuedAt, &attempt.EnqueueKind, &attempt.ProviderUsed, &attempt.FailoverUsed, &attempt.CreatedAt, &attempt.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return DeliveryAttempt{}, fmt.Errorf("get delivery attempt: %w", ErrNotFound)
@@ -962,7 +1145,7 @@ func (p *Postgres) ListDeliveryAttemptsByNotificationID(ctx context.Context, not
 			FROM dead_letters
 			WHERE notification_id = $1
 		)
-		SELECT da.id, da.notification_id, da.channel, da.attempt_number, da.status, da.error_code, da.error_message, da.provider_message_id, da.last_error, da.next_retry_at, da.started_at, da.completed_at, da.sent_at, da.failed_at, da.dispatch_enqueued_at, da.enqueue_kind, dlr.id, replay_dl.id, da.created_at, da.updated_at
+		SELECT da.id, da.notification_id, da.channel, da.attempt_number, da.status, da.error_code, da.error_message, da.provider_message_id, da.last_error, da.next_retry_at, da.started_at, da.completed_at, da.sent_at, da.failed_at, da.dispatch_enqueued_at, da.enqueue_kind, da.provider_used, da.failover_used, dlr.id, replay_dl.id, da.created_at, da.updated_at
 		FROM delivery_attempts da
 		LEFT JOIN dead_lettered_attempts dla ON dla.id = da.id
 		LEFT JOIN dead_letter_rows dlr ON dlr.notification_id = da.notification_id AND dlr.channel = da.channel AND dlr.seq = dla.seq
@@ -978,7 +1161,7 @@ func (p *Postgres) ListDeliveryAttemptsByNotificationID(ctx context.Context, not
 	var attempts []DeliveryAttempt
 	for rows.Next() {
 		var attempt DeliveryAttempt
-		if err := rows.Scan(&attempt.ID, &attempt.NotificationID, &attempt.Channel, &attempt.AttemptNumber, &attempt.Status, &attempt.ErrorCode, &attempt.ErrorMessage, &attempt.ProviderMessageID, &attempt.LastError, &attempt.NextRetryAt, &attempt.StartedAt, &attempt.CompletedAt, &attempt.SentAt, &attempt.FailedAt, &attempt.DispatchEnqueuedAt, &attempt.EnqueueKind, &attempt.DeadLetterID, &attempt.ReplayOfDeadLetter, &attempt.CreatedAt, &attempt.UpdatedAt); err != nil {
+		if err := rows.Scan(&attempt.ID, &attempt.NotificationID, &attempt.Channel, &attempt.AttemptNumber, &attempt.Status, &attempt.ErrorCode, &attempt.ErrorMessage, &attempt.ProviderMessageID, &attempt.LastError, &attempt.NextRetryAt, &attempt.StartedAt, &attempt.CompletedAt, &attempt.SentAt, &attempt.FailedAt, &attempt.DispatchEnqueuedAt, &attempt.EnqueueKind, &attempt.ProviderUsed, &attempt.FailoverUsed, &attempt.DeadLetterID, &attempt.ReplayOfDeadLetter, &attempt.CreatedAt, &attempt.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("list delivery attempts: %w", err)
 		}
 		attempts = append(attempts, attempt)
@@ -990,12 +1173,29 @@ func (p *Postgres) ListDeliveryAttemptsByNotificationID(ctx context.Context, not
 }
 
 func (p *Postgres) RecalculateNotificationStatus(ctx context.Context, notificationID string) error {
+	var scheduledFor, promotedAt, cancelledAt *time.Time
+	if err := p.DB.QueryRowContext(ctx, `
+		SELECT scheduled_for, promoted_at, cancelled_at
+		FROM notifications
+		WHERE id = $1
+	`, notificationID).Scan(&scheduledFor, &promotedAt, &cancelledAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("recalculate notification status: %w", ErrNotFound)
+		}
+		return fmt.Errorf("recalculate notification status: %w", err)
+	}
+
 	attempts, err := p.ListDeliveryAttemptsByNotificationID(ctx, notificationID)
 	if err != nil {
 		return fmt.Errorf("recalculate notification status: %w", err)
 	}
 
 	status := deriveNotificationStatus(attempts)
+	if cancelledAt != nil {
+		status = "cancelled"
+	} else if scheduledFor != nil && promotedAt == nil && scheduledFor.After(time.Now().UTC()) {
+		status = "scheduled"
+	}
 	result, err := p.DB.ExecContext(ctx, `
 		UPDATE notifications
 		SET status = $2, updated_at = NOW()
@@ -1570,11 +1770,44 @@ func (p *Postgres) ClaimPendingDispatchIntents(ctx context.Context, limit int, s
 			UPDATE dispatch_outbox AS o
 			SET status = 'publishing', claimed_at = NOW()
 			WHERE o.id IN (
-				SELECT id
-				FROM dispatch_outbox
-				WHERE status = 'pending'
-				   OR (status = 'publishing' AND claimed_at IS NOT NULL AND claimed_at <= NOW() - ($2 * INTERVAL '1 second'))
-				ORDER BY created_at ASC
+				SELECT i.id
+				FROM dispatch_outbox i
+				WHERE (
+					i.status = 'pending'
+					OR (i.status = 'publishing' AND i.claimed_at IS NOT NULL AND i.claimed_at <= NOW() - ($2 * INTERVAL '1 second'))
+				)
+				  AND COALESCE(
+					(
+						SELECT p_tc.paused
+						FROM delivery_policies p_tc
+						WHERE p_tc.tenant_id = i.tenant_id AND p_tc.channel = i.channel
+						ORDER BY p_tc.updated_at DESC
+						LIMIT 1
+					),
+					(
+						SELECT p_t.paused
+						FROM delivery_policies p_t
+						WHERE p_t.tenant_id = i.tenant_id AND p_t.channel IS NULL
+						ORDER BY p_t.updated_at DESC
+						LIMIT 1
+					),
+					(
+						SELECT p_gc.paused
+						FROM delivery_policies p_gc
+						WHERE p_gc.tenant_id IS NULL AND p_gc.channel = i.channel
+						ORDER BY p_gc.updated_at DESC
+						LIMIT 1
+					),
+					(
+						SELECT p_g.paused
+						FROM delivery_policies p_g
+						WHERE p_g.tenant_id IS NULL AND p_g.channel IS NULL
+						ORDER BY p_g.updated_at DESC
+						LIMIT 1
+					),
+					false
+				) = false
+				ORDER BY i.created_at ASC
 				FOR UPDATE SKIP LOCKED
 				LIMIT $1
 			)
@@ -1772,6 +2005,374 @@ func (p *Postgres) FinalizeReplayEnqueue(ctx context.Context, deadLetterID, atte
 		return fmt.Errorf("finalize replay enqueue: commit: %w", err)
 	}
 	return nil
+}
+
+func (p *Postgres) UpdateAttemptProvider(ctx context.Context, attemptID, provider string, failoverUsed bool) error {
+	result, err := p.DB.ExecContext(ctx, `
+		UPDATE delivery_attempts
+		SET provider_used = $2, failover_used = $3, updated_at = NOW()
+		WHERE id = $1
+	`, attemptID, provider, failoverUsed)
+	if err != nil {
+		return fmt.Errorf("update attempt provider: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("update attempt provider: rows affected: %w", err)
+	}
+	if rows == 0 {
+		return fmt.Errorf("update attempt provider: %w", ErrNotFound)
+	}
+	return nil
+}
+
+func (p *Postgres) ListDeliveryPolicies(ctx context.Context) ([]DeliveryPolicy, error) {
+	rows, err := p.DB.QueryContext(ctx, `
+		SELECT id, tenant_id, channel, paused, failover_enabled, scheduling_enabled, replay_allowed, max_attempts_override, retry_base_delay_seconds, retry_max_delay_seconds, created_at, updated_at
+		FROM delivery_policies
+		ORDER BY tenant_id NULLS FIRST, channel NULLS FIRST, created_at ASC
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("list delivery policies: %w", err)
+	}
+	defer rows.Close()
+	var policies []DeliveryPolicy
+	for rows.Next() {
+		var policy DeliveryPolicy
+		if err := scanDeliveryPolicy(rows, &policy); err != nil {
+			return nil, fmt.Errorf("list delivery policies: %w", err)
+		}
+		policies = append(policies, policy)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list delivery policies: %w", err)
+	}
+	return policies, nil
+}
+
+func (p *Postgres) GetDeliveryPolicyByID(ctx context.Context, id string) (DeliveryPolicy, error) {
+	var policy DeliveryPolicy
+	if err := scanDeliveryPolicy(p.DB.QueryRowContext(ctx, `
+		SELECT id, tenant_id, channel, paused, failover_enabled, scheduling_enabled, replay_allowed, max_attempts_override, retry_base_delay_seconds, retry_max_delay_seconds, created_at, updated_at
+		FROM delivery_policies
+		WHERE id = $1
+	`, id), &policy); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return DeliveryPolicy{}, fmt.Errorf("get delivery policy: %w", ErrNotFound)
+		}
+		return DeliveryPolicy{}, fmt.Errorf("get delivery policy: %w", err)
+	}
+	return policy, nil
+}
+
+func (p *Postgres) UpsertDeliveryPolicy(ctx context.Context, params UpsertDeliveryPolicyParams) (DeliveryPolicy, error) {
+	var policy DeliveryPolicy
+	if err := scanDeliveryPolicy(p.DB.QueryRowContext(ctx, `
+		INSERT INTO delivery_policies (
+			id, tenant_id, channel, paused, failover_enabled, scheduling_enabled, replay_allowed, max_attempts_override, retry_base_delay_seconds, retry_max_delay_seconds
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		ON CONFLICT (id) DO UPDATE SET
+			tenant_id = EXCLUDED.tenant_id,
+			channel = EXCLUDED.channel,
+			paused = EXCLUDED.paused,
+			failover_enabled = EXCLUDED.failover_enabled,
+			scheduling_enabled = EXCLUDED.scheduling_enabled,
+			replay_allowed = EXCLUDED.replay_allowed,
+			max_attempts_override = EXCLUDED.max_attempts_override,
+			retry_base_delay_seconds = EXCLUDED.retry_base_delay_seconds,
+			retry_max_delay_seconds = EXCLUDED.retry_max_delay_seconds,
+			updated_at = NOW()
+		RETURNING id, tenant_id, channel, paused, failover_enabled, scheduling_enabled, replay_allowed, max_attempts_override, retry_base_delay_seconds, retry_max_delay_seconds, created_at, updated_at
+	`, params.ID, params.TenantID, params.Channel, nullableBool(params.Paused), nullableBool(params.FailoverEnabled), nullableBool(params.SchedulingEnabled), nullableBool(params.ReplayAllowed), nullableInt(params.MaxAttemptsOverride), nullableInt(params.RetryBaseDelaySeconds), nullableInt(params.RetryMaxDelaySeconds)), &policy); err != nil {
+		return DeliveryPolicy{}, wrapStoreError("upsert delivery policy", err)
+	}
+	return policy, nil
+}
+
+func (p *Postgres) SetDeliveryPolicyPaused(ctx context.Context, id string, paused bool) (DeliveryPolicy, error) {
+	var policy DeliveryPolicy
+	if err := scanDeliveryPolicy(p.DB.QueryRowContext(ctx, `
+		UPDATE delivery_policies
+		SET paused = $2, updated_at = NOW()
+		WHERE id = $1
+		RETURNING id, tenant_id, channel, paused, failover_enabled, scheduling_enabled, replay_allowed, max_attempts_override, retry_base_delay_seconds, retry_max_delay_seconds, created_at, updated_at
+	`, id, paused), &policy); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return DeliveryPolicy{}, fmt.Errorf("set delivery policy paused: %w", ErrNotFound)
+		}
+		return DeliveryPolicy{}, fmt.Errorf("set delivery policy paused: %w", err)
+	}
+	return policy, nil
+}
+
+func (p *Postgres) ResolveDeliveryPolicy(ctx context.Context, tenantID, channel string) (ResolvedDeliveryPolicy, error) {
+	rows, err := p.DB.QueryContext(ctx, `
+		SELECT id, tenant_id, channel, paused, failover_enabled, scheduling_enabled, replay_allowed, max_attempts_override, retry_base_delay_seconds, retry_max_delay_seconds, created_at, updated_at
+		FROM delivery_policies
+		WHERE (tenant_id = $1 OR tenant_id IS NULL)
+		  AND (channel = $2 OR channel IS NULL)
+		ORDER BY
+			CASE
+				WHEN tenant_id = $1 AND channel = $2 THEN 1
+				WHEN tenant_id = $1 AND channel IS NULL THEN 2
+				WHEN tenant_id IS NULL AND channel = $2 THEN 3
+				ELSE 4
+			END,
+			updated_at DESC,
+			created_at DESC
+	`, tenantID, channel)
+	if err != nil {
+		return ResolvedDeliveryPolicy{}, fmt.Errorf("resolve delivery policy: %w", err)
+	}
+	defer rows.Close()
+
+	resolved := ResolvedDeliveryPolicy{
+		TenantID:          tenantID,
+		Channel:           channel,
+		Paused:            false,
+		FailoverEnabled:   false,
+		SchedulingEnabled: true,
+		ReplayAllowed:     true,
+	}
+	var ordered []DeliveryPolicy
+	for rows.Next() {
+		var policy DeliveryPolicy
+		if err := scanDeliveryPolicy(rows, &policy); err != nil {
+			return ResolvedDeliveryPolicy{}, fmt.Errorf("resolve delivery policy: %w", err)
+		}
+		ordered = append(ordered, policy)
+	}
+	if err := rows.Err(); err != nil {
+		return ResolvedDeliveryPolicy{}, fmt.Errorf("resolve delivery policy: %w", err)
+	}
+	for i := len(ordered) - 1; i >= 0; i-- {
+		applyPolicyRow(&resolved, ordered[i])
+	}
+	return resolved, nil
+}
+
+func (p *Postgres) PromoteDueScheduledNotifications(ctx context.Context, limit int, now time.Time) ([]PromotedScheduledNotification, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	tx, err := p.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("promote scheduled notifications: begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.QueryContext(ctx, `
+		SELECT n.id, n.tenant_id, n.template_id, n.idempotency_key, n.status, n.recipient_email, n.recipient_webhook_url, n.secondary_webhook_url, n.variables, n.scheduled_for, n.promoted_at, n.cancelled_at, n.submitted_at, n.updated_at,
+		       da.id, da.notification_id, da.channel, da.attempt_number, da.status, da.error_code, da.error_message, da.provider_message_id, da.last_error, da.next_retry_at, da.started_at, da.completed_at, da.sent_at, da.failed_at, da.dispatch_enqueued_at, da.enqueue_kind, da.created_at, da.updated_at
+		FROM notifications n
+		JOIN delivery_attempts da ON da.notification_id = n.id AND da.enqueue_kind = 'initial' AND da.attempt_number = 1
+		WHERE n.scheduled_for IS NOT NULL
+		  AND n.scheduled_for <= $2
+		  AND n.promoted_at IS NULL
+		  AND n.cancelled_at IS NULL
+		  AND NOT EXISTS (SELECT 1 FROM dispatch_outbox o WHERE o.attempt_id = da.id)
+		  AND COALESCE(
+			(
+				SELECT p_tc.paused
+				FROM delivery_policies p_tc
+				WHERE p_tc.tenant_id = n.tenant_id AND p_tc.channel = da.channel
+				ORDER BY p_tc.updated_at DESC
+				LIMIT 1
+			),
+			(
+				SELECT p_t.paused
+				FROM delivery_policies p_t
+				WHERE p_t.tenant_id = n.tenant_id AND p_t.channel IS NULL
+				ORDER BY p_t.updated_at DESC
+				LIMIT 1
+			),
+			(
+				SELECT p_gc.paused
+				FROM delivery_policies p_gc
+				WHERE p_gc.tenant_id IS NULL AND p_gc.channel = da.channel
+				ORDER BY p_gc.updated_at DESC
+				LIMIT 1
+			),
+			(
+				SELECT p_g.paused
+				FROM delivery_policies p_g
+				WHERE p_g.tenant_id IS NULL AND p_g.channel IS NULL
+				ORDER BY p_g.updated_at DESC
+				LIMIT 1
+			),
+			false
+		  ) = false
+		ORDER BY n.scheduled_for ASC, n.submitted_at ASC
+		FOR UPDATE OF n, da SKIP LOCKED
+		LIMIT $1
+	`, limit, now)
+	if err != nil {
+		return nil, fmt.Errorf("promote scheduled notifications: %w", err)
+	}
+	defer rows.Close()
+
+	var promoted []PromotedScheduledNotification
+	for rows.Next() {
+		var item PromotedScheduledNotification
+		var rawVariables []byte
+		if err := rows.Scan(
+			&item.Notification.ID, &item.Notification.TenantID, &item.Notification.TemplateID, &item.Notification.IdempotencyKey, &item.Notification.Status, &item.Notification.RecipientEmail, &item.Notification.RecipientWebhookURL, &item.Notification.SecondaryWebhookURL, &rawVariables, &item.Notification.ScheduledFor, &item.Notification.PromotedAt, &item.Notification.CancelledAt, &item.Notification.SubmittedAt, &item.Notification.UpdatedAt,
+			&item.Attempt.ID, &item.Attempt.NotificationID, &item.Attempt.Channel, &item.Attempt.AttemptNumber, &item.Attempt.Status, &item.Attempt.ErrorCode, &item.Attempt.ErrorMessage, &item.Attempt.ProviderMessageID, &item.Attempt.LastError, &item.Attempt.NextRetryAt, &item.Attempt.StartedAt, &item.Attempt.CompletedAt, &item.Attempt.SentAt, &item.Attempt.FailedAt, &item.Attempt.DispatchEnqueuedAt, &item.Attempt.EnqueueKind, &item.Attempt.CreatedAt, &item.Attempt.UpdatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("promote scheduled notifications: %w", err)
+		}
+		item.Notification.Variables, err = unmarshalVariables(rawVariables)
+		if err != nil {
+			return nil, fmt.Errorf("promote scheduled notifications: %w", err)
+		}
+		item.Intent, err = createDispatchIntentTx(ctx, tx, CreateDispatchIntentParams{
+			ID:             "intent-" + item.Attempt.ID,
+			NotificationID: item.Notification.ID,
+			AttemptID:      item.Attempt.ID,
+			TenantID:       item.Notification.TenantID,
+			Channel:        item.Attempt.Channel,
+			Source:         "scheduled",
+		})
+		if err != nil {
+			return nil, fmt.Errorf("promote scheduled notifications: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE notifications
+			SET promoted_at = COALESCE(promoted_at, $2), updated_at = NOW()
+			WHERE id = $1
+		`, item.Notification.ID, now); err != nil {
+			return nil, fmt.Errorf("promote scheduled notifications: mark promoted: %w", err)
+		}
+		item.Notification.PromotedAt = &now
+		promoted = append(promoted, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("promote scheduled notifications: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("promote scheduled notifications: commit: %w", err)
+	}
+	for _, item := range promoted {
+		if err := p.RecalculateNotificationStatus(ctx, item.Notification.ID); err != nil {
+			return nil, err
+		}
+	}
+	return promoted, nil
+}
+
+func (p *Postgres) CancelScheduledNotification(ctx context.Context, notificationID string) (Notification, error) {
+	result, err := p.DB.ExecContext(ctx, `
+		UPDATE notifications
+		SET status = 'cancelled', cancelled_at = NOW(), updated_at = NOW()
+		WHERE id = $1
+		  AND scheduled_for > NOW()
+		  AND status = 'scheduled'
+		  AND promoted_at IS NULL
+		  AND cancelled_at IS NULL
+		  AND NOT EXISTS (
+			SELECT 1
+			FROM dispatch_outbox o
+			WHERE o.notification_id = notifications.id
+		  )
+	`, notificationID)
+	if err != nil {
+		return Notification{}, fmt.Errorf("cancel scheduled notification: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return Notification{}, fmt.Errorf("cancel scheduled notification: rows affected: %w", err)
+	}
+	if rows == 0 {
+		var exists bool
+		if err := p.DB.QueryRowContext(ctx, `
+			SELECT EXISTS (SELECT 1 FROM notifications WHERE id = $1)
+		`, notificationID).Scan(&exists); err != nil {
+			return Notification{}, fmt.Errorf("cancel scheduled notification: check existence: %w", err)
+		}
+		if !exists {
+			return Notification{}, fmt.Errorf("cancel scheduled notification: %w", ErrNotFound)
+		}
+		return Notification{}, fmt.Errorf("cancel scheduled notification: %w", ErrInvalidStateTransition)
+	}
+	return p.GetNotificationByID(ctx, notificationID)
+}
+
+func (p *Postgres) RedriveNotification(ctx context.Context, notificationID string) (PromotedScheduledNotification, error) {
+	tx, err := p.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return PromotedScheduledNotification{}, fmt.Errorf("redrive notification: begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	var item PromotedScheduledNotification
+	var rawVariables []byte
+	if err := tx.QueryRowContext(ctx, `
+		SELECT n.id, n.tenant_id, n.template_id, n.idempotency_key, n.status, n.recipient_email, n.recipient_webhook_url, n.secondary_webhook_url, n.variables, n.scheduled_for, n.promoted_at, n.cancelled_at, n.submitted_at, n.updated_at,
+		       da.id, da.notification_id, da.channel, da.attempt_number, da.status, da.error_code, da.error_message, da.provider_message_id, da.last_error, da.next_retry_at, da.started_at, da.completed_at, da.sent_at, da.failed_at, da.dispatch_enqueued_at, da.enqueue_kind, da.created_at, da.updated_at
+		FROM notifications n
+		JOIN delivery_attempts da ON da.notification_id = n.id AND da.enqueue_kind = 'initial' AND da.attempt_number = 1
+		WHERE n.id = $1
+		  AND n.promoted_at IS NULL
+		  AND n.cancelled_at IS NULL
+		  AND NOT EXISTS (SELECT 1 FROM dispatch_outbox o WHERE o.attempt_id = da.id)
+		FOR UPDATE OF n, da
+	`, notificationID).Scan(
+		&item.Notification.ID, &item.Notification.TenantID, &item.Notification.TemplateID, &item.Notification.IdempotencyKey, &item.Notification.Status, &item.Notification.RecipientEmail, &item.Notification.RecipientWebhookURL, &item.Notification.SecondaryWebhookURL, &rawVariables, &item.Notification.ScheduledFor, &item.Notification.PromotedAt, &item.Notification.CancelledAt, &item.Notification.SubmittedAt, &item.Notification.UpdatedAt,
+		&item.Attempt.ID, &item.Attempt.NotificationID, &item.Attempt.Channel, &item.Attempt.AttemptNumber, &item.Attempt.Status, &item.Attempt.ErrorCode, &item.Attempt.ErrorMessage, &item.Attempt.ProviderMessageID, &item.Attempt.LastError, &item.Attempt.NextRetryAt, &item.Attempt.StartedAt, &item.Attempt.CompletedAt, &item.Attempt.SentAt, &item.Attempt.FailedAt, &item.Attempt.DispatchEnqueuedAt, &item.Attempt.EnqueueKind, &item.Attempt.CreatedAt, &item.Attempt.UpdatedAt,
+	); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			var exists bool
+			if err := p.DB.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM notifications WHERE id = $1)`, notificationID).Scan(&exists); err != nil {
+				return PromotedScheduledNotification{}, fmt.Errorf("redrive notification: check existence: %w", err)
+			}
+			if !exists {
+				return PromotedScheduledNotification{}, fmt.Errorf("redrive notification: %w", ErrNotFound)
+			}
+			return PromotedScheduledNotification{}, fmt.Errorf("redrive notification: %w", ErrInvalidStateTransition)
+		}
+		return PromotedScheduledNotification{}, fmt.Errorf("redrive notification: %w", err)
+	}
+	item.Notification.Variables, err = unmarshalVariables(rawVariables)
+	if err != nil {
+		return PromotedScheduledNotification{}, fmt.Errorf("redrive notification: %w", err)
+	}
+	if item.Notification.CancelledAt != nil {
+		return PromotedScheduledNotification{}, fmt.Errorf("redrive notification: %w", ErrInvalidStateTransition)
+	}
+	policy, err := p.ResolveDeliveryPolicy(ctx, item.Notification.TenantID, item.Attempt.Channel)
+	if err != nil {
+		return PromotedScheduledNotification{}, err
+	}
+	if policy.Paused {
+		return PromotedScheduledNotification{}, fmt.Errorf("redrive notification: %w", ErrInvalidStateTransition)
+	}
+	item.Intent, err = createDispatchIntentTx(ctx, tx, CreateDispatchIntentParams{
+		ID:             "intent-" + item.Attempt.ID,
+		NotificationID: item.Notification.ID,
+		AttemptID:      item.Attempt.ID,
+		TenantID:       item.Notification.TenantID,
+		Channel:        item.Attempt.Channel,
+		Source:         "manual_redrive",
+	})
+	if err != nil {
+		return PromotedScheduledNotification{}, fmt.Errorf("redrive notification: %w", err)
+	}
+	now := time.Now().UTC()
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE notifications
+		SET promoted_at = COALESCE(promoted_at, $2), updated_at = NOW()
+		WHERE id = $1
+	`, item.Notification.ID, now); err != nil {
+		return PromotedScheduledNotification{}, fmt.Errorf("redrive notification: mark promoted: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return PromotedScheduledNotification{}, fmt.Errorf("redrive notification: commit: %w", err)
+	}
+	item.Notification.PromotedAt = &now
+	if err := p.RecalculateNotificationStatus(ctx, item.Notification.ID); err != nil {
+		return PromotedScheduledNotification{}, err
+	}
+	return item, nil
 }
 
 func (p *Postgres) RecordAuditEvent(ctx context.Context, id, tenantID, actor, action, resourceType, resourceID string, metadata map[string]any) error {
