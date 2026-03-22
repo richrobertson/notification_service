@@ -21,7 +21,7 @@ type fakeStore struct {
 	claimed        []string
 }
 
-func (f *fakeStore) ClaimPendingDispatchIntents(_ context.Context, _ int, _ time.Time) ([]store.PendingDispatchIntent, error) {
+func (f *fakeStore) ClaimPendingDispatchIntents(_ context.Context, _ int, _ time.Duration) ([]store.PendingDispatchIntent, error) {
 	var out []store.PendingDispatchIntent
 	for _, item := range f.pending {
 		if !f.publishedByID[item.Intent.ID] && item.Intent.Status == "pending" {

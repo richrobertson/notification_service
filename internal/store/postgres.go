@@ -1557,7 +1557,7 @@ func (p *Postgres) EnsureReplayAttempt(ctx context.Context, deadLetterID, newAtt
 	return ReplayDeadLetterResult{DeadLetter: dl, Attempt: attempt}, nil
 }
 
-func (p *Postgres) ClaimPendingDispatchIntents(ctx context.Context, limit int, staleBefore time.Time) ([]PendingDispatchIntent, error) {
+func (p *Postgres) ClaimPendingDispatchIntents(ctx context.Context, limit int, staleAfter time.Duration) ([]PendingDispatchIntent, error) {
 	if limit <= 0 {
 		limit = 100
 	}
@@ -1569,7 +1569,7 @@ func (p *Postgres) ClaimPendingDispatchIntents(ctx context.Context, limit int, s
 				SELECT id
 				FROM dispatch_outbox
 				WHERE status = 'pending'
-				   OR (status = 'publishing' AND claimed_at IS NOT NULL AND claimed_at <= $2)
+				   OR (status = 'publishing' AND claimed_at IS NOT NULL AND claimed_at <= NOW() - ($2 * INTERVAL '1 second'))
 				ORDER BY created_at ASC
 				FOR UPDATE SKIP LOCKED
 				LIMIT $1
@@ -1580,7 +1580,7 @@ func (p *Postgres) ClaimPendingDispatchIntents(ctx context.Context, limit int, s
 		FROM claimed c
 		LEFT JOIN dead_letters dl ON dl.replay_attempt_id = c.attempt_id
 		ORDER BY c.created_at ASC
-	`, limit, staleBefore)
+	`, limit, int(staleAfter/time.Second))
 	if err != nil {
 		return nil, fmt.Errorf("claim pending dispatch intents: %w", err)
 	}

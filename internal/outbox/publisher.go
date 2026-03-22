@@ -11,7 +11,7 @@ import (
 )
 
 type Store interface {
-	ClaimPendingDispatchIntents(ctx context.Context, limit int, staleBefore time.Time) ([]store.PendingDispatchIntent, error)
+	ClaimPendingDispatchIntents(ctx context.Context, limit int, staleAfter time.Duration) ([]store.PendingDispatchIntent, error)
 	MarkDispatchIntentPublished(ctx context.Context, intentID string, claimedAt time.Time) error
 	RecordDispatchIntentError(ctx context.Context, intentID string, claimedAt time.Time, lastError string) error
 	RecordAuditEvent(ctx context.Context, id, tenantID, actor, action, resourceType, resourceID string, metadata map[string]any) error
@@ -42,7 +42,7 @@ func RunOnce(ctx context.Context, logger *slog.Logger, st Store, q Queue, softLi
 		}
 	}
 
-	pending, err := st.ClaimPendingDispatchIntents(ctx, 100, time.Now().UTC().Add(-claimTimeout))
+	pending, err := st.ClaimPendingDispatchIntents(ctx, 100, claimTimeout)
 	if err != nil {
 		return err
 	}

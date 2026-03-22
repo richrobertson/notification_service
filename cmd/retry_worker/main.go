@@ -65,7 +65,7 @@ func runOnce(ctx context.Context, logger *slog.Logger, postgres retryStore) erro
 			return err
 		}
 		logger.Info("retry attempt dispatch intent created for outbox publisher", slog.String("scheduled_attempt_id", item.Attempt.ID), slog.String("retry_attempt_id", created.Attempt.ID))
-		_ = postgres.RecordAuditEvent(ctx, generateID("audit"), created.TenantID, "retry-worker", "dispatch_intent_created", "delivery_attempt", created.Attempt.ID, map[string]any{"scheduled_attempt_id": item.Attempt.ID, "notification_id": created.Attempt.NotificationID, "channel": created.Attempt.Channel, "source": "retry"})
+		_ = postgres.RecordAuditEvent(ctx, generateID("audit"), created.TenantID, "retry-worker", "dispatch_intent_created", "dispatch_intent", "intent-"+created.Attempt.ID, map[string]any{"scheduled_attempt_id": item.Attempt.ID, "notification_id": created.Attempt.NotificationID, "channel": created.Attempt.Channel, "source": "retry", "attempt_id": created.Attempt.ID})
 	}
 	return nil
 }

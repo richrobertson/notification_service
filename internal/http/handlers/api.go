@@ -341,7 +341,7 @@ func (a *API) CreateNotification() http.HandlerFunc {
 		if recipientWebhookURL != "" {
 			params.RecipientWebhookURL = &recipientWebhookURL
 		}
-		notification, attempt, _, err := a.store.CreateNotificationWithInitialDispatch(r.Context(), store.CreateNotificationDispatchParams{
+		notification, attempt, intent, err := a.store.CreateNotificationWithInitialDispatch(r.Context(), store.CreateNotificationDispatchParams{
 			Notification: params,
 			Channel:      template.Channel,
 			AttemptID:    generateID("attempt"),
@@ -363,7 +363,7 @@ func (a *API) CreateNotification() http.HandlerFunc {
 			return
 		}
 		a.recordAudit(r.Context(), notification.TenantID, "api", "notification_accepted", "notification", notification.ID, map[string]any{"template_id": notification.TemplateID})
-		a.recordAudit(r.Context(), notification.TenantID, "api", "dispatch_intent_created", "delivery_attempt", attempt.ID, map[string]any{"notification_id": notification.ID, "channel": template.Channel, "source": "initial"})
+		a.recordAudit(r.Context(), notification.TenantID, "api", "dispatch_intent_created", "dispatch_intent", intent.ID, map[string]any{"notification_id": notification.ID, "channel": template.Channel, "source": "initial", "attempt_id": attempt.ID})
 
 		writeJSON(w, http.StatusAccepted, notification)
 	}
@@ -438,7 +438,8 @@ func (a *API) ReplayDeadLetter() http.HandlerFunc {
 			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
 			return
 		}
-		a.recordAudit(r.Context(), notification.TenantID, "api", "dispatch_intent_created", "delivery_attempt", result.Attempt.ID, map[string]any{"notification_id": result.Attempt.NotificationID, "dead_letter_id": deadLetterID, "channel": result.Attempt.Channel, "source": "replay"})
+		intentID := "intent-" + result.Attempt.ID
+		a.recordAudit(r.Context(), notification.TenantID, "api", "dispatch_intent_created", "dispatch_intent", intentID, map[string]any{"notification_id": result.Attempt.NotificationID, "dead_letter_id": deadLetterID, "channel": result.Attempt.Channel, "source": "replay", "attempt_id": result.Attempt.ID})
 		writeJSON(w, http.StatusAccepted, result.Attempt)
 	}
 }
