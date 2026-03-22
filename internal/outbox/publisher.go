@@ -25,6 +25,8 @@ type Queue interface {
 type IDGenerator func(prefix string) string
 
 const claimTimeout = 30 * time.Second
+const publishTimeout = claimTimeout / 2
+const claimBatchSize = 1
 
 func RunOnce(ctx context.Context, logger *slog.Logger, st Store, q Queue, softLimit int, generateID IDGenerator) error {
 	if q == nil {
@@ -42,7 +44,7 @@ func RunOnce(ctx context.Context, logger *slog.Logger, st Store, q Queue, softLi
 		}
 	}
 
-	pending, err := st.ClaimPendingDispatchIntents(ctx, 100, claimTimeout)
+	pending, err := st.ClaimPendingDispatchIntents(ctx, claimBatchSize, claimTimeout)
 	if err != nil {
 		return err
 	}
@@ -58,7 +60,10 @@ func RunOnce(ctx context.Context, logger *slog.Logger, st Store, q Queue, softLi
 			Channel:        item.Intent.Channel,
 			CreatedAt:      time.Now().UTC(),
 		}
-		if err := q.EnqueueDispatch(ctx, job); err != nil {
+		publishCtx, cancel := context.WithTimeout(ctx, publishTimeout)
+		err := q.EnqueueDispatch(publishCtx, job)
+		cancel()
+		if err != nil {
 			logger.Error("dispatch intent publish failed; intent remains pending", slog.Any("error", err), slog.String("intent_id", item.Intent.ID), slog.String("attempt_id", item.Intent.AttemptID), slog.String("source", item.Intent.Source))
 			if recErr := st.RecordDispatchIntentError(ctx, item.Intent.ID, *item.Intent.ClaimedAt, err.Error()); recErr != nil {
 				logger.Error("failed to record dispatch intent error", slog.Any("error", recErr), slog.String("intent_id", item.Intent.ID), slog.String("attempt_id", item.Intent.AttemptID), slog.String("source", item.Intent.Source))

@@ -1461,6 +1461,18 @@ func (p *Postgres) EnsureRetryAttempt(ctx context.Context, scheduledAttemptID, n
 		}
 		createdNewAttempt = true
 	}
+	if _, err := createDispatchIntentTx(ctx, tx, CreateDispatchIntentParams{
+		ID:             "intent-" + attempt.ID,
+		NotificationID: attempt.NotificationID,
+		AttemptID:      attempt.ID,
+		TenantID:       item.TenantID,
+		Channel:        attempt.Channel,
+		Source:         "retry",
+		Status:         publishedIntentStatus(attempt.DispatchEnqueuedAt),
+		PublishedAt:    attempt.DispatchEnqueuedAt,
+	}); err != nil {
+		return RetryDueAttempt{}, fmt.Errorf("ensure retry attempt: %w", err)
+	}
 	if item.Attempt.Status == "retry_scheduled" {
 		if _, err := tx.ExecContext(ctx, `UPDATE delivery_attempts SET status = 'failed', next_retry_at = NULL, updated_at = NOW() WHERE id = $1 AND status = 'retry_scheduled'`, scheduledAttemptID); err != nil {
 			return RetryDueAttempt{}, fmt.Errorf("ensure retry attempt: mark prior failed: %w", err)
@@ -1527,20 +1539,22 @@ func (p *Postgres) EnsureReplayAttempt(ctx context.Context, deadLetterID, newAtt
 		if err != nil {
 			return ReplayDeadLetterResult{}, fmt.Errorf("ensure replay attempt: %w", err)
 		}
-		var tenantID string
-		if err := tx.QueryRowContext(ctx, `SELECT tenant_id FROM notifications WHERE id = $1`, dl.NotificationID).Scan(&tenantID); err != nil {
-			return ReplayDeadLetterResult{}, fmt.Errorf("ensure replay attempt: tenant lookup: %w", err)
-		}
-		if _, err := createDispatchIntentTx(ctx, tx, CreateDispatchIntentParams{
-			ID:             "intent-" + attempt.ID,
-			NotificationID: attempt.NotificationID,
-			AttemptID:      attempt.ID,
-			TenantID:       tenantID,
-			Channel:        attempt.Channel,
-			Source:         "replay",
-		}); err != nil {
-			return ReplayDeadLetterResult{}, fmt.Errorf("ensure replay attempt: %w", err)
-		}
+	}
+	var tenantID string
+	if err := tx.QueryRowContext(ctx, `SELECT tenant_id FROM notifications WHERE id = $1`, dl.NotificationID).Scan(&tenantID); err != nil {
+		return ReplayDeadLetterResult{}, fmt.Errorf("ensure replay attempt: tenant lookup: %w", err)
+	}
+	if _, err := createDispatchIntentTx(ctx, tx, CreateDispatchIntentParams{
+		ID:             "intent-" + attempt.ID,
+		NotificationID: attempt.NotificationID,
+		AttemptID:      attempt.ID,
+		TenantID:       tenantID,
+		Channel:        attempt.Channel,
+		Source:         "replay",
+		Status:         publishedIntentStatus(attempt.DispatchEnqueuedAt),
+		PublishedAt:    attempt.DispatchEnqueuedAt,
+	}); err != nil {
+		return ReplayDeadLetterResult{}, fmt.Errorf("ensure replay attempt: %w", err)
 	}
 	if dl.ReplayAttemptID == nil {
 		if _, err := tx.ExecContext(ctx, `UPDATE dead_letters SET replay_attempt_id = $2 WHERE id = $1 AND replay_attempt_id IS NULL`, deadLetterID, attempt.ID); err != nil {
