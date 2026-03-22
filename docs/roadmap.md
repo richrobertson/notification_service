@@ -2,13 +2,14 @@
 
 ## Current status
 
-The repository is currently **through Stage 8**, with earlier Stage 6 follow-up fixes and polish already merged.
+The repository is currently **through Stage 9**, with earlier Stage 6 follow-up fixes and polish already merged.
 
-- Stages 3 through 8 are complete
+- Stages 3 through 9 are complete
 - Stage 6 correctness and inspection improvements are in place
 - Stage 7 overload protection and tenant isolation are in place
 - Stage 8 dispatch outbox durability is in place
-- The next major milestone is **Stage 9**
+- Stage 9 advanced delivery controls are in place
+- The next major milestone is **Stage 10**
 
 ---
 
@@ -60,37 +61,42 @@ The repository is currently **through Stage 8**, with earlier Stage 6 follow-up 
 - Postgres as authoritative source for dispatch publication
 - Reduced reliance on scattered enqueue-recovery paths
 
+### Stage 9 — Advanced Delivery Controls
+- Scheduled delivery with durable promotion via `cmd/scheduler`
+- Delivery policy controls for tenant/channel pause, replay, scheduling, failover, and retry overrides
+- Manual cancellation of future scheduled notifications
+- Manual redrive of eligible deferred notification work
+- Narrow provider failover for webhook and secondary SMTP delivery
+- Audit visibility for failover and operator delivery-control actions
+
 ---
 
 ## In progress
 
 - No separate major milestone is currently in progress
-- The system is in a **stabilized post-Stage-8 state**
-- The next milestone is clearly **Stage 9**
+- The system is in a **stabilized post-Stage-9 state**
+- The next milestone is clearly **Stage 10**
 
 ---
 
 ## Next
 
-### Stage 9 — Advanced Delivery Controls
+### Stage 10 — Production / Platform Polish
 
-Focus: **richer delivery policy and platform sophistication**
+Focus: **operational maturity and platform hardening**
 
-- Provider failover strategies
-- Richer scheduling and delivery policies
-- Per-channel controls and tuning
-- Stronger tenant and platform controls
-- More advanced operational handling around delivery behavior
+- Security hardening
+- Expanded observability and metrics
+- Admin and operator workflows
+- Deployment and operational maturity
 
 ---
 
 ## Later
 
-### Stage 10 — Production / Platform Polish
-- Security hardening
-- Expanded observability and metrics
-- Admin and operator workflows
-- Deployment and operational maturity
+- Additional channels such as SMS
+- Richer provider routing and operational controls
+- More complete admin and operator experiences
 
 ---
 
@@ -102,7 +108,7 @@ Focus: **richer delivery policy and platform sophistication**
   - correctness
   - operator visibility
   - survivability under load
-- The primary remaining gap is **advanced delivery policy and platform sophistication**
+- The primary remaining gap is **production and platform polish**
 - The design continues to favor:
   - simple, explicit components
   - Postgres as source of truth

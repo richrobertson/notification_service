@@ -2,359 +2,157 @@
 
 ## Purpose
 
-The Multi-Tenant Notification Platform provides a reusable backend service for sending notifications across channels with strong reliability, tenant isolation, and operational visibility.
+The notification platform provides a tenant-scoped backend for durable asynchronous delivery across email and webhook channels, with explicit retry, scheduling, failover, and operator control behavior.
 
-The MVP supports:
+## Current Capabilities
+
 - email delivery
 - webhook delivery
-- asynchronous processing
+- asynchronous processing through Redis queues
 - idempotent submission
-- retries with exponential backoff
-- dead-letter handling
-- observability through logs, metrics, and traces
-
-## Problem Statement
-
-Many teams need to send transactional notifications, but implementing channel delivery, retries, idempotency, quotas, and observability independently leads to duplicated effort and inconsistent reliability.
-
-This platform centralizes those concerns behind a tenant-scoped API and an asynchronous processing model.
+- bounded retries and dead-letter handling
+- Postgres-backed dispatch publication through a narrow outbox
+- future scheduled delivery with durable promotion
+- tenant/channel delivery policy controls
+- audit, logs, metrics, and traces for operational visibility
 
 ## Goals
 
-- Expose a clean tenant-scoped API for notification submission
-- Keep submission latency low through asynchronous processing
-- Prevent duplicate sends through idempotency
-- Isolate tenants operationally and logically
-- Handle transient failures through bounded retries
-- Surface terminal failures through dead-letter processing
-- Make the full flow easy to debug and operate
+- keep the submission path fast and durable
+- make PostgreSQL the source of truth for notification and dispatch state
+- preserve at-least-once execution while suppressing duplicate work safely
+- keep tenant behavior explicit through policy instead of hidden worker heuristics
+- make failures inspectable, replayable, and operationally honest
 
 ## Non-Goals
 
-- Rich administrative UI in the MVP
-- Marketing campaign management
-- Complex scheduling features in the MVP
-- Full identity and user management
-- Exactly-once delivery guarantees
-- Broad provider support beyond initial channels
+- exactly-once delivery guarantees
+- generalized workflow orchestration
+- broad provider marketplaces or pluggable ecosystems
+- complex campaign management
+- rich administrative UI
 
-## Functional Requirements
+## Core Components
 
-- Create tenants
-- Create and update templates
-- Submit notification requests
-- Deliver notifications across supported channels
-- Track notification and delivery attempt status
-- Replay dead-lettered notifications
-- Inspect usage and dead-letter records
-
-## Non-Functional Requirements
-
-- Low-latency synchronous submission path
-- At-least-once asynchronous processing
-- Tenant isolation
-- Idempotent request handling
-- Recoverable failure handling
-- Observable system behavior
-- Secure secret and API key handling
-
-## System Context
-
-### Actors
-
-- Product team or service submitting notifications
-- Platform operator monitoring health and failures
-- Channel worker integrating with downstream delivery providers
-
-### External Dependencies
-
-- PostgreSQL for persistence
-- Redis or RabbitMQ for asynchronous delivery jobs
-- Email provider or stub transport for MVP
-- Webhook endpoints owned by downstream systems
-- OpenTelemetry Collector and metrics/tracing backends
-
-## High-Level Architecture
-
-### 1. API Service
+### API service
 
 Responsibilities:
-- authenticate incoming requests
-- validate tenant access
-- validate request shape
-- persist notification intent
+- authenticate and validate requests
 - enforce idempotency
-- expose read and operational endpoints
+- resolve delivery policy
+- persist notification and attempt state
+- expose inspection and operator endpoints
 
-### 2. Dispatcher
-
-Responsibilities:
-- consume newly accepted notifications
-- transform a notification into channel-specific delivery jobs
-- enqueue work for channel workers
-- update lifecycle state
-
-### 3. Channel Workers
+### Outbox publisher
 
 Responsibilities:
-- render templates with request variables
-- perform channel delivery
-- classify transient vs terminal failures
-- schedule retries when appropriate
-- write delivery results
-- emit telemetry
+- poll PostgreSQL for pending dispatch intents
+- publish Redis `notify:dispatch` jobs
+- mark intents published only after successful enqueue
+- leave failed publication work recoverable in PostgreSQL
 
-MVP workers:
-- email worker
-- webhook worker
-
-### 4. Quota and Rate-Limit Layer
+### Dispatcher
 
 Responsibilities:
-- enforce daily tenant quota
-- enforce submission rate limits
-- reject or throttle abusive traffic
+- consume generic dispatch jobs
+- route them to channel-specific Redis queues
+- keep Redis as execution transport rather than durable source of truth
 
-### 5. Dead-Letter Processor
+### Channel workers
 
 Responsibilities:
-- capture terminally failed jobs
-- expose dead-letter records for inspection
-- support replay flows
+- reserve and process channel jobs
+- render templates and call downstream providers
+- classify retryable versus terminal failures
+- apply narrow failover behavior when policy allows it
+- finalize durable attempt state
 
-## Request Lifecycle
+### Retry worker
 
-1. Client sends `POST /v1/notifications`
-2. API authenticates the request using tenant-scoped API key
-3. API validates tenant, template, and recipient payload
-4. API checks idempotency key
-5. API persists notification intent and initial status
-6. Dispatcher creates one job per channel
-7. Channel workers process queued jobs
-8. Workers update attempt state and notification aggregate state
-9. Failed jobs are retried with exponential backoff when eligible
-10. Exhausted jobs are written to dead-letter storage
-11. Operators may replay eligible dead-lettered jobs
+Responsibilities:
+- poll PostgreSQL for due retry attempts
+- create durable retry dispatch intents
+- reuse the same outbox publication path as initial delivery
 
-## Why the Architecture Looks This Way
+### Scheduler/promoter
 
-### Low-latency submission
-
-The client-facing API should not block on external provider delivery because provider latency and intermittent failures are normal. Persisting intent and processing asynchronously reduces client-visible latency and isolates downstream instability.
-
-### Channel isolation
-
-Each channel has different delivery semantics and failure patterns. Separate workers keep that logic isolated and allow future scaling per channel.
-
-### Explicit delivery attempts
-
-Notification lifecycle and delivery attempt lifecycle are separate because a single notification may fan out into multiple channels with independent outcomes.
+Responsibilities:
+- poll PostgreSQL for due scheduled notifications
+- promote eligible work into the outbox path
+- respect paused policy state before promotion
 
 ## Data Model
 
-### tenants
-- id
-- name
-- status
-- daily_quota
-- created_at
-
-### api_keys
-- id
-- tenant_id
-- key_hash
-- created_at
-- revoked_at
-
-### templates
-- id
-- tenant_id
-- name
-- channel
-- version
-- body
-- created_at
-
 ### notifications
-- id
-- tenant_id
-- template_id
-- idempotency_key
-- status
-- submitted_at
+
+- durable notification intent
+- aggregate notification status
+- scheduled delivery metadata through `scheduled_for`, `promoted_at`, and `cancelled_at`
+- recipient details and template linkage
 
 ### delivery_attempts
-- id
-- notification_id
-- channel
-- attempt_number
-- status
-- error_code
-- next_retry_at
-- completed_at
+
+- per-channel attempt records
+- monotonic attempt lifecycle
+- retry scheduling through `next_retry_at`
+- provider metadata through `provider_message_id`, `provider_used`, and `failover_used`
+
+### dispatch_outbox
+
+- one durable dispatch intent per publishable attempt
+- pending/publishing/published state
+- recoverable publication failures through `last_error`
+
+### delivery_policies
+
+- tenant/channel scoped controls
+- pause/resume state
+- failover, scheduling, and replay gating
+- retry override settings
 
 ### dead_letters
-- id
-- notification_id
-- channel
-- final_error
-- dead_lettered_at
+
+- durable record of exhausted attempts
+- replay linkage and operator inspection support
 
 ### audit_events
-- id
-- tenant_id
-- actor
-- action
-- resource_type
-- resource_id
-- created_at
 
-## Status Model
+- tenant-scoped lifecycle and operator actions
+- duplicate suppression, replay, failover, and policy events where tenant-scoped audit is valid
 
-### Notification Status
-- accepted
-- processing
-- partially_delivered
-- delivered
-- failed
-- dead_lettered
+## Request Lifecycle
 
-### Delivery Attempt Status
-- pending
-- in_progress
-- sent
-- delivered
-- failed
-- retry_scheduled
-- dead_lettered
-
-## API Boundaries
-
-### Tenant-scoped endpoints
-- create tenant
-- get tenant
-- create template
-- get template
-- update template
-- submit notification
-- get notification
-- get tenant usage
-
-### Operational endpoints
-- list dead letters
-- replay dead-lettered notification
-- health
-- readiness
-
-## Security Model
-
-- API keys are scoped to tenants
-- API keys are stored as hashes, not plaintext
-- all reads and writes are tenant-filtered
-- operational changes generate audit records
-- secrets are injected through configuration, not committed to source control
+1. Client sends `POST /v1/notifications`.
+2. API authenticates, validates, and checks idempotency.
+3. API resolves tenant/channel delivery policy.
+4. API writes notification state and initial attempt state in PostgreSQL.
+5. Immediate work gets a dispatch intent in `dispatch_outbox`; future scheduled work stays durable until due.
+6. The scheduler promotes due scheduled work by creating the dispatch intent later.
+7. The outbox publisher publishes Redis `notify:dispatch` jobs from pending intents.
+8. The dispatcher routes generic jobs to `notify:dispatch:webhook` or `notify:dispatch:email`.
+9. Channel workers process jobs, finalize attempt state, and schedule retry or dead-letter outcomes as needed.
+10. Retry and replay flows create durable attempts plus dispatch intents before Redis publication.
 
 ## Reliability Model
 
-### Idempotency
+- PostgreSQL is authoritative for notification, attempt, retry, scheduling, and dispatch-publication state.
+- Redis is execution transport, not the source of truth for what still needs to be dispatched.
+- Queueing remains at-least-once.
+- Attempt activation and terminalization are guarded in SQL to suppress duplicate worker execution.
+- Duplicate Redis jobs are tolerated underneath the Stage 6 attempt-level protections.
 
-Clients may safely retry notification submission without creating duplicate downstream sends when the same tenant and idempotency key are reused.
+## Operator Controls
 
-### Retry policy
+- inspect notifications and attempts
+- inspect and replay dead letters
+- cancel future scheduled notifications before promotion
+- redrive eligible deferred work
+- list, inspect, pause, resume, and update delivery policies
 
-Transient failures are retried using bounded exponential backoff. Terminal failures or exhausted retries result in dead-lettering.
+## Remaining Gaps
 
-### Dead-letter handling
-
-Dead letters are first-class operational artifacts. They are retained for inspection and may be replayed when the underlying issue is resolved.
-
-## Observability Model
-
-The platform emits:
-- structured logs
-- request and worker metrics
-- distributed traces
-
-Important telemetry dimensions:
-- tenant_id
-- channel
-- operation
-- status
-- error_code
-
-Suggested dashboards:
-- notification submission rate
-- success/failure rate by channel
-- retry count by channel
-- dead-letter count
-- p95 API latency
-- worker processing latency
-- queue depth
-
-## Scalability
-
-### Horizontal scaling
-
-- API service scales independently from workers
-- each worker type can scale independently based on backlog or utilization
-- queue decoupling reduces tight coupling between ingestion and delivery
-
-### Future scaling opportunities
-
-- separate queue per channel
-- partitioning by tenant or notification class
-- dedicated usage aggregation pipeline
-- provider-specific worker pools
-
-## Failure Scenarios
-
-### Duplicate client submission
-Handled through idempotency key lookup and reuse of existing notification record.
-
-### Email provider timeout
-Classified as transient failure and retried with exponential backoff.
-
-### Invalid webhook URL
-Classified as terminal failure and dead-lettered after validation or first failure depending on policy.
-
-### Database unavailable
-Readiness fails and write operations return failure rather than accepting work that cannot be persisted.
-
-### Queue unavailable
-Submission should fail fast or stop dispatching based on configuration, but the system must not silently drop accepted notifications.
-
-## Deployment Model
-
-### Local development
-- Docker Compose for Postgres, queue, and observability stack
-- API, dispatcher, and workers running locally or in Compose
-
-### Production-style deployment
-- containerized services
-- Kubernetes Deployments for API and workers
-- readiness and liveness probes
-- autoscaling for worker deployments
-- environment-based configuration
-
-## Tradeoffs
-
-### Why REST first instead of gRPC?
-REST is easier to consume broadly, easier to demonstrate, and aligns with externally facing platform API patterns.
-
-### Why email and webhook first?
-They demonstrate the important architecture without ballooning provider integration complexity.
-
-### Why not exactly-once delivery?
-Exactly-once semantics introduce significant complexity across distributed boundaries. At-least-once delivery with idempotent submission is the practical MVP choice.
-
-## Future Work
-
-- SMS channel
-- push/in-app channel
-- scheduled delivery
-- admin UI
-- Terraform provisioning
-- Kubernetes autoscaling policies
-- richer usage analytics
-- per-tenant retry policies
-- webhook signing
+- no exactly-once semantics
+- no multi-region active/active coordination
+- no generalized event bus or CDC pipeline
+- no full admin UI
+- no broad provider routing marketplace
