@@ -710,12 +710,7 @@ func (p *Postgres) EnsureInitialAttempt(ctx context.Context, notificationID, cha
 		VALUES ($1, $2, $3, 1, 'pending', NULL, 'initial')
 		ON CONFLICT (notification_id, channel, attempt_number) DO NOTHING
 	`
-	result, err := tx.ExecContext(ctx, insertQuery, attemptID, notificationID, channel)
-	if err != nil {
-		return DeliveryAttempt{}, DispatchIntent{}, wrapStoreError("ensure initial attempt", err)
-	}
-	rowsAffected, err := result.RowsAffected()
-	if err != nil {
+	if _, err := tx.ExecContext(ctx, insertQuery, attemptID, notificationID, channel); err != nil {
 		return DeliveryAttempt{}, DispatchIntent{}, wrapStoreError("ensure initial attempt", err)
 	}
 	const selectQuery = `
@@ -747,10 +742,8 @@ func (p *Postgres) EnsureInitialAttempt(ctx context.Context, notificationID, cha
 	if err := tx.Commit(); err != nil {
 		return DeliveryAttempt{}, DispatchIntent{}, fmt.Errorf("ensure initial attempt: commit: %w", err)
 	}
-	if rowsAffected > 0 {
-		if err := p.RecalculateNotificationStatus(ctx, notificationID); err != nil {
-			return DeliveryAttempt{}, DispatchIntent{}, err
-		}
+	if err := p.RecalculateNotificationStatus(ctx, notificationID); err != nil {
+		return DeliveryAttempt{}, DispatchIntent{}, err
 	}
 	return attempt, intent, nil
 }
