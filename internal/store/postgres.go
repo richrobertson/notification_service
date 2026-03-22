@@ -333,6 +333,16 @@ func (p *Postgres) GetTemplateByID(ctx context.Context, id string) (Template, er
 }
 
 func (p *Postgres) CreateNotification(ctx context.Context, params CreateNotificationParams) (Notification, error) {
+	notification, err := createNotificationTx(ctx, p.DB, params)
+	if err != nil {
+		return Notification{}, err
+	}
+	return notification, nil
+}
+
+func createNotificationTx(ctx context.Context, querier interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, params CreateNotificationParams) (Notification, error) {
 	const query = `
 		INSERT INTO notifications (
 			id,
@@ -365,7 +375,7 @@ func (p *Postgres) CreateNotification(ctx context.Context, params CreateNotifica
 
 	var notification Notification
 	var rawVariables []byte
-	err = p.DB.QueryRowContext(
+	err = querier.QueryRowContext(
 		ctx,
 		query,
 		params.ID,
@@ -406,50 +416,7 @@ func (p *Postgres) CreateNotificationWithInitialDispatch(ctx context.Context, pa
 	}
 	defer tx.Rollback()
 
-	variablesJSON, err := marshalVariables(params.Notification.Variables)
-	if err != nil {
-		return Notification{}, DeliveryAttempt{}, DispatchIntent{}, fmt.Errorf("create notification with initial dispatch: %w", err)
-	}
-
-	var notification Notification
-	var rawVariables []byte
-	err = tx.QueryRowContext(ctx, `
-		INSERT INTO notifications (
-			id,
-			tenant_id,
-			template_id,
-			idempotency_key,
-			status,
-			recipient_email,
-			recipient_webhook_url,
-			variables
-		)
-		VALUES ($1, $2, $3, $4, 'accepted', $5, $6, $7::jsonb)
-		RETURNING id, tenant_id, template_id, idempotency_key, status, recipient_email, recipient_webhook_url, variables, submitted_at, updated_at
-	`,
-		params.Notification.ID,
-		params.Notification.TenantID,
-		params.Notification.TemplateID,
-		params.Notification.IdempotencyKey,
-		params.Notification.RecipientEmail,
-		params.Notification.RecipientWebhookURL,
-		variablesJSON,
-	).Scan(
-		&notification.ID,
-		&notification.TenantID,
-		&notification.TemplateID,
-		&notification.IdempotencyKey,
-		&notification.Status,
-		&notification.RecipientEmail,
-		&notification.RecipientWebhookURL,
-		&rawVariables,
-		&notification.SubmittedAt,
-		&notification.UpdatedAt,
-	)
-	if err != nil {
-		return Notification{}, DeliveryAttempt{}, DispatchIntent{}, wrapStoreError("create notification with initial dispatch", err)
-	}
-	notification.Variables, err = unmarshalVariables(rawVariables)
+	notification, err := createNotificationTx(ctx, tx, params.Notification)
 	if err != nil {
 		return Notification{}, DeliveryAttempt{}, DispatchIntent{}, fmt.Errorf("create notification with initial dispatch: %w", err)
 	}
