@@ -2171,6 +2171,37 @@ func (p *Postgres) PromoteDueScheduledNotifications(ctx context.Context, limit i
 		  AND n.promoted_at IS NULL
 		  AND n.cancelled_at IS NULL
 		  AND NOT EXISTS (SELECT 1 FROM dispatch_outbox o WHERE o.attempt_id = da.id)
+		  AND COALESCE(
+			(
+				SELECT p_tc.paused
+				FROM delivery_policies p_tc
+				WHERE p_tc.tenant_id = n.tenant_id AND p_tc.channel = da.channel
+				ORDER BY p_tc.updated_at DESC
+				LIMIT 1
+			),
+			(
+				SELECT p_t.paused
+				FROM delivery_policies p_t
+				WHERE p_t.tenant_id = n.tenant_id AND p_t.channel IS NULL
+				ORDER BY p_t.updated_at DESC
+				LIMIT 1
+			),
+			(
+				SELECT p_gc.paused
+				FROM delivery_policies p_gc
+				WHERE p_gc.tenant_id IS NULL AND p_gc.channel = da.channel
+				ORDER BY p_gc.updated_at DESC
+				LIMIT 1
+			),
+			(
+				SELECT p_g.paused
+				FROM delivery_policies p_g
+				WHERE p_g.tenant_id IS NULL AND p_g.channel IS NULL
+				ORDER BY p_g.updated_at DESC
+				LIMIT 1
+			),
+			false
+		  ) = false
 		ORDER BY n.scheduled_for ASC, n.submitted_at ASC
 		FOR UPDATE OF n, da SKIP LOCKED
 		LIMIT $1
@@ -2193,13 +2224,6 @@ func (p *Postgres) PromoteDueScheduledNotifications(ctx context.Context, limit i
 		item.Notification.Variables, err = unmarshalVariables(rawVariables)
 		if err != nil {
 			return nil, fmt.Errorf("promote scheduled notifications: %w", err)
-		}
-		policy, err := p.ResolveDeliveryPolicy(ctx, item.Notification.TenantID, item.Attempt.Channel)
-		if err != nil {
-			return nil, err
-		}
-		if policy.Paused {
-			continue
 		}
 		item.Intent, err = createDispatchIntentTx(ctx, tx, CreateDispatchIntentParams{
 			ID:             "intent-" + item.Attempt.ID,
@@ -2250,6 +2274,15 @@ func (p *Postgres) CancelScheduledNotification(ctx context.Context, notification
 		return Notification{}, fmt.Errorf("cancel scheduled notification: rows affected: %w", err)
 	}
 	if rows == 0 {
+		var exists bool
+		if err := p.DB.QueryRowContext(ctx, `
+			SELECT EXISTS (SELECT 1 FROM notifications WHERE id = $1)
+		`, notificationID).Scan(&exists); err != nil {
+			return Notification{}, fmt.Errorf("cancel scheduled notification: check existence: %w", err)
+		}
+		if !exists {
+			return Notification{}, fmt.Errorf("cancel scheduled notification: %w", ErrNotFound)
+		}
 		return Notification{}, fmt.Errorf("cancel scheduled notification: %w", ErrInvalidStateTransition)
 	}
 	return p.GetNotificationByID(ctx, notificationID)
@@ -2270,13 +2303,23 @@ func (p *Postgres) RedriveNotification(ctx context.Context, notificationID strin
 		FROM notifications n
 		JOIN delivery_attempts da ON da.notification_id = n.id AND da.enqueue_kind = 'initial' AND da.attempt_number = 1
 		WHERE n.id = $1
+		  AND n.promoted_at IS NULL
+		  AND n.cancelled_at IS NULL
+		  AND NOT EXISTS (SELECT 1 FROM dispatch_outbox o WHERE o.attempt_id = da.id)
 		FOR UPDATE OF n, da
 	`, notificationID).Scan(
 		&item.Notification.ID, &item.Notification.TenantID, &item.Notification.TemplateID, &item.Notification.IdempotencyKey, &item.Notification.Status, &item.Notification.RecipientEmail, &item.Notification.RecipientWebhookURL, &item.Notification.SecondaryWebhookURL, &rawVariables, &item.Notification.ScheduledFor, &item.Notification.PromotedAt, &item.Notification.CancelledAt, &item.Notification.SubmittedAt, &item.Notification.UpdatedAt,
 		&item.Attempt.ID, &item.Attempt.NotificationID, &item.Attempt.Channel, &item.Attempt.AttemptNumber, &item.Attempt.Status, &item.Attempt.ErrorCode, &item.Attempt.ErrorMessage, &item.Attempt.ProviderMessageID, &item.Attempt.LastError, &item.Attempt.NextRetryAt, &item.Attempt.StartedAt, &item.Attempt.CompletedAt, &item.Attempt.SentAt, &item.Attempt.FailedAt, &item.Attempt.DispatchEnqueuedAt, &item.Attempt.EnqueueKind, &item.Attempt.CreatedAt, &item.Attempt.UpdatedAt,
 	); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return PromotedScheduledNotification{}, fmt.Errorf("redrive notification: %w", ErrNotFound)
+			var exists bool
+			if err := p.DB.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM notifications WHERE id = $1)`, notificationID).Scan(&exists); err != nil {
+				return PromotedScheduledNotification{}, fmt.Errorf("redrive notification: check existence: %w", err)
+			}
+			if !exists {
+				return PromotedScheduledNotification{}, fmt.Errorf("redrive notification: %w", ErrNotFound)
+			}
+			return PromotedScheduledNotification{}, fmt.Errorf("redrive notification: %w", ErrInvalidStateTransition)
 		}
 		return PromotedScheduledNotification{}, fmt.Errorf("redrive notification: %w", err)
 	}

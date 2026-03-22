@@ -137,7 +137,7 @@ CREATE INDEX dispatch_outbox_pending_idx
 CREATE TABLE delivery_policies (
     id TEXT PRIMARY KEY,
     tenant_id TEXT REFERENCES tenants(id) ON DELETE CASCADE,
-    channel channel_type,
+    channel TEXT CHECK (channel IN ('email', 'webhook')),
     paused BOOLEAN,
     failover_enabled BOOLEAN,
     scheduling_enabled BOOLEAN,

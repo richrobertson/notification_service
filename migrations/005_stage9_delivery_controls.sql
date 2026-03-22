@@ -2,19 +2,47 @@ BEGIN;
 
 DO $$
 BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_enum
-        WHERE enumtypid = 'notification_status'::regtype
-          AND enumlabel = 'scheduled'
+    IF EXISTS (
+        SELECT 1
+        FROM pg_type
+        WHERE typname = 'notification_status'
+          AND typtype = 'e'
     ) THEN
-        ALTER TYPE notification_status ADD VALUE 'scheduled';
-    END IF;
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_enum
-        WHERE enumtypid = 'notification_status'::regtype
-          AND enumlabel = 'cancelled'
-    ) THEN
-        ALTER TYPE notification_status ADD VALUE 'cancelled';
+        IF NOT EXISTS (
+            SELECT 1
+            FROM pg_enum e
+            JOIN pg_type t ON t.oid = e.enumtypid
+            WHERE t.typname = 'notification_status'
+              AND e.enumlabel = 'scheduled'
+        ) THEN
+            ALTER TYPE notification_status ADD VALUE 'scheduled';
+        END IF;
+        IF NOT EXISTS (
+            SELECT 1
+            FROM pg_enum e
+            JOIN pg_type t ON t.oid = e.enumtypid
+            WHERE t.typname = 'notification_status'
+              AND e.enumlabel = 'cancelled'
+        ) THEN
+            ALTER TYPE notification_status ADD VALUE 'cancelled';
+        END IF;
+    ELSE
+        ALTER TABLE notifications
+            DROP CONSTRAINT IF EXISTS notifications_status_check;
+
+        ALTER TABLE notifications
+            ADD CONSTRAINT notifications_status_check CHECK (
+                status IN (
+                    'accepted',
+                    'scheduled',
+                    'processing',
+                    'partially_delivered',
+                    'delivered',
+                    'failed',
+                    'dead_lettered',
+                    'cancelled'
+                )
+            );
     END IF;
 END$$;
 

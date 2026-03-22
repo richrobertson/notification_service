@@ -342,15 +342,6 @@ func (a *API) CreateNotification() http.HandlerFunc {
 			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
 			return
 		}
-		policy, err := a.store.ResolveDeliveryPolicy(r.Context(), req.TenantID, template.Channel)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
-			return
-		}
-		if req.ScheduledFor != nil && !policy.SchedulingEnabled {
-			writeError(w, http.StatusConflict, "conflict", "scheduled delivery is disabled for this tenant/channel")
-			return
-		}
 		if req.IdempotencyKey != "" {
 			existing, err := a.store.GetNotificationByTenantAndIdempotencyKey(r.Context(), req.TenantID, req.IdempotencyKey)
 			if err == nil {
@@ -361,6 +352,15 @@ func (a *API) CreateNotification() http.HandlerFunc {
 				writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
 				return
 			}
+		}
+		policy, err := a.store.ResolveDeliveryPolicy(r.Context(), req.TenantID, template.Channel)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
+			return
+		}
+		if req.ScheduledFor != nil && !policy.SchedulingEnabled {
+			writeError(w, http.StatusConflict, "conflict", "scheduled delivery is disabled for this tenant/channel")
+			return
 		}
 		params := store.CreateNotificationParams{ID: req.ID, TenantID: req.TenantID, TemplateID: req.TemplateID, Variables: req.Variables}
 		if req.IdempotencyKey != "" {
@@ -613,6 +613,26 @@ func (a *API) UpsertPolicy() http.HandlerFunc {
 		if strings.TrimSpace(req.ID) == "" {
 			writeError(w, http.StatusBadRequest, "bad_request", "id is required")
 			return
+		}
+		if req.Channel != nil && *req.Channel != "email" && *req.Channel != "webhook" {
+			writeError(w, http.StatusBadRequest, "bad_request", "channel must be one of: email, webhook")
+			return
+		}
+		for _, value := range []*int{req.MaxAttemptsOverride, req.RetryBaseDelaySeconds, req.RetryMaxDelaySeconds} {
+			if value != nil && *value <= 0 {
+				writeError(w, http.StatusBadRequest, "bad_request", "numeric policy overrides must be greater than 0")
+				return
+			}
+		}
+		if req.TenantID != nil && strings.TrimSpace(*req.TenantID) != "" {
+			if _, err := a.store.GetTenantByID(r.Context(), *req.TenantID); err != nil {
+				if errors.Is(err, store.ErrNotFound) {
+					writeError(w, http.StatusNotFound, "not_found", "tenant not found")
+					return
+				}
+				writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
+				return
+			}
 		}
 		policy, err := a.store.UpsertDeliveryPolicy(r.Context(), store.UpsertDeliveryPolicyParams{
 			ID:                    req.ID,
