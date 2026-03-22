@@ -14,11 +14,10 @@ I built a tenant-scoped REST API backed by persistent notification intent, async
 I chose REST for broad usability and faster implementation, asynchronous processing to isolate downstream provider latency, and a simple queue technology for MVP speed. I limited the first version to email and webhook to keep the architecture deep without letting integrations sprawl.
 
 ## Reliability Story
-The system supports idempotent submission, bounded exponential backoff, and dead-letter replay, which makes failures visible and recoverable instead of hidden or silently dropped.
+The system supports idempotent submission, bounded exponential backoff, dead-letter replay, and a Postgres-backed outbox for durable dispatch publication, which makes failures visible and recoverable instead of hidden or silently dropped.
 
 ## Operational Story
-I instrumented the request path and worker pipeline with structured logs, metrics, and traces so it is easy to debug issues like queue backlog, retry storms, or provider-specific failures.
+I instrumented the request path and worker pipeline with structured logs, metrics, and traces so it is easy to debug issues like queue backlog, retry storms, scheduled promotion lag, paused policy scopes, or provider-specific failures.
 
 ## What I’d Add Next
-I would add SMS, scheduled delivery, per-tenant policies, and a simple operations UI, but only after the core delivery and observability loop proved stable.
-
+I would add SMS, richer operator workflows, and deeper provider routing controls, but only after the current delivery policy and observability loop proved stable.

@@ -235,7 +235,7 @@ Existing:
 - `SMTP_STARTTLS`
 - `SMTP_INSECURE_SKIP_VERIFY`
 
-New in Stage 5:
+Delivery, scheduling, and policy controls:
 
 - `RETRY_MAX_ATTEMPTS`
 - `RETRY_BASE_DELAY`
@@ -266,15 +266,15 @@ The roadmap remains deliberately pragmatic. The service still does **not** provi
 - advanced cross-region or multi-region replication guarantees
 - generalized duplicate suppression across every possible crash boundary
 - fully pluggable provider ecosystems or marketplace-style provider routing
-- rate limiting / quota enforcement beyond whatever already exists in the broader codebase
+- richer tenant/platform quotas and policy controls beyond the current Stage 9 model
 - an admin UI or operator console
 - distributed coordination or leader election for recovery/retry/outbox workers
 
 Those remain future milestones, with the next major gap centered on production/platform polish rather than basic durability, policy control, or survivability under load.
 
-## Stage 7: Backpressure, rate limiting, and tenant isolation
+## Load Protection and Tenant Isolation
 
-Stage 7 adds graceful degradation controls while keeping the existing Redis + Postgres architecture.
+The service applies graceful degradation controls while keeping the existing Redis + Postgres architecture.
 
 ### Overload behavior
 - The API now applies a per-tenant Redis-backed fixed-window rate limit and returns `429 Too Many Requests` with `Retry-After` when exceeded.
