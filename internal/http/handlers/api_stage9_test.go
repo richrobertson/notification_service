@@ -120,6 +120,33 @@ func TestPolicyEndpointsPauseAndResume(t *testing.T) {
 	}
 }
 
+func TestGlobalPolicyPauseAndResumeSkipTenantScopedAudit(t *testing.T) {
+	st, _, api := newDeadLetterTestAPI()
+	st.policies = map[string]store.DeliveryPolicy{
+		"policy-global": {ID: "policy-global"},
+	}
+
+	pauseReq := httptest.NewRequest(http.MethodPost, "/v1/policies/policy-global/pause", nil)
+	pauseReq.SetPathValue("id", "policy-global")
+	pauseRes := httptest.NewRecorder()
+	api.PausePolicy().ServeHTTP(pauseRes, pauseReq)
+	if pauseRes.Code != http.StatusOK {
+		t.Fatalf("pause status=%d body=%s", pauseRes.Code, pauseRes.Body.String())
+	}
+
+	resumeReq := httptest.NewRequest(http.MethodPost, "/v1/policies/policy-global/resume", nil)
+	resumeReq.SetPathValue("id", "policy-global")
+	resumeRes := httptest.NewRecorder()
+	api.ResumePolicy().ServeHTTP(resumeRes, resumeReq)
+	if resumeRes.Code != http.StatusOK {
+		t.Fatalf("resume status=%d body=%s", resumeRes.Code, resumeRes.Body.String())
+	}
+
+	if len(st.auditActions) != 0 {
+		t.Fatalf("expected no tenant-scoped audit for global policy actions, got %v", st.auditActions)
+	}
+}
+
 func TestUpsertPolicyTreatsBlankTenantIDAsGlobal(t *testing.T) {
 	st, _, api := newDeadLetterTestAPI()
 	body := []byte(`{"id":"policy-global","tenant_id":"   ","channel":"email","failover_enabled":true}`)
@@ -133,6 +160,9 @@ func TestUpsertPolicyTreatsBlankTenantIDAsGlobal(t *testing.T) {
 	}
 	if policy := st.policies["policy-global"]; policy.TenantID != nil {
 		t.Fatalf("expected global policy tenant_id to be nil, got %+v", policy.TenantID)
+	}
+	if len(st.auditActions) != 0 {
+		t.Fatalf("expected no tenant-scoped audit for global policy, got %v", st.auditActions)
 	}
 }
 

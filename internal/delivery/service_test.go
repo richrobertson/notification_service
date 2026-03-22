@@ -12,27 +12,28 @@ import (
 )
 
 type stubStore struct {
-	notification     store.Notification
-	template         store.Template
-	attempt          store.DeliveryAttempt
-	loadErr          error
-	inProgressErr    error
-	sentErr          error
-	failedErr        error
-	scheduleRetryErr error
-	deadLetterErr    error
-	insertDeadErr    error
-	inProgressCall   int
-	failedMsg        string
-	scheduledMsg     string
-	scheduledAt      *time.Time
-	deadLetterMsg    string
-	insertedDead     *store.DeadLetter
-	auditActions     []string
-	auditTenantIDs   map[string]string
-	resolvedPolicy   store.ResolvedDeliveryPolicy
-	providerUsed     string
-	failoverUsed     bool
+	notification      store.Notification
+	template          store.Template
+	attempt           store.DeliveryAttempt
+	loadErr           error
+	inProgressErr     error
+	updateProviderErr error
+	sentErr           error
+	failedErr         error
+	scheduleRetryErr  error
+	deadLetterErr     error
+	insertDeadErr     error
+	inProgressCall    int
+	failedMsg         string
+	scheduledMsg      string
+	scheduledAt       *time.Time
+	deadLetterMsg     string
+	insertedDead      *store.DeadLetter
+	auditActions      []string
+	auditTenantIDs    map[string]string
+	resolvedPolicy    store.ResolvedDeliveryPolicy
+	providerUsed      string
+	failoverUsed      bool
 }
 
 func (s *stubStore) LoadDeliveryJob(context.Context, string, string) (store.Notification, store.Template, store.DeliveryAttempt, error) {
@@ -59,7 +60,7 @@ func (s *stubStore) ResolveDeliveryPolicy(context.Context, string, string) (stor
 func (s *stubStore) UpdateAttemptProvider(_ context.Context, _ string, provider string, failoverUsed bool) error {
 	s.providerUsed = provider
 	s.failoverUsed = failoverUsed
-	return nil
+	return s.updateProviderErr
 }
 func (s *stubStore) MarkAttemptSent(context.Context, string, *string) error { return s.sentErr }
 func (s *stubStore) MarkAttemptFailed(context.Context, string, string) error {
@@ -265,6 +266,31 @@ func TestServiceUsesEmailFailoverOnRetryableError(t *testing.T) {
 		t.Fatalf("Outcome=%v", result.Outcome)
 	}
 	if st.providerUsed != "smtp_secondary" || !st.failoverUsed {
+		t.Fatalf("provider=%q failover=%v", st.providerUsed, st.failoverUsed)
+	}
+}
+
+func TestServiceDoesNotFailSentDeliveryWhenProviderMetadataUpdateFails(t *testing.T) {
+	to := "to@example.test"
+	st := &stubStore{
+		notification:      store.Notification{ID: "notif-1", TenantID: "tenant-1", RecipientEmail: &to, Variables: map[string]any{"name": "Ada"}},
+		template:          store.Template{Name: "welcome", Body: "hello {{.name}}"},
+		attempt:           store.DeliveryAttempt{ID: "attempt-1", NotificationID: "notif-1", AttemptNumber: 1},
+		resolvedPolicy:    store.ResolvedDeliveryPolicy{SchedulingEnabled: true, ReplayAllowed: true},
+		updateProviderErr: errors.New("transient metadata write failure"),
+	}
+	svc, err := NewService(st, stubWebhookSender{}, stubWebhookSender{}, stubEmailSender{}, stubEmailSender{}, RetryPolicy{MaxAttempts: 3, BaseDelay: 5 * time.Second, MaxDelay: time.Minute, Now: time.Now, IDGenerator: func() string { return "audit-1" }, RandSource: rand.New(rand.NewSource(1))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := svc.ProcessEmail(context.Background(), queue.DispatchJob{AttemptID: "attempt-1", NotificationID: "notif-1", TenantID: "tenant-1", Channel: "email"})
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if result.Outcome != OutcomeSent {
+		t.Fatalf("Outcome=%v", result.Outcome)
+	}
+	if st.providerUsed != "smtp_primary" || st.failoverUsed {
 		t.Fatalf("provider=%q failover=%v", st.providerUsed, st.failoverUsed)
 	}
 }

@@ -119,6 +119,14 @@ func (a *API) recordAudit(ctx context.Context, tenantID, actor, action, resource
 	}
 }
 
+func (a *API) recordPolicyAudit(ctx context.Context, policy store.DeliveryPolicy, action string) {
+	if policy.TenantID == nil || strings.TrimSpace(*policy.TenantID) == "" {
+		slog.Default().Info("skipping tenant-scoped audit for global delivery policy action", slog.String("action", action), slog.String("policy_id", policy.ID))
+		return
+	}
+	a.recordAudit(ctx, *policy.TenantID, "api", action, "delivery_policy", policy.ID, map[string]any{})
+}
+
 func (a *API) enforceRateLimit(ctx context.Context, w http.ResponseWriter, tenantID string) bool {
 	if a.limiter == nil || tenantID == "" {
 		return true
@@ -659,11 +667,7 @@ func (a *API) UpsertPolicy() http.HandlerFunc {
 			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
 			return
 		}
-		tenantID := ""
-		if policy.TenantID != nil {
-			tenantID = *policy.TenantID
-		}
-		a.recordAudit(r.Context(), tenantID, "api", "delivery_policy_updated", "delivery_policy", policy.ID, map[string]any{})
+		a.recordPolicyAudit(r.Context(), policy, "delivery_policy_updated")
 		writeJSON(w, http.StatusOK, policy)
 	}
 }
@@ -679,11 +683,7 @@ func (a *API) PausePolicy() http.HandlerFunc {
 			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
 			return
 		}
-		tenantID := ""
-		if policy.TenantID != nil {
-			tenantID = *policy.TenantID
-		}
-		a.recordAudit(r.Context(), tenantID, "api", "delivery_paused", "delivery_policy", policy.ID, map[string]any{})
+		a.recordPolicyAudit(r.Context(), policy, "delivery_paused")
 		writeJSON(w, http.StatusOK, policy)
 	}
 }
@@ -699,11 +699,7 @@ func (a *API) ResumePolicy() http.HandlerFunc {
 			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
 			return
 		}
-		tenantID := ""
-		if policy.TenantID != nil {
-			tenantID = *policy.TenantID
-		}
-		a.recordAudit(r.Context(), tenantID, "api", "delivery_resumed", "delivery_policy", policy.ID, map[string]any{})
+		a.recordPolicyAudit(r.Context(), policy, "delivery_resumed")
 		writeJSON(w, http.StatusOK, policy)
 	}
 }

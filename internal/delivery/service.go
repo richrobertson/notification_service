@@ -219,13 +219,13 @@ func (s *Service) process(ctx context.Context, job queue.DispatchJob, sender fun
 	}
 	providerID, providerName, failoverUsed, err := sender(ctx, notification, template, resolvedPolicy)
 	if err == nil {
-		if providerName != "" {
-			if updateErr := s.store.UpdateAttemptProvider(ctx, job.AttemptID, providerName, failoverUsed); updateErr != nil {
-				return Result{}, updateErr
-			}
-		}
 		if err := s.store.MarkAttemptSent(ctx, job.AttemptID, providerID); err != nil {
 			return Result{}, err
+		}
+		if providerName != "" {
+			if updateErr := s.store.UpdateAttemptProvider(ctx, job.AttemptID, providerName, failoverUsed); updateErr != nil {
+				slog.Default().Warn("failed to update attempt provider metadata", slog.String("attempt_id", job.AttemptID), slog.String("notification_id", job.NotificationID), slog.String("channel", job.Channel), slog.String("provider_name", providerName), slog.Bool("failover_used", failoverUsed), slog.Any("error", updateErr))
+			}
 		}
 		if failoverUsed {
 			_ = s.store.RecordAuditEvent(ctx, s.policy.IDGenerator(), job.TenantID, "worker", "provider_failover_used", "delivery_attempt", job.AttemptID, map[string]any{"notification_id": job.NotificationID, "channel": job.Channel, "provider": providerName})

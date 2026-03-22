@@ -2264,7 +2264,16 @@ func (p *Postgres) CancelScheduledNotification(ctx context.Context, notification
 	result, err := p.DB.ExecContext(ctx, `
 		UPDATE notifications
 		SET status = 'cancelled', cancelled_at = NOW(), updated_at = NOW()
-		WHERE id = $1 AND scheduled_for IS NOT NULL AND promoted_at IS NULL AND cancelled_at IS NULL
+		WHERE id = $1
+		  AND scheduled_for > NOW()
+		  AND status = 'scheduled'
+		  AND promoted_at IS NULL
+		  AND cancelled_at IS NULL
+		  AND NOT EXISTS (
+			SELECT 1
+			FROM dispatch_outbox o
+			WHERE o.notification_id = notifications.id
+		  )
 	`, notificationID)
 	if err != nil {
 		return Notification{}, fmt.Errorf("cancel scheduled notification: %w", err)

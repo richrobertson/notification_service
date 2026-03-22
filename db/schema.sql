@@ -209,3 +209,8 @@ CREATE TRIGGER delivery_attempts_set_updated_at
 BEFORE UPDATE ON delivery_attempts
 FOR EACH ROW
 EXECUTE FUNCTION set_updated_at();
+
+CREATE TRIGGER notifications_set_updated_at
+BEFORE UPDATE ON notifications
+FOR EACH ROW
+EXECUTE FUNCTION set_updated_at();
