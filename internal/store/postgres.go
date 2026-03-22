@@ -1565,6 +1565,10 @@ func (p *Postgres) ClaimPendingDispatchIntents(ctx context.Context, limit int, s
 	if limit <= 0 {
 		limit = 100
 	}
+	staleAfterSeconds := int(staleAfter / time.Second)
+	if staleAfter > 0 && staleAfterSeconds == 0 {
+		staleAfterSeconds = 1
+	}
 	rows, err := p.DB.QueryContext(ctx, `
 		WITH claimed AS (
 			UPDATE dispatch_outbox AS o
@@ -1584,7 +1588,7 @@ func (p *Postgres) ClaimPendingDispatchIntents(ctx context.Context, limit int, s
 		FROM claimed c
 		LEFT JOIN dead_letters dl ON dl.replay_attempt_id = c.attempt_id
 		ORDER BY c.created_at ASC
-	`, limit, int(staleAfter/time.Second))
+	`, limit, staleAfterSeconds)
 	if err != nil {
 		return nil, fmt.Errorf("claim pending dispatch intents: %w", err)
 	}

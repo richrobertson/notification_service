@@ -24,9 +24,13 @@ type Queue interface {
 
 type IDGenerator func(prefix string) string
 
-const claimTimeout = 30 * time.Second
-const publishTimeout = claimTimeout / 2
-const claimBatchSize = 10
+const (
+	claimBatchSize = 10
+	publishTimeout = 15 * time.Second
+	// claimTimeout is the stale-reclaim window for a claimed batch.
+	// Keep it comfortably above the worst-case time to publish the full batch.
+	claimTimeout = (claimBatchSize + 1) * publishTimeout
+)
 
 func RunOnce(ctx context.Context, logger *slog.Logger, st Store, q Queue, softLimit int, generateID IDGenerator) error {
 	if q == nil {
