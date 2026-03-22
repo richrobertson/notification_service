@@ -56,6 +56,21 @@ func TestCancelScheduledNotification(t *testing.T) {
 	}
 }
 
+func TestCancelScheduledNotificationNotFound(t *testing.T) {
+	st, _, api := newDeadLetterTestAPI()
+	st.cancelErr = store.ErrNotFound
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/notifications/missing/cancel", nil)
+	req.SetPathValue("id", "missing")
+	res := httptest.NewRecorder()
+
+	api.CancelNotification().ServeHTTP(res, req)
+
+	if res.Code != http.StatusNotFound {
+		t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
+	}
+}
+
 func TestReplayBlockedWhenPolicyDisablesReplay(t *testing.T) {
 	st, _, api := newDeadLetterTestAPI()
 	st.resolvedPolicy = store.ResolvedDeliveryPolicy{TenantID: "tenant-1", Channel: "email", SchedulingEnabled: true, ReplayAllowed: false}
@@ -102,6 +117,22 @@ func TestPolicyEndpointsPauseAndResume(t *testing.T) {
 	}
 	if policy := st.policies["policy-1"]; policy.Paused == nil || *policy.Paused {
 		t.Fatalf("resumed policy=%+v", policy)
+	}
+}
+
+func TestUpsertPolicyTreatsBlankTenantIDAsGlobal(t *testing.T) {
+	st, _, api := newDeadLetterTestAPI()
+	body := []byte(`{"id":"policy-global","tenant_id":"   ","channel":"email","failover_enabled":true}`)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/policies", bytes.NewReader(body))
+	res := httptest.NewRecorder()
+	api.UpsertPolicy().ServeHTTP(res, req)
+
+	if res.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
+	}
+	if policy := st.policies["policy-global"]; policy.TenantID != nil {
+		t.Fatalf("expected global policy tenant_id to be nil, got %+v", policy.TenantID)
 	}
 }
 

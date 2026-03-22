@@ -75,4 +75,7 @@ CREATE TABLE IF NOT EXISTS delivery_policies (
 CREATE INDEX IF NOT EXISTS delivery_policies_scope_idx
     ON delivery_policies (tenant_id, channel);
 
+CREATE INDEX IF NOT EXISTS delivery_policies_scope_updated_idx
+    ON delivery_policies (tenant_id, channel, updated_at DESC);
+
 COMMIT;

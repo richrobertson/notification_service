@@ -545,6 +545,10 @@ func (a *API) CancelNotification() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		notification, err := a.store.CancelScheduledNotification(r.Context(), r.PathValue("id"))
 		if err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				writeError(w, http.StatusNotFound, "not_found", "notification not found")
+				return
+			}
 			if errors.Is(err, store.ErrInvalidStateTransition) {
 				writeError(w, http.StatusConflict, "conflict", "notification cannot be cancelled")
 				return
@@ -624,14 +628,19 @@ func (a *API) UpsertPolicy() http.HandlerFunc {
 				return
 			}
 		}
-		if req.TenantID != nil && strings.TrimSpace(*req.TenantID) != "" {
-			if _, err := a.store.GetTenantByID(r.Context(), *req.TenantID); err != nil {
+		if req.TenantID != nil {
+			trimmedTenantID := strings.TrimSpace(*req.TenantID)
+			if trimmedTenantID == "" {
+				req.TenantID = nil
+			} else if _, err := a.store.GetTenantByID(r.Context(), trimmedTenantID); err != nil {
 				if errors.Is(err, store.ErrNotFound) {
 					writeError(w, http.StatusNotFound, "not_found", "tenant not found")
 					return
 				}
 				writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
 				return
+			} else {
+				req.TenantID = &trimmedTenantID
 			}
 		}
 		policy, err := a.store.UpsertDeliveryPolicy(r.Context(), store.UpsertDeliveryPolicyParams{

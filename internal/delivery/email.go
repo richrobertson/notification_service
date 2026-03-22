@@ -48,6 +48,13 @@ func NewSecondarySMTPSender(cfg config.Config) *SMTPSender {
 	return &SMTPSender{cfg: secondary, dial: net.Dial}
 }
 
+func NewOptionalSecondaryEmailSender(cfg config.Config) emailSender {
+	if sender := NewSecondarySMTPSender(cfg); sender != nil {
+		return sender
+	}
+	return nil
+}
+
 func (s *SMTPSender) Send(ctx context.Context, req EmailRequest) error {
 	_, span := otel.Tracer("notification-platform/delivery").Start(ctx, "email.send")
 	defer span.End()

@@ -18,6 +18,7 @@ type fakeAPIStore struct {
 	deadLetters            map[string]store.DeadLetter
 	attempt                store.DeliveryAttempt
 	notification           store.Notification
+	cancelErr              error
 	ensureCalls            int
 	ensureInitialCalls     int
 	createAttemptCalls     int
@@ -223,6 +224,9 @@ func (f *fakeAPIStore) RecalculateNotificationStatus(_ context.Context, notifica
 	return f.recalculateErr
 }
 func (f *fakeAPIStore) CancelScheduledNotification(_ context.Context, notificationID string) (store.Notification, error) {
+	if f.cancelErr != nil {
+		return store.Notification{}, f.cancelErr
+	}
 	f.notification.ID = notificationID
 	now := time.Now().UTC()
 	f.notification.CancelledAt = &now

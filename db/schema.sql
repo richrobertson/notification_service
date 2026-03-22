@@ -152,6 +152,9 @@ CREATE TABLE delivery_policies (
 CREATE INDEX delivery_policies_scope_idx
     ON delivery_policies (tenant_id, channel);
 
+CREATE INDEX delivery_policies_scope_updated_idx
+    ON delivery_policies (tenant_id, channel, updated_at DESC);
+
 CREATE TABLE dead_letters (
     id TEXT PRIMARY KEY,
     notification_id TEXT NOT NULL REFERENCES notifications(id) ON DELETE CASCADE,
