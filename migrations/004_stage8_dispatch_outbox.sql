@@ -7,7 +7,14 @@ BEGIN
         FROM pg_type
         WHERE typname = 'dispatch_outbox_status'
     ) THEN
-        CREATE TYPE dispatch_outbox_status AS ENUM ('pending', 'published');
+        CREATE TYPE dispatch_outbox_status AS ENUM ('pending', 'publishing', 'published');
+    ELSIF NOT EXISTS (
+        SELECT 1
+        FROM pg_enum
+        WHERE enumtypid = 'dispatch_outbox_status'::regtype
+          AND enumlabel = 'publishing'
+    ) THEN
+        ALTER TYPE dispatch_outbox_status ADD VALUE 'publishing';
     END IF;
 END$$;
 
@@ -21,6 +28,7 @@ CREATE TABLE IF NOT EXISTS dispatch_outbox (
     status dispatch_outbox_status NOT NULL DEFAULT 'pending',
     last_error TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    claimed_at TIMESTAMPTZ,
     published_at TIMESTAMPTZ
 );
 
@@ -28,10 +36,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS dispatch_outbox_attempt_id_idx
     ON dispatch_outbox (attempt_id);
 
 CREATE INDEX IF NOT EXISTS dispatch_outbox_pending_idx
-    ON dispatch_outbox (status, created_at)
-    WHERE status = 'pending';
+    ON dispatch_outbox (status, claimed_at, created_at)
+    WHERE status IN ('pending', 'publishing');
 
-INSERT INTO dispatch_outbox (id, notification_id, attempt_id, tenant_id, channel, source, status, published_at)
+INSERT INTO dispatch_outbox (id, notification_id, attempt_id, tenant_id, channel, source, status, claimed_at, published_at)
 SELECT
     'intent-' || da.id,
     da.notification_id,
@@ -43,6 +51,7 @@ SELECT
         WHEN da.dispatch_enqueued_at IS NULL THEN 'pending'::dispatch_outbox_status
         ELSE 'published'::dispatch_outbox_status
     END,
+    NULL,
     da.dispatch_enqueued_at
 FROM delivery_attempts da
 JOIN notifications n ON n.id = da.notification_id

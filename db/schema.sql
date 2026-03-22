@@ -17,7 +17,7 @@ CREATE TYPE delivery_attempt_status AS ENUM (
     'dead_lettered'
 );
 CREATE TYPE channel_type AS ENUM ('email', 'webhook');
-CREATE TYPE dispatch_outbox_status AS ENUM ('pending', 'published');
+CREATE TYPE dispatch_outbox_status AS ENUM ('pending', 'publishing', 'published');
 
 CREATE TABLE tenants (
     id TEXT PRIMARY KEY,
@@ -116,13 +116,14 @@ CREATE TABLE dispatch_outbox (
     status dispatch_outbox_status NOT NULL DEFAULT 'pending',
     last_error TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    claimed_at TIMESTAMPTZ,
     published_at TIMESTAMPTZ,
     UNIQUE (attempt_id)
 );
 
 CREATE INDEX dispatch_outbox_pending_idx
-    ON dispatch_outbox (status, created_at)
-    WHERE status = 'pending';
+    ON dispatch_outbox (status, claimed_at, created_at)
+    WHERE status IN ('pending', 'publishing');
 
 CREATE TABLE dead_letters (
     id TEXT PRIMARY KEY,

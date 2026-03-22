@@ -91,6 +91,7 @@ type DispatchIntent struct {
 	Status         string     `json:"status"`
 	LastError      *string    `json:"last_error"`
 	CreatedAt      time.Time  `json:"created_at"`
+	ClaimedAt      *time.Time `json:"claimed_at"`
 	PublishedAt    *time.Time `json:"published_at"`
 }
 
@@ -615,6 +616,7 @@ func scanDispatchIntent(scanner interface {
 		&intent.Status,
 		&intent.LastError,
 		&intent.CreatedAt,
+		&intent.ClaimedAt,
 		&intent.PublishedAt,
 	)
 }
@@ -867,10 +869,10 @@ func createDispatchIntentTx(ctx context.Context, querier interface {
 		)
 		VALUES ($1, $2, $3, $4, $5, $6)
 		ON CONFLICT (attempt_id) DO NOTHING
-		RETURNING id, notification_id, attempt_id, tenant_id, channel, source, status, last_error, created_at, published_at
+		RETURNING id, notification_id, attempt_id, tenant_id, channel, source, status, last_error, created_at, claimed_at, published_at
 	`
 	const selectQuery = `
-		SELECT id, notification_id, attempt_id, tenant_id, channel, source, status, last_error, created_at, published_at
+		SELECT id, notification_id, attempt_id, tenant_id, channel, source, status, last_error, created_at, claimed_at, published_at
 		FROM dispatch_outbox
 		WHERE attempt_id = $1
 	`
@@ -1562,20 +1564,32 @@ func (p *Postgres) EnsureReplayAttempt(ctx context.Context, deadLetterID, newAtt
 	return ReplayDeadLetterResult{DeadLetter: dl, Attempt: attempt}, nil
 }
 
-func (p *Postgres) ListPendingDispatchIntents(ctx context.Context, limit int) ([]PendingDispatchIntent, error) {
+func (p *Postgres) ClaimPendingDispatchIntents(ctx context.Context, limit int, staleBefore time.Time) ([]PendingDispatchIntent, error) {
 	if limit <= 0 {
 		limit = 100
 	}
 	rows, err := p.DB.QueryContext(ctx, `
-		SELECT o.id, o.notification_id, o.attempt_id, o.tenant_id, o.channel, o.source, o.status, o.last_error, o.created_at, o.published_at, dl.id
-		FROM dispatch_outbox o
-		LEFT JOIN dead_letters dl ON dl.replay_attempt_id = o.attempt_id
-		WHERE o.status = 'pending'
-		ORDER BY o.created_at ASC
-		LIMIT $1
-	`, limit)
+		WITH claimed AS (
+			UPDATE dispatch_outbox AS o
+			SET status = 'publishing', claimed_at = NOW()
+			WHERE o.id IN (
+				SELECT id
+				FROM dispatch_outbox
+				WHERE status = 'pending'
+				   OR (status = 'publishing' AND claimed_at IS NOT NULL AND claimed_at <= $2)
+				ORDER BY created_at ASC
+				FOR UPDATE SKIP LOCKED
+				LIMIT $1
+			)
+			RETURNING o.id, o.notification_id, o.attempt_id, o.tenant_id, o.channel, o.source, o.status, o.last_error, o.created_at, o.claimed_at, o.published_at
+		)
+		SELECT c.id, c.notification_id, c.attempt_id, c.tenant_id, c.channel, c.source, c.status, c.last_error, c.created_at, c.claimed_at, c.published_at, dl.id
+		FROM claimed c
+		LEFT JOIN dead_letters dl ON dl.replay_attempt_id = c.attempt_id
+		ORDER BY c.created_at ASC
+	`, limit, staleBefore)
 	if err != nil {
-		return nil, fmt.Errorf("list pending dispatch intents: %w", err)
+		return nil, fmt.Errorf("claim pending dispatch intents: %w", err)
 	}
 	defer rows.Close()
 
@@ -1592,15 +1606,16 @@ func (p *Postgres) ListPendingDispatchIntents(ctx context.Context, limit int) ([
 			&item.Intent.Status,
 			&item.Intent.LastError,
 			&item.Intent.CreatedAt,
+			&item.Intent.ClaimedAt,
 			&item.Intent.PublishedAt,
 			&item.DeadLetterID,
 		); err != nil {
-			return nil, fmt.Errorf("list pending dispatch intents: %w", err)
+			return nil, fmt.Errorf("claim pending dispatch intents: %w", err)
 		}
 		intents = append(intents, item)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("list pending dispatch intents: %w", err)
+		return nil, fmt.Errorf("claim pending dispatch intents: %w", err)
 	}
 	return intents, nil
 }
@@ -1615,9 +1630,9 @@ func (p *Postgres) MarkDispatchIntentPublished(ctx context.Context, intentID str
 	var intent DispatchIntent
 	if err := scanDispatchIntent(tx.QueryRowContext(ctx, `
 		UPDATE dispatch_outbox
-		SET status = 'published', published_at = COALESCE(published_at, NOW()), last_error = NULL
-		WHERE id = $1
-		RETURNING id, notification_id, attempt_id, tenant_id, channel, source, status, last_error, created_at, published_at
+		SET status = 'published', claimed_at = NULL, published_at = COALESCE(published_at, NOW()), last_error = NULL
+		WHERE id = $1 AND status = 'publishing'
+		RETURNING id, notification_id, attempt_id, tenant_id, channel, source, status, last_error, created_at, claimed_at, published_at
 	`, intentID), &intent); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("mark dispatch intent published: %w", ErrNotFound)
@@ -1652,8 +1667,8 @@ func (p *Postgres) MarkDispatchIntentPublished(ctx context.Context, intentID str
 func (p *Postgres) RecordDispatchIntentError(ctx context.Context, intentID, lastError string) error {
 	result, err := p.DB.ExecContext(ctx, `
 		UPDATE dispatch_outbox
-		SET last_error = $2
-		WHERE id = $1 AND status = 'pending'
+		SET status = 'pending', claimed_at = NULL, last_error = $2
+		WHERE id = $1 AND status = 'publishing'
 	`, intentID, lastError)
 	if err != nil {
 		return fmt.Errorf("record dispatch intent error: %w", err)

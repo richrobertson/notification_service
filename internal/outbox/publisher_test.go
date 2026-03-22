@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"testing"
+	"time"
 
 	"github.com/richrobertson/notification-platform/internal/queue"
 	"github.com/richrobertson/notification-platform/internal/store"
@@ -17,13 +18,16 @@ type fakeStore struct {
 	recordedErrors []string
 	recordedAudits []string
 	publishedByID  map[string]bool
+	claimed        []string
 }
 
-func (f *fakeStore) ListPendingDispatchIntents(context.Context, int) ([]store.PendingDispatchIntent, error) {
+func (f *fakeStore) ClaimPendingDispatchIntents(_ context.Context, _ int, _ time.Time) ([]store.PendingDispatchIntent, error) {
 	var out []store.PendingDispatchIntent
 	for _, item := range f.pending {
-		if !f.publishedByID[item.Intent.ID] {
+		if !f.publishedByID[item.Intent.ID] && item.Intent.Status == "pending" {
+			item.Intent.Status = "publishing"
 			out = append(out, item)
+			f.claimed = append(f.claimed, item.Intent.ID)
 		}
 	}
 	return out, nil
@@ -84,6 +88,9 @@ func TestRunOncePublishesPendingIntent(t *testing.T) {
 	}
 	if len(st.published) != 1 || st.published[0] != "intent-1" {
 		t.Fatalf("published=%v", st.published)
+	}
+	if len(st.claimed) != 1 || st.claimed[0] != "intent-1" {
+		t.Fatalf("claimed=%v", st.claimed)
 	}
 }
 

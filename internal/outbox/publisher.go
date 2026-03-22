@@ -11,7 +11,7 @@ import (
 )
 
 type Store interface {
-	ListPendingDispatchIntents(ctx context.Context, limit int) ([]store.PendingDispatchIntent, error)
+	ClaimPendingDispatchIntents(ctx context.Context, limit int, staleBefore time.Time) ([]store.PendingDispatchIntent, error)
 	MarkDispatchIntentPublished(ctx context.Context, intentID string) error
 	RecordDispatchIntentError(ctx context.Context, intentID, lastError string) error
 	RecordAuditEvent(ctx context.Context, id, tenantID, actor, action, resourceType, resourceID string, metadata map[string]any) error
@@ -23,6 +23,8 @@ type Queue interface {
 }
 
 type IDGenerator func(prefix string) string
+
+const claimTimeout = 30 * time.Second
 
 func RunOnce(ctx context.Context, logger *slog.Logger, st Store, q Queue, softLimit int, generateID IDGenerator) error {
 	if q == nil {
@@ -40,7 +42,7 @@ func RunOnce(ctx context.Context, logger *slog.Logger, st Store, q Queue, softLi
 		}
 	}
 
-	pending, err := st.ListPendingDispatchIntents(ctx, 100)
+	pending, err := st.ClaimPendingDispatchIntents(ctx, 100, time.Now().UTC().Add(-claimTimeout))
 	if err != nil {
 		return err
 	}
