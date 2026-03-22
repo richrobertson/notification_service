@@ -1,11 +1,13 @@
 CREATE TYPE tenant_status AS ENUM ('active', 'disabled');
 CREATE TYPE notification_status AS ENUM (
     'accepted',
+    'scheduled',
     'processing',
     'partially_delivered',
     'delivered',
     'failed',
-    'dead_lettered'
+    'dead_lettered',
+    'cancelled'
 );
 CREATE TYPE delivery_attempt_status AS ENUM (
     'pending',
@@ -58,10 +60,15 @@ CREATE TABLE notifications (
     template_id TEXT NOT NULL REFERENCES templates(id) ON DELETE RESTRICT,
     idempotency_key TEXT NOT NULL,
     status notification_status NOT NULL,
-    channels channel_type[] NOT NULL,
-    recipient JSONB NOT NULL,
+    recipient_email TEXT,
+    recipient_webhook_url TEXT,
+    secondary_webhook_url TEXT,
     variables JSONB NOT NULL DEFAULT '{}'::jsonb,
-    submitted_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    scheduled_for TIMESTAMPTZ,
+    promoted_at TIMESTAMPTZ,
+    cancelled_at TIMESTAMPTZ,
+    submitted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE UNIQUE INDEX notifications_tenant_idempotency_idx
@@ -90,6 +97,8 @@ CREATE TABLE delivery_attempts (
     failed_at TIMESTAMPTZ,
     dispatch_enqueued_at TIMESTAMPTZ,
     enqueue_kind TEXT NOT NULL DEFAULT 'initial',
+    provider_used TEXT,
+    failover_used BOOLEAN NOT NULL DEFAULT FALSE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE (notification_id, channel, attempt_number)
@@ -124,6 +133,24 @@ CREATE TABLE dispatch_outbox (
 CREATE INDEX dispatch_outbox_pending_idx
     ON dispatch_outbox (status, claimed_at, created_at)
     WHERE status IN ('pending', 'publishing');
+
+CREATE TABLE delivery_policies (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT REFERENCES tenants(id) ON DELETE CASCADE,
+    channel channel_type,
+    paused BOOLEAN,
+    failover_enabled BOOLEAN,
+    scheduling_enabled BOOLEAN,
+    replay_allowed BOOLEAN,
+    max_attempts_override INTEGER CHECK (max_attempts_override IS NULL OR max_attempts_override > 0),
+    retry_base_delay_seconds INTEGER CHECK (retry_base_delay_seconds IS NULL OR retry_base_delay_seconds > 0),
+    retry_max_delay_seconds INTEGER CHECK (retry_max_delay_seconds IS NULL OR retry_max_delay_seconds > 0),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX delivery_policies_scope_idx
+    ON delivery_policies (tenant_id, channel);
 
 CREATE TABLE dead_letters (
     id TEXT PRIMARY KEY,

@@ -49,7 +49,8 @@ func main() {
 	defer redisQueue.Close()
 	worker.RecoverProcessingQueues(startupCtx, logger, redisQueue)
 	worker.StartRecoveryLoop(ctx, logger, redisQueue, cfg.RecoveryInterval)
-	svc, err := delivery.NewService(postgres, delivery.NewWebhookSender(cfg.WebhookTimeout), delivery.NewSMTPSender(cfg), delivery.RetryPolicy{MaxAttempts: cfg.RetryMaxAttempts, BaseDelay: cfg.RetryBaseDelay, MaxDelay: cfg.RetryMaxDelay, ExponentialBackoff: cfg.RetryExponentialBackoff, Jitter: cfg.RetryJitter, Now: func() time.Time { return time.Now().UTC() }, PressureMultiplier: cfg.RetryPressureMultiplier, PressureMinDelay: cfg.RetryPressureMinDelay, QueueSoftLimit: cfg.QueueSoftLimit, QueueDepth: func(channel string) int {
+	webhookSender := delivery.NewWebhookSender(cfg.WebhookTimeout)
+	svc, err := delivery.NewService(postgres, webhookSender, webhookSender, delivery.NewSMTPSender(cfg), delivery.NewSecondarySMTPSender(cfg), delivery.RetryPolicy{MaxAttempts: cfg.RetryMaxAttempts, BaseDelay: cfg.RetryBaseDelay, MaxDelay: cfg.RetryMaxDelay, ExponentialBackoff: cfg.RetryExponentialBackoff, Jitter: cfg.RetryJitter, Now: func() time.Time { return time.Now().UTC() }, PressureMultiplier: cfg.RetryPressureMultiplier, PressureMinDelay: cfg.RetryPressureMinDelay, QueueSoftLimit: cfg.QueueSoftLimit, QueueDepth: func(channel string) int {
 		name, err := queue.QueueNameForChannel(channel)
 		if err != nil {
 			return 0

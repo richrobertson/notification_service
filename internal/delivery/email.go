@@ -30,6 +30,24 @@ func NewSMTPSender(cfg config.Config) *SMTPSender {
 	return &SMTPSender{cfg: cfg, dial: net.Dial}
 }
 
+func NewSecondarySMTPSender(cfg config.Config) *SMTPSender {
+	if strings.TrimSpace(cfg.SecondarySMTPHost) == "" || cfg.SecondarySMTPPort <= 0 {
+		return nil
+	}
+	secondary := cfg
+	secondary.SMTPHost = cfg.SecondarySMTPHost
+	secondary.SMTPPort = cfg.SecondarySMTPPort
+	secondary.SMTPUsername = cfg.SecondarySMTPUsername
+	secondary.SMTPPassword = cfg.SecondarySMTPPassword
+	if strings.TrimSpace(cfg.SecondarySMTPFrom) != "" {
+		secondary.SMTPFrom = cfg.SecondarySMTPFrom
+	}
+	secondary.SMTPUseTLS = cfg.SecondarySMTPUseTLS
+	secondary.SMTPStartTLS = cfg.SecondarySMTPStartTLS
+	secondary.SMTPInsecureSkipVerify = cfg.SecondarySMTPInsecureSkipVerify
+	return &SMTPSender{cfg: secondary, dial: net.Dial}
+}
+
 func (s *SMTPSender) Send(ctx context.Context, req EmailRequest) error {
 	_, span := otel.Tracer("notification-platform/delivery").Start(ctx, "email.send")
 	defer span.End()
