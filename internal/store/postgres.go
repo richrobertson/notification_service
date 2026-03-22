@@ -848,7 +848,7 @@ func (p *Postgres) CreateDispatchIntent(ctx context.Context, params CreateDispat
 func createDispatchIntentTx(ctx context.Context, querier interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 }, params CreateDispatchIntentParams) (DispatchIntent, error) {
-	const query = `
+	const insertQuery = `
 		INSERT INTO dispatch_outbox (
 			id,
 			notification_id,
@@ -858,15 +858,19 @@ func createDispatchIntentTx(ctx context.Context, querier interface {
 			source
 		)
 		VALUES ($1, $2, $3, $4, $5, $6)
-		ON CONFLICT (attempt_id) DO UPDATE
-		SET id = dispatch_outbox.id
+		ON CONFLICT (attempt_id) DO NOTHING
 		RETURNING id, notification_id, attempt_id, tenant_id, channel, source, status, last_error, created_at, published_at
+	`
+	const selectQuery = `
+		SELECT id, notification_id, attempt_id, tenant_id, channel, source, status, last_error, created_at, published_at
+		FROM dispatch_outbox
+		WHERE attempt_id = $1
 	`
 
 	var intent DispatchIntent
 	if err := scanDispatchIntent(querier.QueryRowContext(
 		ctx,
-		query,
+		insertQuery,
 		params.ID,
 		params.NotificationID,
 		params.AttemptID,
@@ -874,7 +878,12 @@ func createDispatchIntentTx(ctx context.Context, querier interface {
 		params.Channel,
 		params.Source,
 	), &intent); err != nil {
-		return DispatchIntent{}, wrapStoreError("create dispatch intent", err)
+		if !errors.Is(err, sql.ErrNoRows) {
+			return DispatchIntent{}, wrapStoreError("create dispatch intent", err)
+		}
+		if err := scanDispatchIntent(querier.QueryRowContext(ctx, selectQuery, params.AttemptID), &intent); err != nil {
+			return DispatchIntent{}, wrapStoreError("create dispatch intent", err)
+		}
 	}
 	return intent, nil
 }

@@ -25,16 +25,18 @@ type Queue interface {
 type IDGenerator func(prefix string) string
 
 func RunOnce(ctx context.Context, logger *slog.Logger, st Store, q Queue, softLimit int, generateID IDGenerator) error {
-	if q != nil {
-		snapshot, err := q.PressureSnapshot(ctx)
-		if err == nil {
-			if softLimit > 0 {
-				snapshot.SoftLimit = softLimit
-			}
-			if snapshot.AnySoftLimited() {
-				logger.Warn("outbox publisher delaying dispatch publication due to queue pressure", slog.Any("depths", snapshot.Depths))
-				return nil
-			}
+	if q == nil {
+		return fmt.Errorf("outbox publisher queue is required")
+	}
+
+	snapshot, err := q.PressureSnapshot(ctx)
+	if err == nil {
+		if softLimit > 0 {
+			snapshot.SoftLimit = softLimit
+		}
+		if snapshot.AnySoftLimited() {
+			logger.Warn("outbox publisher delaying dispatch publication due to queue pressure", slog.Any("depths", snapshot.Depths))
+			return nil
 		}
 	}
 

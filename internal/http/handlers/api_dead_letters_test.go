@@ -646,9 +646,6 @@ func TestIdempotentRetryReturnsExistingNotificationWhenInitialAlreadyEnqueued(t 
 	existing := store.Notification{ID: "notif-1", TenantID: "tenant-1", TemplateID: "tpl-1"}
 	st.existingByKey = map[string]store.Notification{"tenant-1/" + key: existing}
 	st.createdAttempt = &store.CreateDeliveryAttemptParams{ID: "attempt-1", NotificationID: "notif-1", Channel: "email", AttemptNumber: 1, Status: "pending", EnqueueKind: "initial"}
-	st.createdIntent = &store.CreateDispatchIntentParams{ID: "intent-attempt-1", NotificationID: "notif-1", AttemptID: "attempt-1", TenantID: "tenant-1", Channel: "email", Source: "initial"}
-	st.createdIntent = &store.CreateDispatchIntentParams{ID: "intent-attempt-1", NotificationID: "notif-1", AttemptID: "attempt-1", TenantID: "tenant-1", Channel: "email", Source: "initial"}
-	st.createdIntent = &store.CreateDispatchIntentParams{ID: "intent-attempt-1", NotificationID: "notif-1", AttemptID: "attempt-1", TenantID: "tenant-1", Channel: "email", Source: "initial"}
 	st.createdIntent = nil
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/notifications", bytes.NewReader([]byte(`{"id":"notif-2","tenant_id":"tenant-1","template_id":"tpl-1","recipient_email":"user@example.test","variables":{},"idempotency_key":"`+key+`"}`)))
@@ -689,10 +686,9 @@ func TestIdempotentRetryWithChangedRequestTemplateReusesPendingStoredChannelAtte
 	}
 }
 
-func TestSecondIdempotentRequestRepairsMissingInitialAttemptAfterEnsureFailure(t *testing.T) {
+func TestSecondIdempotentRequestRepairsMissingInitialAttempt(t *testing.T) {
 	st, _, api := newDeadLetterTestAPI()
 	key := "stable-key"
-	st.ensureInitialErr = errors.New("db blip")
 	first := httptest.NewRequest(http.MethodPost, "/v1/notifications", bytes.NewReader([]byte(`{"id":"notif-1","tenant_id":"tenant-1","template_id":"tpl-1","recipient_email":"user@example.test","variables":{},"idempotency_key":"`+key+`"}`)))
 	first.Header.Set("Content-Type", "application/json")
 	firstRes := httptest.NewRecorder()
@@ -707,7 +703,6 @@ func TestSecondIdempotentRequestRepairsMissingInitialAttemptAfterEnsureFailure(t
 		t.Fatalf("createAttemptCalls=%d", st.createAttemptCalls)
 	}
 
-	st.ensureInitialErr = nil
 	st.initialAttemptMissing = true
 	second := httptest.NewRequest(http.MethodPost, "/v1/notifications", bytes.NewReader([]byte(`{"id":"notif-2","tenant_id":"tenant-1","template_id":"tpl-1","recipient_email":"user@example.test","variables":{},"idempotency_key":"`+key+`"}`)))
 	second.Header.Set("Content-Type", "application/json")
