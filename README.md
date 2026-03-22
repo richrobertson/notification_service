@@ -89,7 +89,7 @@ The current retry model is:
 3. on transient failure, the same attempt is marked `retry_scheduled` with `next_retry_at`
 4. when API, retry, or replay creates publishable work, it writes the attempt plus one `dispatch_outbox` intent in the same PostgreSQL transaction
 5. the outbox publisher later enqueues Redis work only for that already-durable intent and marks it published after success
-6. if Redis is unavailable, the intent remains pending in PostgreSQL and is retried later
+6. if Redis is unavailable at outbox publish time, the intent remains pending in PostgreSQL and is retried later
 7. once the retry budget is exhausted, the final attempt is marked `dead_lettered` and a `dead_letters` row is inserted
 
 Replay uses the same model: the replay attempt is created durably first, the dead letter is only marked replayed after the outbox publisher successfully enqueues Redis work, and failed publish work remains recoverable from PostgreSQL. Initial API attempts and retry attempts now follow the same path, so Redis is treated as execution transport rather than the source of truth for "what still needs dispatch publication." Duplicate Redis jobs are still possible underneath, but Stage 6 attempt-level idempotency and duplicate suppression still protect execution.
@@ -101,7 +101,8 @@ Replay uses the same model: the replay attempt is created durably first, the dea
 - One publishable attempt gets at most one live dispatch intent.
 - Initial submission, retry creation, and replay creation all write their dispatch intent transactionally with the durable attempt state.
 - The outbox publisher polls pending intents, pushes `notify:dispatch`, and only then marks the intent `published`.
-- If Redis is down, the intent stays `pending` with `last_error` for inspection and later recovery.
+- If Redis is down when the outbox publisher tries to publish, the intent stays `pending` with `last_error` for inspection and later recovery.
+- The API still depends on Redis for rate limiting and queue-pressure checks, so a Redis outage can still block new submissions even though already-created dispatch intents remain durable in PostgreSQL.
 - Existing attempt inspection still shows pending durable work through `status = pending` plus `dispatch_enqueued_at = null`.
 
 ## Duplicate Suppression Model

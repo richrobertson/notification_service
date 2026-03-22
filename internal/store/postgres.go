@@ -1558,8 +1558,11 @@ func (p *Postgres) ClaimPendingDispatchIntents(ctx context.Context, limit int, s
 	if limit <= 0 {
 		limit = 100
 	}
+	if staleAfter <= 0 {
+		return nil, fmt.Errorf("claim pending dispatch intents: staleAfter must be positive")
+	}
 	staleAfterSeconds := int(staleAfter / time.Second)
-	if staleAfter > 0 && staleAfterSeconds == 0 {
+	if staleAfterSeconds == 0 {
 		staleAfterSeconds = 1
 	}
 	rows, err := p.DB.QueryContext(ctx, `
