@@ -17,6 +17,10 @@ import (
 
 func main() {
 	cfg := config.Load()
+	if err := cfg.Validate(); err != nil {
+		slog.Error("invalid configuration", slog.Any("error", err))
+		os.Exit(1)
+	}
 	logger := platform.NewLogger(cfg.LogLevel)
 	slog.SetDefault(logger)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

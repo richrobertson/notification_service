@@ -145,6 +145,7 @@ func RunChannelWorker(ctx context.Context, logger *slog.Logger, redisQueue *queu
 	scheduler := newFairScheduler(opts.TenantBurst, opts.TenantMaxInFlight)
 	sem := make(chan struct{}, opts.Concurrency)
 	var mu sync.Mutex
+	var inFlight sync.WaitGroup
 	for {
 		for len(sem) < cap(sem) {
 			mu.Lock()
@@ -154,8 +155,10 @@ func RunChannelWorker(ctx context.Context, logger *slog.Logger, redisQueue *queu
 				break
 			}
 			sem <- struct{}{}
+			inFlight.Add(1)
 			go func(reserved queue.ReservedJob) {
 				defer func() {
+					inFlight.Done()
 					<-sem
 					mu.Lock()
 					scheduler.complete(reserved.Job.TenantID)
@@ -165,6 +168,7 @@ func RunChannelWorker(ctx context.Context, logger *slog.Logger, redisQueue *queu
 			}(job)
 		}
 		if ctx.Err() != nil {
+			inFlight.Wait()
 			logger.Info("worker shutdown complete", slog.String("queue", queueName))
 			return
 		}
@@ -178,6 +182,7 @@ func RunChannelWorker(ctx context.Context, logger *slog.Logger, redisQueue *queu
 		reserved, err := redisQueue.ReserveChannel(ctx, queueName, int(blockTimeout/time.Second))
 		if err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
+				inFlight.Wait()
 				logger.Info("worker shutdown complete", slog.String("queue", queueName))
 				return
 			}

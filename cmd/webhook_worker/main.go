@@ -35,6 +35,10 @@ func main() {
 
 func run(appName, queueName string, svcFactory func(config.Config, *store.Postgres, *queue.RedisQueue) (*delivery.Service, error)) {
 	cfg := config.Load()
+	if err := cfg.Validate(); err != nil {
+		slog.Error("invalid configuration", slog.Any("error", err))
+		os.Exit(1)
+	}
 	cfg.AppName = appName
 	logger := platform.NewLogger(cfg.LogLevel)
 	slog.SetDefault(logger)

@@ -1,8 +1,12 @@
 package config
 
 import (
+	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -16,6 +20,13 @@ type Config struct {
 	RedisAddr                       string
 	RedisPassword                   string
 	RedisDB                         int
+	HTTPReadHeaderTimeout           time.Duration
+	HTTPReadTimeout                 time.Duration
+	HTTPWriteTimeout                time.Duration
+	HTTPIdleTimeout                 time.Duration
+	HTTPShutdownTimeout             time.Duration
+	MaxRequestBodyBytes             int64
+	AdminToken                      string
 	WebhookTimeout                  time.Duration
 	QueueBlockTimeout               time.Duration
 	RetryMaxAttempts                int
@@ -55,10 +66,14 @@ type Config struct {
 	PerTenantMaxInFlight            int
 	RetryPressureMultiplier         int
 	RetryPressureMinDelay           time.Duration
+	MaintenanceAuditRetention       time.Duration
+	MaintenanceOutboxRetention      time.Duration
+	MaintenanceDeadLetterRetention  time.Duration
+	MaintenanceDryRun               bool
 }
 
 func Load() Config {
-	return Config{
+	cfg := Config{
 		AppName:                         envOrDefault("APP_NAME", "notification-platform-api"),
 		HTTPPort:                        envOrDefault("HTTP_PORT", "8080"),
 		LogLevel:                        envOrDefault("LOG_LEVEL", "debug"),
@@ -68,6 +83,13 @@ func Load() Config {
 		RedisAddr:                       envOrDefault("REDIS_ADDR", "localhost:6379"),
 		RedisPassword:                   envOrDefault("REDIS_PASSWORD", ""),
 		RedisDB:                         envIntOrDefault("REDIS_DB", 0),
+		HTTPReadHeaderTimeout:           envDurationOrDefault("HTTP_READ_HEADER_TIMEOUT", 5*time.Second),
+		HTTPReadTimeout:                 envDurationOrDefault("HTTP_READ_TIMEOUT", 10*time.Second),
+		HTTPWriteTimeout:                envDurationOrDefault("HTTP_WRITE_TIMEOUT", 15*time.Second),
+		HTTPIdleTimeout:                 envDurationOrDefault("HTTP_IDLE_TIMEOUT", 60*time.Second),
+		HTTPShutdownTimeout:             envDurationOrDefault("HTTP_SHUTDOWN_TIMEOUT", 10*time.Second),
+		MaxRequestBodyBytes:             envInt64OrDefault("HTTP_MAX_REQUEST_BODY_BYTES", 1<<20),
+		AdminToken:                      envOrDefault("ADMIN_TOKEN", ""),
 		WebhookTimeout:                  envDurationOrDefault("WEBHOOK_TIMEOUT", 5*time.Second),
 		QueueBlockTimeout:               envDurationOrDefault("QUEUE_BLOCK_TIMEOUT", time.Second),
 		RetryMaxAttempts:                envIntOrDefault("RETRY_MAX_ATTEMPTS", 3),
@@ -107,7 +129,161 @@ func Load() Config {
 		PerTenantMaxInFlight:            envIntOrDefault("PER_TENANT_MAX_IN_FLIGHT", 2),
 		RetryPressureMultiplier:         envIntOrDefault("RETRY_PRESSURE_MULTIPLIER", 2),
 		RetryPressureMinDelay:           envDurationOrDefault("RETRY_PRESSURE_MIN_DELAY", 15*time.Second),
+		MaintenanceAuditRetention:       envDurationOrDefault("MAINTENANCE_AUDIT_RETENTION", 30*24*time.Hour),
+		MaintenanceOutboxRetention:      envDurationOrDefault("MAINTENANCE_OUTBOX_RETENTION", 7*24*time.Hour),
+		MaintenanceDeadLetterRetention:  envDurationOrDefault("MAINTENANCE_DEAD_LETTER_RETENTION", 0),
+		MaintenanceDryRun:               envBoolOrDefault("MAINTENANCE_DRY_RUN", true),
 	}
+
+	if cfg.Environment == "local" && strings.TrimSpace(cfg.AdminToken) == "" {
+		cfg.AdminToken = "dev-admin-token"
+	}
+
+	return cfg
+}
+
+func (c Config) Validate() error {
+	if strings.TrimSpace(c.AppName) == "" {
+		return fmt.Errorf("APP_NAME must not be empty")
+	}
+	if strings.TrimSpace(c.HTTPPort) == "" {
+		return fmt.Errorf("HTTP_PORT must not be empty")
+	}
+	if strings.TrimSpace(c.DatabaseURL) == "" {
+		return fmt.Errorf("DATABASE_URL must not be empty")
+	}
+	if _, err := url.ParseRequestURI(c.DatabaseURL); err != nil {
+		return fmt.Errorf("DATABASE_URL must be a valid URL: %w", err)
+	}
+	if strings.TrimSpace(c.RedisAddr) == "" {
+		return fmt.Errorf("REDIS_ADDR must not be empty")
+	}
+	if _, _, err := net.SplitHostPort(c.RedisAddr); err != nil {
+		return fmt.Errorf("REDIS_ADDR must be in host:port form: %w", err)
+	}
+	if err := positiveDuration("WEBHOOK_TIMEOUT", c.WebhookTimeout); err != nil {
+		return err
+	}
+	if err := positiveDuration("QUEUE_BLOCK_TIMEOUT", c.QueueBlockTimeout); err != nil {
+		return err
+	}
+	if err := positiveDuration("RETRY_BASE_DELAY", c.RetryBaseDelay); err != nil {
+		return err
+	}
+	if err := positiveDuration("RETRY_MAX_DELAY", c.RetryMaxDelay); err != nil {
+		return err
+	}
+	if err := positiveDuration("RETRY_WORKER_POLL_INTERVAL", c.RetryWorkerPollInterval); err != nil {
+		return err
+	}
+	if err := positiveDuration("OUTBOX_POLL_INTERVAL", c.OutboxPollInterval); err != nil {
+		return err
+	}
+	if err := positiveDuration("SCHEDULER_POLL_INTERVAL", c.SchedulerPollInterval); err != nil {
+		return err
+	}
+	if err := positiveDuration("PROCESSING_RECOVERY_INTERVAL", c.RecoveryInterval); err != nil {
+		return err
+	}
+	if err := positiveDuration("API_RATE_LIMIT_WINDOW", c.APIRateLimitWindow); err != nil {
+		return err
+	}
+	if err := positiveDuration("BACKPRESSURE_RETRY_AFTER", c.BackpressureRetryAfter); err != nil {
+		return err
+	}
+	if err := positiveDuration("RETRY_PRESSURE_MIN_DELAY", c.RetryPressureMinDelay); err != nil {
+		return err
+	}
+	if err := positiveDuration("HTTP_READ_HEADER_TIMEOUT", c.HTTPReadHeaderTimeout); err != nil {
+		return err
+	}
+	if err := positiveDuration("HTTP_READ_TIMEOUT", c.HTTPReadTimeout); err != nil {
+		return err
+	}
+	if err := positiveDuration("HTTP_WRITE_TIMEOUT", c.HTTPWriteTimeout); err != nil {
+		return err
+	}
+	if err := positiveDuration("HTTP_IDLE_TIMEOUT", c.HTTPIdleTimeout); err != nil {
+		return err
+	}
+	if err := positiveDuration("HTTP_SHUTDOWN_TIMEOUT", c.HTTPShutdownTimeout); err != nil {
+		return err
+	}
+	if err := positiveDuration("MAINTENANCE_AUDIT_RETENTION", c.MaintenanceAuditRetention); err != nil {
+		return err
+	}
+	if err := positiveDuration("MAINTENANCE_OUTBOX_RETENTION", c.MaintenanceOutboxRetention); err != nil {
+		return err
+	}
+	if c.MaintenanceDeadLetterRetention < 0 {
+		return fmt.Errorf("MAINTENANCE_DEAD_LETTER_RETENTION must be >= 0")
+	}
+	if c.RetryMaxAttempts <= 0 {
+		return fmt.Errorf("RETRY_MAX_ATTEMPTS must be greater than 0")
+	}
+	if c.RetryMaxDelay < c.RetryBaseDelay {
+		return fmt.Errorf("RETRY_MAX_DELAY must be greater than or equal to RETRY_BASE_DELAY")
+	}
+	if c.APIRateLimitPerSecond <= 0 {
+		return fmt.Errorf("API_RATE_LIMIT_PER_SECOND must be greater than 0")
+	}
+	if c.QueueSoftLimit <= 0 {
+		return fmt.Errorf("QUEUE_SOFT_LIMIT must be greater than 0")
+	}
+	if c.QueueHardLimit <= 0 {
+		return fmt.Errorf("QUEUE_HARD_LIMIT must be greater than 0")
+	}
+	if c.QueueHardLimit < c.QueueSoftLimit {
+		return fmt.Errorf("QUEUE_HARD_LIMIT must be greater than or equal to QUEUE_SOFT_LIMIT")
+	}
+	if c.DispatcherConcurrency <= 0 {
+		return fmt.Errorf("DISPATCHER_CONCURRENCY must be greater than 0")
+	}
+	if c.EmailWorkerConcurrency <= 0 {
+		return fmt.Errorf("EMAIL_WORKER_CONCURRENCY must be greater than 0")
+	}
+	if c.WebhookWorkerConcurrency <= 0 {
+		return fmt.Errorf("WEBHOOK_WORKER_CONCURRENCY must be greater than 0")
+	}
+	if c.PerTenantWorkerBurst <= 0 {
+		return fmt.Errorf("PER_TENANT_WORKER_BURST must be greater than 0")
+	}
+	if c.PerTenantMaxInFlight <= 0 {
+		return fmt.Errorf("PER_TENANT_MAX_IN_FLIGHT must be greater than 0")
+	}
+	if c.RetryPressureMultiplier <= 0 {
+		return fmt.Errorf("RETRY_PRESSURE_MULTIPLIER must be greater than 0")
+	}
+	if c.MaxRequestBodyBytes <= 0 {
+		return fmt.Errorf("HTTP_MAX_REQUEST_BODY_BYTES must be greater than 0")
+	}
+	if c.HTTPWriteTimeout < c.HTTPReadTimeout {
+		return fmt.Errorf("HTTP_WRITE_TIMEOUT must be greater than or equal to HTTP_READ_TIMEOUT")
+	}
+	if c.SMTPPort < 0 {
+		return fmt.Errorf("SMTP_PORT must be >= 0")
+	}
+	if c.SecondarySMTPHost != "" && c.SecondarySMTPPort <= 0 {
+		return fmt.Errorf("SMTP_SECONDARY_PORT must be greater than 0 when SMTP_SECONDARY_HOST is set")
+	}
+	return nil
+}
+
+func (c Config) ValidateForAPI() error {
+	if err := c.Validate(); err != nil {
+		return err
+	}
+	if strings.TrimSpace(c.AdminToken) == "" {
+		return fmt.Errorf("ADMIN_TOKEN must not be empty")
+	}
+	return nil
+}
+
+func positiveDuration(name string, value time.Duration) error {
+	if value <= 0 {
+		return fmt.Errorf("%s must be greater than 0", name)
+	}
+	return nil
 }
 
 func envOrDefault(key, fallback string) string {
@@ -125,6 +301,20 @@ func envIntOrDefault(key string, fallback int) int {
 	}
 
 	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		return fallback
+	}
+
+	return parsed
+}
+
+func envInt64OrDefault(key string, fallback int64) int64 {
+	value := os.Getenv(key)
+	if value == "" {
+		return fallback
+	}
+
+	parsed, err := strconv.ParseInt(value, 10, 64)
 	if err != nil {
 		return fallback
 	}

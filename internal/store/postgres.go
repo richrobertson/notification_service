@@ -236,6 +236,37 @@ type PendingDispatchIntent struct {
 	DeadLetterID *string
 }
 
+type OperationalMetrics struct {
+	OutboxPendingCount        int       `json:"outbox_pending_count"`
+	OutboxPublishingCount     int       `json:"outbox_publishing_count"`
+	OutboxOldestLagSeconds    int64     `json:"outbox_oldest_lag_seconds"`
+	DueRetryCount             int       `json:"due_retry_count"`
+	OpenDeadLetterCount       int       `json:"open_dead_letter_count"`
+	DuplicateSuppressionCount int       `json:"duplicate_suppression_count"`
+	RetryScheduledCount       int       `json:"retry_scheduled_count"`
+	DeadLetteredCount         int       `json:"dead_lettered_count"`
+	ScheduledPendingCount     int       `json:"scheduled_pending_count"`
+	ScheduledDueCount         int       `json:"scheduled_due_count"`
+	ScheduledOldestLagSeconds int64     `json:"scheduled_oldest_lag_seconds"`
+	CollectedAt               time.Time `json:"collected_at"`
+}
+
+type CleanupParams struct {
+	Now                 time.Time
+	AuditRetention      time.Duration
+	OutboxRetention     time.Duration
+	DeadLetterRetention time.Duration
+	DryRun              bool
+}
+
+type CleanupResult struct {
+	DryRun                 bool      `json:"dry_run"`
+	AuditEventsDeleted     int64     `json:"audit_events_deleted"`
+	PublishedOutboxDeleted int64     `json:"published_outbox_deleted"`
+	DeadLettersDeleted     int64     `json:"dead_letters_deleted"`
+	ExecutedAt             time.Time `json:"executed_at"`
+}
+
 func NewPostgres(ctx context.Context, databaseURL string) (*Postgres, error) {
 	db, err := sql.Open("postgres", databaseURL)
 	if err != nil {
@@ -2387,4 +2418,127 @@ func (p *Postgres) RecordAuditEvent(ctx context.Context, id, tenantID, actor, ac
 		return wrapStoreError("record audit event", err)
 	}
 	return nil
+}
+
+func (p *Postgres) CollectOperationalMetrics(ctx context.Context, now time.Time) (OperationalMetrics, error) {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	metrics := OperationalMetrics{CollectedAt: now}
+	if err := p.DB.QueryRowContext(ctx, `
+		SELECT
+			COALESCE(COUNT(*) FILTER (WHERE status = 'pending'), 0),
+			COALESCE(COUNT(*) FILTER (WHERE status = 'publishing'), 0),
+			COALESCE(MAX(EXTRACT(EPOCH FROM ($1 - created_at))) FILTER (WHERE status = 'pending'), 0)
+		FROM dispatch_outbox
+	`, now).Scan(&metrics.OutboxPendingCount, &metrics.OutboxPublishingCount, &metrics.OutboxOldestLagSeconds); err != nil {
+		return OperationalMetrics{}, fmt.Errorf("collect operational metrics: outbox: %w", err)
+	}
+	if err := p.DB.QueryRowContext(ctx, `
+		SELECT
+			COALESCE(COUNT(*) FILTER (WHERE status = 'retry_scheduled' AND next_retry_at <= $1), 0),
+			COALESCE(COUNT(*) FILTER (WHERE status = 'retry_scheduled'), 0)
+		FROM delivery_attempts
+	`, now).Scan(&metrics.DueRetryCount, &metrics.RetryScheduledCount); err != nil {
+		return OperationalMetrics{}, fmt.Errorf("collect operational metrics: retries: %w", err)
+	}
+	if err := p.DB.QueryRowContext(ctx, `
+		SELECT COALESCE(COUNT(*), 0)
+		FROM dead_letters
+		WHERE replayed_at IS NULL
+	`).Scan(&metrics.OpenDeadLetterCount); err != nil {
+		return OperationalMetrics{}, fmt.Errorf("collect operational metrics: dead letters: %w", err)
+	}
+	if err := p.DB.QueryRowContext(ctx, `
+		SELECT
+			COALESCE(COUNT(*) FILTER (WHERE scheduled_for IS NOT NULL AND promoted_at IS NULL AND cancelled_at IS NULL), 0),
+			COALESCE(COUNT(*) FILTER (WHERE scheduled_for IS NOT NULL AND scheduled_for <= $1 AND promoted_at IS NULL AND cancelled_at IS NULL), 0),
+			COALESCE(MAX(EXTRACT(EPOCH FROM ($1 - scheduled_for))) FILTER (WHERE scheduled_for IS NOT NULL AND scheduled_for <= $1 AND promoted_at IS NULL AND cancelled_at IS NULL), 0)
+		FROM notifications
+	`, now).Scan(&metrics.ScheduledPendingCount, &metrics.ScheduledDueCount, &metrics.ScheduledOldestLagSeconds); err != nil {
+		return OperationalMetrics{}, fmt.Errorf("collect operational metrics: scheduled: %w", err)
+	}
+	if err := p.DB.QueryRowContext(ctx, `
+		SELECT
+			COALESCE(COUNT(*) FILTER (WHERE action = 'duplicate_job_suppressed'), 0),
+			COALESCE(COUNT(*) FILTER (WHERE action = 'dead_lettered'), 0)
+		FROM audit_events
+	`).Scan(&metrics.DuplicateSuppressionCount, &metrics.DeadLetteredCount); err != nil {
+		return OperationalMetrics{}, fmt.Errorf("collect operational metrics: audits: %w", err)
+	}
+	return metrics, nil
+}
+
+func (p *Postgres) RunMaintenance(ctx context.Context, params CleanupParams) (CleanupResult, error) {
+	if params.Now.IsZero() {
+		params.Now = time.Now().UTC()
+	}
+	if params.AuditRetention <= 0 {
+		return CleanupResult{}, fmt.Errorf("run maintenance: audit retention must be positive")
+	}
+	if params.OutboxRetention <= 0 {
+		return CleanupResult{}, fmt.Errorf("run maintenance: outbox retention must be positive")
+	}
+	if params.DeadLetterRetention < 0 {
+		return CleanupResult{}, fmt.Errorf("run maintenance: dead letter retention must be >= 0")
+	}
+
+	result := CleanupResult{DryRun: params.DryRun, ExecutedAt: params.Now}
+	auditCutoff := params.Now.Add(-params.AuditRetention)
+	outboxCutoff := params.Now.Add(-params.OutboxRetention)
+	deadLetterCutoff := params.Now.Add(-params.DeadLetterRetention)
+
+	tx, err := p.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return CleanupResult{}, fmt.Errorf("run maintenance: begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM audit_events
+		WHERE created_at < $1
+	`, auditCutoff).Scan(&result.AuditEventsDeleted); err != nil {
+		return CleanupResult{}, fmt.Errorf("run maintenance: audit count: %w", err)
+	}
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM dispatch_outbox
+		WHERE status = 'published' AND published_at IS NOT NULL AND published_at < $1
+	`, outboxCutoff).Scan(&result.PublishedOutboxDeleted); err != nil {
+		return CleanupResult{}, fmt.Errorf("run maintenance: outbox count: %w", err)
+	}
+	if params.DeadLetterRetention > 0 {
+		if err := tx.QueryRowContext(ctx, `
+			SELECT COUNT(*)
+			FROM dead_letters
+			WHERE replayed_at IS NOT NULL AND replayed_at < $1
+		`, deadLetterCutoff).Scan(&result.DeadLettersDeleted); err != nil {
+			return CleanupResult{}, fmt.Errorf("run maintenance: dead letter count: %w", err)
+		}
+	}
+
+	if params.DryRun {
+		if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+			return CleanupResult{}, fmt.Errorf("run maintenance: rollback dry run: %w", err)
+		}
+		return result, nil
+	}
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM audit_events WHERE created_at < $1`, auditCutoff); err != nil {
+		return CleanupResult{}, fmt.Errorf("run maintenance: delete audit events: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM dispatch_outbox WHERE status = 'published' AND published_at IS NOT NULL AND published_at < $1`, outboxCutoff); err != nil {
+		return CleanupResult{}, fmt.Errorf("run maintenance: delete outbox rows: %w", err)
+	}
+	if params.DeadLetterRetention > 0 {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM dead_letters WHERE replayed_at IS NOT NULL AND replayed_at < $1`, deadLetterCutoff); err != nil {
+			return CleanupResult{}, fmt.Errorf("run maintenance: delete dead letters: %w", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return CleanupResult{}, fmt.Errorf("run maintenance: commit: %w", err)
+	}
+	return result, nil
 }

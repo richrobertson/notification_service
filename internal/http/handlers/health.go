@@ -3,7 +3,6 @@ package handlers
 import (
 	"context"
 	"net/http"
-	"os"
 	"time"
 )
 
@@ -24,8 +23,12 @@ type readinessResponse struct {
 	Dependencies []dependencyStatus `json:"dependencies"`
 }
 
-func Health() http.HandlerFunc {
-	serviceName := os.Getenv("APP_NAME")
+type DependencyCheck struct {
+	Name string
+	Ping func(context.Context) error
+}
+
+func Health(serviceName string) http.HandlerFunc {
 	if serviceName == "" {
 		serviceName = defaultServiceName
 	}
@@ -38,25 +41,30 @@ func Health() http.HandlerFunc {
 	}
 }
 
-func Readiness(dbPing func(context.Context) error) http.HandlerFunc {
+func Readiness(checks ...DependencyCheck) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 		defer cancel()
 
 		status := readinessResponse{
-			Status: "ready",
-			Dependencies: []dependencyStatus{
-				{Name: "postgres", Status: "ok"},
-			},
+			Status:       "ready",
+			Dependencies: make([]dependencyStatus, 0, len(checks)),
+		}
+		for _, check := range checks {
+			dependency := dependencyStatus{Name: check.Name, Status: "ok"}
+			if check.Ping != nil {
+				if err := check.Ping(ctx); err != nil {
+					dependency.Status = "down"
+					status.Status = "not_ready"
+				}
+			}
+			status.Dependencies = append(status.Dependencies, dependency)
 		}
 
-		if err := dbPing(ctx); err != nil {
-			status.Status = "not_ready"
-			status.Dependencies[0].Status = "down"
+		if status.Status != "ready" {
 			writeJSON(w, http.StatusServiceUnavailable, status)
 			return
 		}
-
 		writeJSON(w, http.StatusOK, status)
 	}
 }

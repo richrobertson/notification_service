@@ -21,6 +21,10 @@ type schedulerStore interface {
 
 func main() {
 	cfg := config.Load()
+	if err := cfg.Validate(); err != nil {
+		slog.Error("invalid configuration", slog.Any("error", err))
+		os.Exit(1)
+	}
 	cfg.AppName = "scheduler"
 	logger := platform.NewLogger(cfg.LogLevel)
 	slog.SetDefault(logger)
