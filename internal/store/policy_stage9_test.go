@@ -28,3 +28,26 @@ func TestApplyPolicyRowResolutionOrder(t *testing.T) {
 		t.Fatal("expected paused=true")
 	}
 }
+
+func TestNewerSameScopePolicyWins(t *testing.T) {
+	resolved := ResolvedDeliveryPolicy{
+		TenantID:          "tenant-1",
+		Channel:           "email",
+		SchedulingEnabled: true,
+		ReplayAllowed:     true,
+	}
+	olderRetry := 30
+	newerRetry := 10
+	ordered := []DeliveryPolicy{
+		{RetryBaseDelaySeconds: &newerRetry},
+		{RetryBaseDelaySeconds: &olderRetry},
+	}
+
+	for i := len(ordered) - 1; i >= 0; i-- {
+		applyPolicyRow(&resolved, ordered[i])
+	}
+
+	if resolved.RetryBaseDelaySeconds == nil || *resolved.RetryBaseDelaySeconds != 10 {
+		t.Fatalf("retry_base_delay_seconds=%v", resolved.RetryBaseDelaySeconds)
+	}
+}

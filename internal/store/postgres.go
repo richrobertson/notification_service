@@ -2118,8 +2118,8 @@ func (p *Postgres) ResolveDeliveryPolicy(ctx context.Context, tenantID, channel 
 				WHEN tenant_id IS NULL AND channel = $2 THEN 3
 				ELSE 4
 			END,
-			updated_at ASC,
-			created_at ASC
+			updated_at DESC,
+			created_at DESC
 	`, tenantID, channel)
 	if err != nil {
 		return ResolvedDeliveryPolicy{}, fmt.Errorf("resolve delivery policy: %w", err)

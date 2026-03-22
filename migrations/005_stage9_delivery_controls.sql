@@ -57,6 +57,10 @@ ALTER TABLE delivery_attempts
     ADD COLUMN IF NOT EXISTS provider_used TEXT,
     ADD COLUMN IF NOT EXISTS failover_used BOOLEAN NOT NULL DEFAULT FALSE;
 
+CREATE INDEX IF NOT EXISTS notifications_scheduled_pending_idx
+    ON notifications (scheduled_for)
+    WHERE scheduled_for IS NOT NULL AND promoted_at IS NULL AND cancelled_at IS NULL;
+
 CREATE TABLE IF NOT EXISTS delivery_policies (
     id TEXT PRIMARY KEY,
     tenant_id TEXT REFERENCES tenants(id) ON DELETE CASCADE,

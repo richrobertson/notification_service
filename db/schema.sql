@@ -80,6 +80,10 @@ CREATE INDEX notifications_tenant_submitted_at_idx
 CREATE INDEX notifications_status_idx
     ON notifications (status);
 
+CREATE INDEX notifications_scheduled_pending_idx
+    ON notifications (scheduled_for)
+    WHERE scheduled_for IS NOT NULL AND promoted_at IS NULL AND cancelled_at IS NULL;
+
 CREATE TABLE delivery_attempts (
     id TEXT PRIMARY KEY,
     notification_id TEXT NOT NULL REFERENCES notifications(id) ON DELETE CASCADE,
