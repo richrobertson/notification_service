@@ -162,6 +162,13 @@ func (c Config) Validate() error {
 	if strings.TrimSpace(c.HTTPPort) == "" {
 		return fmt.Errorf("HTTP_PORT must not be empty")
 	}
+	port, err := strconv.Atoi(c.HTTPPort)
+	if err != nil {
+		return fmt.Errorf("HTTP_PORT must be a valid integer: %w", err)
+	}
+	if port < 1 || port > 65535 {
+		return fmt.Errorf("HTTP_PORT must be between 1 and 65535")
+	}
 	if strings.TrimSpace(c.DatabaseURL) == "" {
 		return fmt.Errorf("DATABASE_URL must not be empty")
 	}

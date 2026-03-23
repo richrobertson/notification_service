@@ -27,6 +27,16 @@ func TestValidateRejectsInvalidRetryRange(t *testing.T) {
 	}
 }
 
+func TestValidateRejectsInvalidHTTPPort(t *testing.T) {
+	cfg := Load()
+	cfg.HTTPPort = "70000"
+
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "HTTP_PORT") {
+		t.Fatalf("expected HTTP_PORT validation error, got %v", err)
+	}
+}
+
 func TestValidateForAPIRequiresAdminTokenOutsideLocal(t *testing.T) {
 	cfg := Load()
 	cfg.Environment = "prod"

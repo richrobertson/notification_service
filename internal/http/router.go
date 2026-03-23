@@ -2,6 +2,7 @@ package httpserver
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/json"
 	"log/slog"
@@ -161,7 +162,9 @@ func adminMiddleware(token string) func(http.Handler) http.Handler {
 					provided = strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
 				}
 			}
-			if subtle.ConstantTimeCompare([]byte(provided), []byte(token)) != 1 {
+			providedDigest := sha256.Sum256([]byte(provided))
+			expectedDigest := sha256.Sum256([]byte(token))
+			if subtle.ConstantTimeCompare(providedDigest[:], expectedDigest[:]) != 1 {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusUnauthorized)
 				_ = json.NewEncoder(w).Encode(map[string]string{"code": "unauthorized", "message": "admin credentials required"})

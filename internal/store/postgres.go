@@ -2650,15 +2650,28 @@ func (p *Postgres) RunMaintenance(ctx context.Context, params CleanupParams) (Cl
 		return result, nil
 	}
 
-	if _, err := tx.ExecContext(ctx, `DELETE FROM audit_events WHERE created_at < $1`, auditCutoff); err != nil {
+	auditDeleteResult, err := tx.ExecContext(ctx, `DELETE FROM audit_events WHERE created_at < $1`, auditCutoff)
+	if err != nil {
 		return CleanupResult{}, fmt.Errorf("run maintenance: delete audit events: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM dispatch_outbox WHERE status = 'published' AND published_at IS NOT NULL AND published_at < $1`, outboxCutoff); err != nil {
+	if result.AuditEventsDeleted, err = auditDeleteResult.RowsAffected(); err != nil {
+		return CleanupResult{}, fmt.Errorf("run maintenance: audit rows affected: %w", err)
+	}
+
+	outboxDeleteResult, err := tx.ExecContext(ctx, `DELETE FROM dispatch_outbox WHERE status = 'published' AND published_at IS NOT NULL AND published_at < $1`, outboxCutoff)
+	if err != nil {
 		return CleanupResult{}, fmt.Errorf("run maintenance: delete outbox rows: %w", err)
 	}
+	if result.PublishedOutboxDeleted, err = outboxDeleteResult.RowsAffected(); err != nil {
+		return CleanupResult{}, fmt.Errorf("run maintenance: outbox rows affected: %w", err)
+	}
 	if params.DeadLetterRetention > 0 {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM dead_letters WHERE replayed_at IS NOT NULL AND replayed_at < $1`, deadLetterCutoff); err != nil {
+		deadLetterDeleteResult, err := tx.ExecContext(ctx, `DELETE FROM dead_letters WHERE replayed_at IS NOT NULL AND replayed_at < $1`, deadLetterCutoff)
+		if err != nil {
 			return CleanupResult{}, fmt.Errorf("run maintenance: delete dead letters: %w", err)
+		}
+		if result.DeadLettersDeleted, err = deadLetterDeleteResult.RowsAffected(); err != nil {
+			return CleanupResult{}, fmt.Errorf("run maintenance: dead letter rows affected: %w", err)
 		}
 	}
 
