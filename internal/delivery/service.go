@@ -16,6 +16,8 @@ import (
 	"go.opentelemetry.io/otel/metric"
 )
 
+// NotificationStore captures the durable state transitions the delivery service
+// depends on while processing one attempt.
 type NotificationStore interface {
 	LoadDeliveryJob(ctx context.Context, notificationID, attemptID string) (store.Notification, store.Template, store.DeliveryAttempt, error)
 	GetDeliveryAttemptByID(ctx context.Context, attemptID string) (store.DeliveryAttempt, error)
@@ -30,6 +32,8 @@ type NotificationStore interface {
 	RecordAuditEvent(ctx context.Context, id, tenantID, actor, action, resourceType, resourceID string, metadata map[string]any) error
 }
 
+// RetryPolicy controls how retryable failures are converted into retry
+// schedules.
 type RetryPolicy struct {
 	MaxAttempts        int
 	BaseDelay          time.Duration
@@ -52,6 +56,7 @@ type emailSender interface {
 	Send(ctx context.Context, req EmailRequest) error
 }
 
+// Outcome classifies the durable result of processing one queue job.
 type Outcome int
 
 const (
@@ -69,17 +74,29 @@ type Result struct {
 	Message     string
 }
 
+// TerminalError marks a failure as non-retryable.
 type TerminalError struct{ Err error }
 
+// Error implements the error interface.
 func (e *TerminalError) Error() string { return e.Err.Error() }
+
+// Unwrap exposes the wrapped cause.
 func (e *TerminalError) Unwrap() error { return e.Err }
 
+// RetryableError marks a failure as retryable.
 type RetryableError struct{ Err error }
 
+// Error implements the error interface.
 func (e *RetryableError) Error() string { return e.Err.Error() }
+
+// Unwrap exposes the wrapped cause.
 func (e *RetryableError) Unwrap() error { return e.Err }
 
-func IsTerminal(err error) bool  { var target *TerminalError; return errors.As(err, &target) }
+// IsTerminal reports whether the error was classified as a terminal delivery
+// failure.
+func IsTerminal(err error) bool { var target *TerminalError; return errors.As(err, &target) }
+
+// IsRetryable reports whether the error was classified as retryable.
 func IsRetryable(err error) bool { var target *RetryableError; return errors.As(err, &target) }
 func terminalErrorf(format string, args ...any) error {
 	return &TerminalError{Err: fmt.Errorf(format, args...)}
@@ -88,6 +105,8 @@ func retryableErrorf(format string, args ...any) error {
 	return &RetryableError{Err: fmt.Errorf(format, args...)}
 }
 
+// MaybeRetryable wraps an ordinary error as retryable unless it has already
+// been classified.
 func MaybeRetryable(err error) error {
 	if err == nil || IsTerminal(err) || IsRetryable(err) {
 		return err
@@ -95,6 +114,7 @@ func MaybeRetryable(err error) error {
 	return &RetryableError{Err: err}
 }
 
+// Service coordinates one delivery attempt from queue job to durable outcome.
 type Service struct {
 	store         NotificationStore
 	webhookSender webhookSender
@@ -106,6 +126,8 @@ type Service struct {
 	failCounter   metric.Int64Counter
 }
 
+// NewService constructs a delivery Service with retry policy defaults and
+// telemetry counters.
 func NewService(store NotificationStore, webhookSender webhookSender, webhookBackup webhookSender, emailSender emailSender, emailBackup emailSender, policy RetryPolicy) (*Service, error) {
 	if policy.MaxAttempts <= 0 {
 		policy.MaxAttempts = 3
@@ -140,6 +162,7 @@ func NewService(store NotificationStore, webhookSender webhookSender, webhookBac
 	return &Service{store: store, webhookSender: webhookSender, webhookBackup: webhookBackup, emailSender: emailSender, emailBackup: emailBackup, policy: policy, sentCounter: sentCounter, failCounter: failCounter}, nil
 }
 
+// ProcessWebhook processes one webhook dispatch job.
 func (s *Service) ProcessWebhook(ctx context.Context, job queue.DispatchJob) (Result, error) {
 	return s.process(ctx, job, func(ctx context.Context, notification store.Notification, template store.Template, policy store.ResolvedDeliveryPolicy) (*string, string, bool, error) {
 		if notification.RecipientWebhookURL == nil || strings.TrimSpace(*notification.RecipientWebhookURL) == "" {
@@ -166,6 +189,7 @@ func (s *Service) ProcessWebhook(ctx context.Context, job queue.DispatchJob) (Re
 	})
 }
 
+// ProcessEmail processes one email dispatch job.
 func (s *Service) ProcessEmail(ctx context.Context, job queue.DispatchJob) (Result, error) {
 	return s.process(ctx, job, func(ctx context.Context, notification store.Notification, template store.Template, policy store.ResolvedDeliveryPolicy) (*string, string, bool, error) {
 		if notification.RecipientEmail == nil || strings.TrimSpace(*notification.RecipientEmail) == "" {

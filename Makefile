@@ -4,7 +4,7 @@ APP_NAME := notification-platform
 DB_URL := postgres://notification:notification@localhost:5432/notification_platform?sslmode=disable
 MIGRATIONS_DIR := ./migrations
 
-.PHONY: help dev-up dev-down dev-logs db-shell migrate-up migrate-reset run-api run-dispatcher run-webhook-worker run-email-worker test fmt lint
+.PHONY: help dev-up dev-down dev-logs db-shell migrate-up migrate-reset run-api run-dispatcher run-webhook-worker run-email-worker test fmt lint docs-godoc
 
 help:
 	@echo "$(APP_NAME) developer workflow"
@@ -24,6 +24,7 @@ help:
 	@echo "  test               Run Go tests"
 	@echo "  fmt                Format Go files"
 	@echo "  lint               Run go vet"
+	@echo "  docs-godoc         Generate package API docs from Go doc comments"
 
 dev-up:
 	docker compose -f deployments/docker-compose.yml up -d
@@ -70,6 +71,25 @@ fmt:
 
 lint:
 	go vet ./...
+
+docs-godoc:
+	@mkdir -p docs/api
+	@set -euo pipefail; \
+	packages=$$(go list -f '{{if or .GoFiles .CgoFiles}}{{.ImportPath}}{{end}}' ./... | sed '/^$$/d' | sort); \
+	for pkg in $$packages; do \
+		name=$$(echo $$pkg | sed 's#github.com/richrobertson/notification-platform/##; s#^\./##; s#/#_#g'); \
+		out="docs/api/$${name}.md"; \
+		echo "Generating $$out"; \
+		{ \
+			echo "# $$pkg"; \
+			echo ""; \
+			echo "_Generated from Go doc comments. Run \`make docs-godoc\` to refresh._"; \
+			echo ""; \
+			echo '```text'; \
+			go doc -all $$pkg; \
+			echo '```'; \
+		} > "$$out"; \
+	done
 
 run-webhook-worker:
 	go run ./cmd/webhook_worker

@@ -21,6 +21,10 @@ import (
 
 func main() {
 	cfg := config.Load()
+	if err := cfg.ValidateForAPI(); err != nil {
+		slog.Error("invalid configuration", slog.Any("error", err))
+		os.Exit(1)
+	}
 	logger := platform.NewLogger(cfg.LogLevel)
 	slog.SetDefault(logger)
 
@@ -66,8 +70,25 @@ func main() {
 	}()
 
 	monitor := pressure.NewMonitor(redisQueue, cfg.QueueSoftLimit, cfg.QueueHardLimit, cfg.BackpressureRetryAfter)
-	router := httpserver.NewRouter(httpserver.RouterDeps{AppName: cfg.AppName, DBPing: postgres.Ping, Store: postgres, Queue: redisQueue, Monitor: monitor, Limiter: queue.NewTenantRateLimiter(redisQueue, cfg.APIRateLimitPerSecond, cfg.APIRateLimitWindow)})
-	server := &http.Server{Addr: ":" + cfg.HTTPPort, Handler: router, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 15 * time.Second, IdleTimeout: 60 * time.Second}
+	router := httpserver.NewRouter(httpserver.RouterDeps{
+		AppName:             cfg.AppName,
+		AdminToken:          cfg.AdminToken,
+		MaxRequestBodyBytes: cfg.MaxRequestBodyBytes,
+		DBPing:              postgres.Ping,
+		RedisPing:           redisQueue.Ping,
+		Store:               postgres,
+		Queue:               redisQueue,
+		Monitor:             monitor,
+		Limiter:             queue.NewTenantRateLimiter(redisQueue, cfg.APIRateLimitPerSecond, cfg.APIRateLimitWindow),
+	})
+	server := &http.Server{
+		Addr:              ":" + cfg.HTTPPort,
+		Handler:           router,
+		ReadHeaderTimeout: cfg.HTTPReadHeaderTimeout,
+		ReadTimeout:       cfg.HTTPReadTimeout,
+		WriteTimeout:      cfg.HTTPWriteTimeout,
+		IdleTimeout:       cfg.HTTPIdleTimeout,
+	}
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -85,7 +106,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 10*time.Second)
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), cfg.HTTPShutdownTimeout)
 	defer cancelShutdown()
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		logger.Error("failed to shut down http server", slog.Any("error", err))

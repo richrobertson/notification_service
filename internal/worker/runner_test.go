@@ -181,3 +181,52 @@ func TestRunChannelWorkerRespectsConcurrency(t *testing.T) {
 		t.Fatalf("max concurrency=%d", maxActive)
 	}
 }
+
+func TestRunChannelWorkerWaitsForInFlightJobsOnShutdown(t *testing.T) {
+	server := newFakeRedisServerForWorker(t)
+	defer server.close()
+
+	q := queue.NewRedisQueue(server.addr(), "", 0)
+	ctx, cancel := context.WithCancel(context.Background())
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	if err := q.EnqueueChannel(ctx, queue.DispatchJob{
+		JobID:     "job-1",
+		AttemptID: "attempt-1",
+		TenantID:  "tenant-1",
+		Channel:   "email",
+		CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+
+	started := make(chan struct{})
+	finish := make(chan struct{})
+	done := make(chan struct{})
+
+	go func() {
+		RunChannelWorker(ctx, logger, q, queue.DispatchEmailQueueName, time.Second, func(ctx context.Context, job queue.DispatchJob) (delivery.Result, error) {
+			close(started)
+			<-finish
+			return delivery.Result{Outcome: delivery.OutcomeSent}, nil
+		}, Options{Concurrency: 1, TenantBurst: 1, TenantMaxInFlight: 1})
+		close(done)
+	}()
+
+	<-started
+	cancel()
+
+	select {
+	case <-done:
+		t.Fatal("worker returned before in-flight job completed")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(finish)
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("worker did not complete after in-flight job finished")
+	}
+}

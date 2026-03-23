@@ -2,14 +2,13 @@
 
 ## Current status
 
-The repository is currently **through Stage 9**, with earlier Stage 6 follow-up fixes and polish already merged.
+The repository is currently **through Stage 10**, with earlier follow-up fixes and polish already merged.
 
-- Stages 3 through 9 are complete
-- Stage 6 correctness and inspection improvements are in place
-- Stage 7 overload protection and tenant isolation are in place
+- Stages 3 through 10 are complete
 - Stage 8 dispatch outbox durability is in place
 - Stage 9 advanced delivery controls are in place
-- The next major milestone is **Stage 10**
+- Stage 10 production / platform polish is in place
+- The next major milestone is a later expansion step rather than another foundational runtime milestone
 
 ---
 
@@ -69,34 +68,39 @@ The repository is currently **through Stage 9**, with earlier Stage 6 follow-up 
 - Narrow provider failover for webhook and secondary SMTP delivery
 - Audit visibility for failover and operator delivery-control actions
 
+### Stage 10 — Production / Platform Polish
+- Health, readiness, and richer metrics endpoints
+- Admin token protection for operator routes
+- Config validation and bounded HTTP request handling
+- Graceful shutdown across API and worker processes
+- Retention-driven maintenance cleanup and updated runbooks
+
 ---
 
 ## In progress
 
 - No separate major milestone is currently in progress
-- The system is in a **stabilized post-Stage-9 state**
-- The next milestone is clearly **Stage 10**
+- The system is in a **stabilized post-Stage-10 state**
+- The next milestone is a later expansion step, not a missing Stage 10 follow-up
 
 ---
 
 ## Next
 
-### Stage 10 — Production / Platform Polish
+### Later platform expansion
 
-Focus: **operational maturity and platform hardening**
-
-- Security hardening
-- Expanded observability and metrics
-- Admin and operator workflows
-- Deployment and operational maturity
+- Additional channels such as SMS
+- Richer provider routing and operational controls
+- More complete admin and operator experiences
+- Deeper tenant/platform policy and quota controls
 
 ---
 
 ## Later
 
-- Additional channels such as SMS
-- Richer provider routing and operational controls
-- More complete admin and operator experiences
+- Multi-region and more advanced deployment models
+- Broader provider ecosystem work if the design still benefits from it
+- More complete admin/operator tooling beyond API and runbooks
 
 ---
 
@@ -108,7 +112,7 @@ Focus: **operational maturity and platform hardening**
   - correctness
   - operator visibility
   - survivability under load
-- The primary remaining gap is **production and platform polish**
+  - production/runtime safety
 - The design continues to favor:
   - simple, explicit components
   - Postgres as source of truth

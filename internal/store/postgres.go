@@ -12,13 +12,22 @@ import (
 )
 
 var (
-	ErrNotFound                 = errors.New("store: not found")
-	ErrConflict                 = errors.New("store: conflict")
-	ErrAttemptAlreadyFinalized  = errors.New("store: attempt already finalized")
+	// ErrNotFound reports that the requested durable record does not exist.
+	ErrNotFound = errors.New("store: not found")
+	// ErrConflict reports that a uniqueness or ownership invariant was violated.
+	ErrConflict = errors.New("store: conflict")
+	// ErrAttemptAlreadyFinalized reports that an attempt can no longer move into a
+	// new active state.
+	ErrAttemptAlreadyFinalized = errors.New("store: attempt already finalized")
+	// ErrAttemptAlreadyProcessing reports that another worker already owns the
+	// active execution of an attempt.
 	ErrAttemptAlreadyProcessing = errors.New("store: attempt already processing")
-	ErrInvalidStateTransition   = errors.New("store: invalid state transition")
+	// ErrInvalidStateTransition reports that the requested transition would break
+	// the durable workflow rules.
+	ErrInvalidStateTransition = errors.New("store: invalid state transition")
 )
 
+// Postgres wraps the shared sql.DB used by the durable store layer.
 type Postgres struct {
 	DB *sql.DB
 }
@@ -27,6 +36,7 @@ func touchUpdatedAtSetClause() string {
 	return "updated_at = NOW()"
 }
 
+// Tenant is the durable tenant record stored in Postgres.
 type Tenant struct {
 	ID         string    `json:"id"`
 	Name       string    `json:"name"`
@@ -35,6 +45,7 @@ type Tenant struct {
 	CreatedAt  time.Time `json:"created_at"`
 }
 
+// Template is the durable template record stored in Postgres.
 type Template struct {
 	ID        string    `json:"id"`
 	TenantID  string    `json:"tenant_id"`
@@ -45,6 +56,8 @@ type Template struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+// Notification is the durable notification record exposed by the API and
+// operator inspection endpoints.
 type Notification struct {
 	ID                  string         `json:"id"`
 	TenantID            string         `json:"tenant_id"`
@@ -62,6 +75,7 @@ type Notification struct {
 	UpdatedAt           time.Time      `json:"updated_at"`
 }
 
+// DeliveryAttempt is the durable execution record for one delivery try.
 type DeliveryAttempt struct {
 	ID                 string     `json:"id"`
 	NotificationID     string     `json:"notification_id"`
@@ -87,6 +101,8 @@ type DeliveryAttempt struct {
 	UpdatedAt          time.Time  `json:"updated_at"`
 }
 
+// DispatchIntent is the Stage 8 outbox record that tracks whether an attempt
+// still needs Redis publication.
 type DispatchIntent struct {
 	ID             string     `json:"id"`
 	NotificationID string     `json:"notification_id"`
@@ -101,6 +117,8 @@ type DispatchIntent struct {
 	PublishedAt    *time.Time `json:"published_at"`
 }
 
+// AuditEvent is the durable audit-trail record for operator and runtime
+// actions.
 type AuditEvent struct {
 	ID           string         `json:"id"`
 	TenantID     string         `json:"tenant_id"`
@@ -112,12 +130,14 @@ type AuditEvent struct {
 	CreatedAt    time.Time      `json:"created_at"`
 }
 
+// CreateTenantParams holds the input for CreateTenant.
 type CreateTenantParams struct {
 	ID         string
 	Name       string
 	DailyQuota int
 }
 
+// CreateTemplateParams holds the input for CreateTemplate.
 type CreateTemplateParams struct {
 	ID       string
 	TenantID string
@@ -127,6 +147,8 @@ type CreateTemplateParams struct {
 	Body     string
 }
 
+// CreateNotificationParams holds the durable notification fields created before
+// initial dispatch behavior is applied.
 type CreateNotificationParams struct {
 	ID                  string
 	TenantID            string
@@ -139,6 +161,7 @@ type CreateNotificationParams struct {
 	ScheduledFor        *time.Time
 }
 
+// CreateDeliveryAttemptParams holds the input for CreateDeliveryAttempt.
 type CreateDeliveryAttemptParams struct {
 	ID                 string
 	NotificationID     string
@@ -151,6 +174,7 @@ type CreateDeliveryAttemptParams struct {
 	EnqueueKind        string
 }
 
+// CreateDispatchIntentParams holds the input for CreateDispatchIntent.
 type CreateDispatchIntentParams struct {
 	ID             string
 	NotificationID string
@@ -162,6 +186,8 @@ type CreateDispatchIntentParams struct {
 	PublishedAt    *time.Time
 }
 
+// CreateNotificationDispatchParams combines notification, initial attempt, and
+// initial dispatch-intent creation.
 type CreateNotificationDispatchParams struct {
 	Notification CreateNotificationParams
 	Channel      string
@@ -169,6 +195,8 @@ type CreateNotificationDispatchParams struct {
 	IntentID     string
 }
 
+// DeliveryPolicy stores one policy row that may contribute to tenant/channel
+// policy resolution.
 type DeliveryPolicy struct {
 	ID                    string    `json:"id"`
 	TenantID              *string   `json:"tenant_id,omitempty"`
@@ -184,6 +212,8 @@ type DeliveryPolicy struct {
 	UpdatedAt             time.Time `json:"updated_at"`
 }
 
+// ResolvedDeliveryPolicy is the final policy view after precedence and override
+// rules have been applied.
 type ResolvedDeliveryPolicy struct {
 	TenantID              string `json:"tenant_id"`
 	Channel               string `json:"channel"`
@@ -196,6 +226,7 @@ type ResolvedDeliveryPolicy struct {
 	RetryMaxDelaySeconds  *int   `json:"retry_max_delay_seconds,omitempty"`
 }
 
+// UpsertDeliveryPolicyParams holds the mutable policy fields for upsert.
 type UpsertDeliveryPolicyParams struct {
 	ID                    string
 	TenantID              *string
@@ -209,12 +240,15 @@ type UpsertDeliveryPolicyParams struct {
 	RetryMaxDelaySeconds  *int
 }
 
+// PromotedScheduledNotification is the result of turning scheduled work into an
+// active dispatch intent.
 type PromotedScheduledNotification struct {
 	Notification Notification
 	Attempt      DeliveryAttempt
 	Intent       DispatchIntent
 }
 
+// DeadLetter is the durable terminal record for a permanently failed attempt.
 type DeadLetter struct {
 	ID              string     `json:"id"`
 	NotificationID  string     `json:"notification_id"`
@@ -225,17 +259,56 @@ type DeadLetter struct {
 	ReplayAttemptID *string    `json:"replay_attempt_id"`
 }
 
+// RetryDueAttempt is the retry scheduler's durable input row.
 type RetryDueAttempt struct {
 	Attempt        DeliveryAttempt
 	NotificationID string
 	TenantID       string
 }
 
+// PendingDispatchIntent is the outbox publisher's durable input row.
 type PendingDispatchIntent struct {
 	Intent       DispatchIntent
 	DeadLetterID *string
 }
 
+// OperationalMetrics is the Stage 10 store-backed metrics snapshot returned by
+// the metrics endpoint.
+type OperationalMetrics struct {
+	OutboxPendingCount        int       `json:"outbox_pending_count"`
+	OutboxPublishingCount     int       `json:"outbox_publishing_count"`
+	OutboxOldestLagSeconds    int64     `json:"outbox_oldest_lag_seconds"`
+	DueRetryCount             int       `json:"due_retry_count"`
+	OpenDeadLetterCount       int       `json:"open_dead_letter_count"`
+	DuplicateSuppressionCount int       `json:"duplicate_suppression_count"`
+	RetryScheduledCount       int       `json:"retry_scheduled_count"`
+	DeadLetteredCount         int       `json:"dead_lettered_count"`
+	ScheduledPendingCount     int       `json:"scheduled_pending_count"`
+	ScheduledDueCount         int       `json:"scheduled_due_count"`
+	ScheduledOldestLagSeconds int64     `json:"scheduled_oldest_lag_seconds"`
+	CollectedAt               time.Time `json:"collected_at"`
+}
+
+// CleanupParams controls one explicit maintenance pass.
+type CleanupParams struct {
+	Now                 time.Time
+	AuditRetention      time.Duration
+	OutboxRetention     time.Duration
+	DeadLetterRetention time.Duration
+	DryRun              bool
+}
+
+// CleanupResult reports what a maintenance pass deleted, or would have deleted
+// in dry-run mode.
+type CleanupResult struct {
+	DryRun                 bool      `json:"dry_run"`
+	AuditEventsDeleted     int64     `json:"audit_events_deleted"`
+	PublishedOutboxDeleted int64     `json:"published_outbox_deleted"`
+	DeadLettersDeleted     int64     `json:"dead_letters_deleted"`
+	ExecutedAt             time.Time `json:"executed_at"`
+}
+
+// NewPostgres opens the durable Postgres connection used by the runtime.
 func NewPostgres(ctx context.Context, databaseURL string) (*Postgres, error) {
 	db, err := sql.Open("postgres", databaseURL)
 	if err != nil {
@@ -255,6 +328,7 @@ func NewPostgres(ctx context.Context, databaseURL string) (*Postgres, error) {
 	return &Postgres{DB: db}, nil
 }
 
+// Close releases the underlying database connection pool.
 func (p *Postgres) Close() error {
 	if p == nil || p.DB == nil {
 		return nil
@@ -267,6 +341,7 @@ func (p *Postgres) Close() error {
 	return nil
 }
 
+// Ping verifies that Postgres is reachable.
 func (p *Postgres) Ping(ctx context.Context) error {
 	if p == nil || p.DB == nil {
 		return fmt.Errorf("postgres connection is not initialized")
@@ -279,6 +354,7 @@ func (p *Postgres) Ping(ctx context.Context) error {
 	return nil
 }
 
+// CreateTenant inserts a new tenant row.
 func (p *Postgres) CreateTenant(ctx context.Context, params CreateTenantParams) (Tenant, error) {
 	const query = `
 		INSERT INTO tenants (id, name, daily_quota)
@@ -301,6 +377,7 @@ func (p *Postgres) CreateTenant(ctx context.Context, params CreateTenantParams) 
 	return tenant, nil
 }
 
+// GetTenantByID returns one tenant by ID.
 func (p *Postgres) GetTenantByID(ctx context.Context, id string) (Tenant, error) {
 	const query = `
 		SELECT id, name, status, daily_quota, created_at
@@ -326,6 +403,7 @@ func (p *Postgres) GetTenantByID(ctx context.Context, id string) (Tenant, error)
 	return tenant, nil
 }
 
+// CreateTemplate inserts a new template row.
 func (p *Postgres) CreateTemplate(ctx context.Context, params CreateTemplateParams) (Template, error) {
 	const query = `
 		INSERT INTO templates (id, tenant_id, name, channel, version, body)
@@ -359,6 +437,7 @@ func (p *Postgres) CreateTemplate(ctx context.Context, params CreateTemplatePara
 	return template, nil
 }
 
+// GetTemplateByID returns one template by ID.
 func (p *Postgres) GetTemplateByID(ctx context.Context, id string) (Template, error) {
 	const query = `
 		SELECT id, tenant_id, name, channel, version, body, created_at
@@ -386,6 +465,8 @@ func (p *Postgres) GetTemplateByID(ctx context.Context, id string) (Template, er
 	return template, nil
 }
 
+// CreateNotification inserts a notification row without creating an initial
+// attempt or dispatch intent.
 func (p *Postgres) CreateNotification(ctx context.Context, params CreateNotificationParams) (Notification, error) {
 	notification, err := createNotificationTx(ctx, p.DB, params)
 	if err != nil {
@@ -480,6 +561,9 @@ func createNotificationTx(ctx context.Context, querier interface {
 	return notification, nil
 }
 
+// CreateNotificationWithInitialDispatch atomically creates the notification and
+// its initial attempt, plus an initial dispatch intent when the work is
+// immediately publishable.
 func (p *Postgres) CreateNotificationWithInitialDispatch(ctx context.Context, params CreateNotificationDispatchParams) (Notification, DeliveryAttempt, DispatchIntent, error) {
 	tx, err := p.DB.BeginTx(ctx, nil)
 	if err != nil {
@@ -535,6 +619,8 @@ func (p *Postgres) CreateNotificationWithInitialDispatch(ctx context.Context, pa
 	return notification, attempt, intent, nil
 }
 
+// GetNotificationByTenantAndIdempotencyKey returns the durable notification for
+// a tenant-scoped idempotency key.
 func (p *Postgres) GetNotificationByTenantAndIdempotencyKey(ctx context.Context, tenantID, idempotencyKey string) (Notification, error) {
 	const query = `
 		SELECT
@@ -589,6 +675,7 @@ func (p *Postgres) GetNotificationByTenantAndIdempotencyKey(ctx context.Context,
 	return notification, nil
 }
 
+// IsConflict reports whether an error should be treated as a durable conflict.
 func IsConflict(err error) bool {
 	return errors.Is(err, ErrConflict)
 }
@@ -777,14 +864,20 @@ func applyPolicyRow(resolved *ResolvedDeliveryPolicy, row DeliveryPolicy) {
 	}
 }
 
+// IsAttemptAlreadyFinalized reports whether an error means the attempt is
+// already terminal.
 func IsAttemptAlreadyFinalized(err error) bool {
 	return errors.Is(err, ErrAttemptAlreadyFinalized)
 }
 
+// IsAttemptAlreadyProcessing reports whether another worker already owns the
+// attempt.
 func IsAttemptAlreadyProcessing(err error) bool {
 	return errors.Is(err, ErrAttemptAlreadyProcessing)
 }
 
+// IsInvalidStateTransition reports whether the requested durable transition was
+// rejected by workflow rules.
 func IsInvalidStateTransition(err error) bool {
 	return errors.Is(err, ErrInvalidStateTransition)
 }
@@ -847,6 +940,8 @@ func (p *Postgres) notificationIDForAttempt(ctx context.Context, attemptID strin
 	return notificationID, nil
 }
 
+// GetInitialAttemptByNotificationID returns the initial attempt for a
+// notification.
 func (p *Postgres) GetInitialAttemptByNotificationID(ctx context.Context, notificationID string) (DeliveryAttempt, error) {
 	const query = `
 		SELECT id, notification_id, channel, attempt_number, status, error_code, error_message, provider_message_id, last_error, next_retry_at, started_at, completed_at, sent_at, failed_at, dispatch_enqueued_at, enqueue_kind, created_at, updated_at
@@ -865,6 +960,8 @@ func (p *Postgres) GetInitialAttemptByNotificationID(ctx context.Context, notifi
 	return attempt, nil
 }
 
+// EnsureInitialAttempt repairs or recreates the initial attempt and dispatch
+// intent for idempotent request recovery paths.
 func (p *Postgres) EnsureInitialAttempt(ctx context.Context, notificationID, channel, attemptID, intentID string) (DeliveryAttempt, DispatchIntent, error) {
 	tx, err := p.DB.BeginTx(ctx, nil)
 	if err != nil {
@@ -931,6 +1028,7 @@ func (p *Postgres) EnsureInitialAttempt(ctx context.Context, notificationID, cha
 	return attempt, intent, nil
 }
 
+// CreateDeliveryAttempt inserts a delivery attempt row.
 func (p *Postgres) CreateDeliveryAttempt(ctx context.Context, params CreateDeliveryAttemptParams) (DeliveryAttempt, error) {
 	attempt, err := createDeliveryAttemptTx(ctx, p.DB, params)
 	if err != nil {
@@ -998,6 +1096,7 @@ func createDeliveryAttemptTx(ctx context.Context, querier interface {
 	return attempt, nil
 }
 
+// CreateDispatchIntent inserts a Stage 8 outbox row.
 func (p *Postgres) CreateDispatchIntent(ctx context.Context, params CreateDispatchIntentParams) (DispatchIntent, error) {
 	intent, err := createDispatchIntentTx(ctx, p.DB, params)
 	if err != nil {
@@ -1067,6 +1166,8 @@ func publishedIntentStatus(publishedAt *time.Time) string {
 	return "pending"
 }
 
+// LoadDeliveryJob loads the durable notification, template, and attempt needed
+// by a channel worker.
 func (p *Postgres) LoadDeliveryJob(ctx context.Context, notificationID, attemptID string) (Notification, Template, DeliveryAttempt, error) {
 	notification, err := p.GetNotificationByID(ctx, notificationID)
 	if err != nil {
@@ -1086,6 +1187,7 @@ func (p *Postgres) LoadDeliveryJob(ctx context.Context, notificationID, attemptI
 	return notification, template, attempt, nil
 }
 
+// GetNotificationByID returns one notification by ID.
 func (p *Postgres) GetNotificationByID(ctx context.Context, id string) (Notification, error) {
 	const query = `
 		SELECT id, tenant_id, template_id, idempotency_key, status, recipient_email, recipient_webhook_url, secondary_webhook_url, variables, scheduled_for, promoted_at, cancelled_at, submitted_at, updated_at
@@ -1108,6 +1210,7 @@ func (p *Postgres) GetNotificationByID(ctx context.Context, id string) (Notifica
 	return notification, nil
 }
 
+// GetDeliveryAttemptByID returns one attempt by ID.
 func (p *Postgres) GetDeliveryAttemptByID(ctx context.Context, id string) (DeliveryAttempt, error) {
 	const query = `
 		SELECT id, notification_id, channel, attempt_number, status, error_code, error_message, provider_message_id, last_error, next_retry_at, started_at, completed_at, sent_at, failed_at, dispatch_enqueued_at, enqueue_kind, provider_used, failover_used, created_at, updated_at
@@ -1125,6 +1228,8 @@ func (p *Postgres) GetDeliveryAttemptByID(ctx context.Context, id string) (Deliv
 	return attempt, nil
 }
 
+// ListDeliveryAttemptsByNotificationID returns all attempts for a notification
+// in inspection-friendly order.
 func (p *Postgres) ListDeliveryAttemptsByNotificationID(ctx context.Context, notificationID string) ([]DeliveryAttempt, error) {
 	rows, err := p.DB.QueryContext(ctx, `
 		WITH dead_lettered_attempts AS (
@@ -1172,6 +1277,8 @@ func (p *Postgres) ListDeliveryAttemptsByNotificationID(ctx context.Context, not
 	return attempts, nil
 }
 
+// RecalculateNotificationStatus recomputes the notification rollup from its
+// current attempt state.
 func (p *Postgres) RecalculateNotificationStatus(ctx context.Context, notificationID string) error {
 	var scheduledFor, promotedAt, cancelledAt *time.Time
 	if err := p.DB.QueryRowContext(ctx, `
@@ -1214,6 +1321,8 @@ func (p *Postgres) RecalculateNotificationStatus(ctx context.Context, notificati
 	return nil
 }
 
+// MarkAttemptInProgress atomically transitions an attempt from pending to
+// in_progress.
 func (p *Postgres) MarkAttemptInProgress(ctx context.Context, attemptID string) error {
 	const query = `
 		UPDATE delivery_attempts
@@ -1252,6 +1361,7 @@ func (p *Postgres) MarkAttemptInProgress(ctx context.Context, attemptID string) 
 	return nil
 }
 
+// MarkAttemptSent finalizes an attempt as sent.
 func (p *Postgres) MarkAttemptSent(ctx context.Context, attemptID string, providerMessageID *string) error {
 	const query = `
 		UPDATE delivery_attempts
@@ -1283,6 +1393,7 @@ func (p *Postgres) MarkAttemptSent(ctx context.Context, attemptID string, provid
 	return p.RecalculateNotificationStatus(ctx, notificationID)
 }
 
+// MarkAttemptFailed finalizes an attempt as failed without retry scheduling.
 func (p *Postgres) MarkAttemptFailed(ctx context.Context, attemptID string, lastError string) error {
 	const query = `
 		UPDATE delivery_attempts
@@ -1314,11 +1425,14 @@ func (p *Postgres) MarkAttemptFailed(ctx context.Context, attemptID string, last
 	return p.RecalculateNotificationStatus(ctx, notificationID)
 }
 
+// ReplayDeadLetterResult returns the durable rows produced by a replay path.
 type ReplayDeadLetterResult struct {
 	DeadLetter DeadLetter
 	Attempt    DeliveryAttempt
 }
 
+// ScheduleRetry moves an attempt into retry_scheduled and stores the next retry
+// timestamp.
 func (p *Postgres) ScheduleRetry(ctx context.Context, attemptID, lastError string, nextRetryAt time.Time) error {
 	const query = `
 		UPDATE delivery_attempts
@@ -1350,6 +1464,7 @@ func (p *Postgres) ScheduleRetry(ctx context.Context, attemptID, lastError strin
 	return p.RecalculateNotificationStatus(ctx, notificationID)
 }
 
+// MarkAttemptDeadLettered finalizes an attempt as dead-lettered.
 func (p *Postgres) MarkAttemptDeadLettered(ctx context.Context, attemptID, lastError string) error {
 	const query = `
 		UPDATE delivery_attempts
@@ -1381,6 +1496,7 @@ func (p *Postgres) MarkAttemptDeadLettered(ctx context.Context, attemptID, lastE
 	return p.RecalculateNotificationStatus(ctx, notificationID)
 }
 
+// InsertDeadLetter creates a durable dead-letter row.
 func (p *Postgres) InsertDeadLetter(ctx context.Context, id, notificationID, channel, finalError string) (DeadLetter, error) {
 	const query = `
 		INSERT INTO dead_letters (id, notification_id, channel, final_error)
@@ -1402,6 +1518,7 @@ func (p *Postgres) InsertDeadLetter(ctx context.Context, id, notificationID, cha
 	return deadLetter, nil
 }
 
+// ListDeadLetters returns recent dead letters for operator inspection.
 func (p *Postgres) ListDeadLetters(ctx context.Context, limit int) ([]DeadLetter, error) {
 	if limit <= 0 {
 		limit = 100
@@ -1431,6 +1548,7 @@ func (p *Postgres) ListDeadLetters(ctx context.Context, limit int) ([]DeadLetter
 	return deadLetters, nil
 }
 
+// GetDeadLetterByID returns one dead-letter row by ID.
 func (p *Postgres) GetDeadLetterByID(ctx context.Context, id string) (DeadLetter, error) {
 	const query = `
 		SELECT id, notification_id, channel, final_error, dead_lettered_at, replayed_at, replay_attempt_id
@@ -1447,6 +1565,8 @@ func (p *Postgres) GetDeadLetterByID(ctx context.Context, id string) (DeadLetter
 	return dl, nil
 }
 
+// FinalizeDeadLetterReplay is the older replay path that recreates work and
+// marks the dead letter replayed in one transaction.
 func (p *Postgres) FinalizeDeadLetterReplay(ctx context.Context, deadLetterID, newAttemptID string) (ReplayDeadLetterResult, error) {
 	tx, err := p.DB.BeginTx(ctx, nil)
 	if err != nil {
@@ -1500,6 +1620,7 @@ func (p *Postgres) FinalizeDeadLetterReplay(ctx context.Context, deadLetterID, n
 	return ReplayDeadLetterResult{DeadLetter: dl, Attempt: attempt}, nil
 }
 
+// ListDueRetryAttempts returns retry-scheduled attempts whose retry time is due.
 func (p *Postgres) ListDueRetryAttempts(ctx context.Context, limit int) ([]RetryDueAttempt, error) {
 	if limit <= 0 {
 		limit = 50
@@ -1531,6 +1652,8 @@ func (p *Postgres) ListDueRetryAttempts(ctx context.Context, limit int) ([]Retry
 	return items, nil
 }
 
+// FinalizeRetryDispatch is the older retry path that creates retry work in one
+// transaction.
 func (p *Postgres) FinalizeRetryDispatch(ctx context.Context, scheduledAttemptID, newAttemptID string) (RetryDueAttempt, error) {
 	tx, err := p.DB.BeginTx(ctx, nil)
 	if err != nil {
@@ -1596,12 +1719,16 @@ func getAttemptByIDTx(ctx context.Context, tx *sql.Tx, id string) (DeliveryAttem
 	return attempt, nil
 }
 
+// PendingEnqueueAttempt exposes the older compatibility view of attempts that
+// still need queue publication.
 type PendingEnqueueAttempt struct {
 	Attempt      DeliveryAttempt
 	TenantID     string
 	DeadLetterID *string
 }
 
+// EnsureRetryAttempt repairs or recreates the retry attempt and its dispatch
+// intent.
 func (p *Postgres) EnsureRetryAttempt(ctx context.Context, scheduledAttemptID, newAttemptID string) (RetryDueAttempt, error) {
 	tx, err := p.DB.BeginTx(ctx, nil)
 	if err != nil {
@@ -1673,6 +1800,8 @@ func (p *Postgres) EnsureRetryAttempt(ctx context.Context, scheduledAttemptID, n
 	return item, nil
 }
 
+// EnsureReplayAttempt repairs or recreates the replay attempt and its dispatch
+// intent.
 func (p *Postgres) EnsureReplayAttempt(ctx context.Context, deadLetterID, newAttemptID string) (ReplayDeadLetterResult, error) {
 	tx, err := p.DB.BeginTx(ctx, nil)
 	if err != nil {
@@ -1754,6 +1883,7 @@ func (p *Postgres) EnsureReplayAttempt(ctx context.Context, deadLetterID, newAtt
 	return ReplayDeadLetterResult{DeadLetter: dl, Attempt: attempt}, nil
 }
 
+// ClaimPendingDispatchIntents leases a batch of outbox rows to one publisher.
 func (p *Postgres) ClaimPendingDispatchIntents(ctx context.Context, limit int, staleAfter time.Duration) ([]PendingDispatchIntent, error) {
 	if limit <= 0 {
 		limit = 100
@@ -1850,6 +1980,7 @@ func (p *Postgres) ClaimPendingDispatchIntents(ctx context.Context, limit int, s
 	return intents, nil
 }
 
+// MarkDispatchIntentPublished finalizes a claimed dispatch intent as published.
 func (p *Postgres) MarkDispatchIntentPublished(ctx context.Context, intentID string, claimedAt time.Time) error {
 	tx, err := p.DB.BeginTx(ctx, nil)
 	if err != nil {
@@ -1910,6 +2041,8 @@ func (p *Postgres) MarkDispatchIntentPublished(ctx context.Context, intentID str
 	return nil
 }
 
+// RecordDispatchIntentError releases a claimed intent back to pending with the
+// latest publish failure recorded.
 func (p *Postgres) RecordDispatchIntentError(ctx context.Context, intentID string, claimedAt time.Time, lastError string) error {
 	result, err := p.DB.ExecContext(ctx, `
 		UPDATE dispatch_outbox
@@ -1943,6 +2076,8 @@ func (p *Postgres) RecordDispatchIntentError(ctx context.Context, intentID strin
 	return nil
 }
 
+// ListAttemptsPendingEnqueue exposes the older pre-outbox repair surface for
+// compatibility and migration-safe inspection.
 func (p *Postgres) ListAttemptsPendingEnqueue(ctx context.Context, limit int) ([]PendingEnqueueAttempt, error) {
 	if limit <= 0 {
 		limit = 100
@@ -1974,6 +2109,7 @@ func (p *Postgres) ListAttemptsPendingEnqueue(ctx context.Context, limit int) ([
 	return items, nil
 }
 
+// MarkAttemptEnqueued records that an attempt has been published to Redis.
 func (p *Postgres) MarkAttemptEnqueued(ctx context.Context, attemptID string) error {
 	result, err := p.DB.ExecContext(ctx, `UPDATE delivery_attempts SET dispatch_enqueued_at = COALESCE(dispatch_enqueued_at, NOW()), updated_at = NOW() WHERE id = $1`, attemptID)
 	if err != nil {
@@ -1989,6 +2125,8 @@ func (p *Postgres) MarkAttemptEnqueued(ctx context.Context, attemptID string) er
 	return nil
 }
 
+// FinalizeReplayEnqueue is the older replay compatibility path that marks work
+// as enqueued and replayed together.
 func (p *Postgres) FinalizeReplayEnqueue(ctx context.Context, deadLetterID, attemptID string) error {
 	tx, err := p.DB.BeginTx(ctx, nil)
 	if err != nil {
@@ -2007,6 +2145,8 @@ func (p *Postgres) FinalizeReplayEnqueue(ctx context.Context, deadLetterID, atte
 	return nil
 }
 
+// UpdateAttemptProvider stores which provider handled an attempt and whether
+// failover was used.
 func (p *Postgres) UpdateAttemptProvider(ctx context.Context, attemptID, provider string, failoverUsed bool) error {
 	result, err := p.DB.ExecContext(ctx, `
 		UPDATE delivery_attempts
@@ -2026,6 +2166,7 @@ func (p *Postgres) UpdateAttemptProvider(ctx context.Context, attemptID, provide
 	return nil
 }
 
+// ListDeliveryPolicies returns all durable policy rows.
 func (p *Postgres) ListDeliveryPolicies(ctx context.Context) ([]DeliveryPolicy, error) {
 	rows, err := p.DB.QueryContext(ctx, `
 		SELECT id, tenant_id, channel, paused, failover_enabled, scheduling_enabled, replay_allowed, max_attempts_override, retry_base_delay_seconds, retry_max_delay_seconds, created_at, updated_at
@@ -2050,6 +2191,7 @@ func (p *Postgres) ListDeliveryPolicies(ctx context.Context) ([]DeliveryPolicy, 
 	return policies, nil
 }
 
+// GetDeliveryPolicyByID returns one policy row by ID.
 func (p *Postgres) GetDeliveryPolicyByID(ctx context.Context, id string) (DeliveryPolicy, error) {
 	var policy DeliveryPolicy
 	if err := scanDeliveryPolicy(p.DB.QueryRowContext(ctx, `
@@ -2065,6 +2207,7 @@ func (p *Postgres) GetDeliveryPolicyByID(ctx context.Context, id string) (Delive
 	return policy, nil
 }
 
+// UpsertDeliveryPolicy inserts or updates one delivery policy row.
 func (p *Postgres) UpsertDeliveryPolicy(ctx context.Context, params UpsertDeliveryPolicyParams) (DeliveryPolicy, error) {
 	var policy DeliveryPolicy
 	if err := scanDeliveryPolicy(p.DB.QueryRowContext(ctx, `
@@ -2089,6 +2232,7 @@ func (p *Postgres) UpsertDeliveryPolicy(ctx context.Context, params UpsertDelive
 	return policy, nil
 }
 
+// SetDeliveryPolicyPaused updates the paused flag for a policy row.
 func (p *Postgres) SetDeliveryPolicyPaused(ctx context.Context, id string, paused bool) (DeliveryPolicy, error) {
 	var policy DeliveryPolicy
 	if err := scanDeliveryPolicy(p.DB.QueryRowContext(ctx, `
@@ -2105,6 +2249,8 @@ func (p *Postgres) SetDeliveryPolicyPaused(ctx context.Context, id string, pause
 	return policy, nil
 }
 
+// ResolveDeliveryPolicy applies the tenant/channel policy precedence rules and
+// returns the effective policy.
 func (p *Postgres) ResolveDeliveryPolicy(ctx context.Context, tenantID, channel string) (ResolvedDeliveryPolicy, error) {
 	rows, err := p.DB.QueryContext(ctx, `
 		SELECT id, tenant_id, channel, paused, failover_enabled, scheduling_enabled, replay_allowed, max_attempts_override, retry_base_delay_seconds, retry_max_delay_seconds, created_at, updated_at
@@ -2151,6 +2297,8 @@ func (p *Postgres) ResolveDeliveryPolicy(ctx context.Context, tenantID, channel 
 	return resolved, nil
 }
 
+// PromoteDueScheduledNotifications turns due scheduled notifications into live
+// dispatch intents.
 func (p *Postgres) PromoteDueScheduledNotifications(ctx context.Context, limit int, now time.Time) ([]PromotedScheduledNotification, error) {
 	if limit <= 0 {
 		limit = 100
@@ -2260,6 +2408,8 @@ func (p *Postgres) PromoteDueScheduledNotifications(ctx context.Context, limit i
 	return promoted, nil
 }
 
+// CancelScheduledNotification cancels still-future scheduled work that has not
+// yet been promoted.
 func (p *Postgres) CancelScheduledNotification(ctx context.Context, notificationID string) (Notification, error) {
 	result, err := p.DB.ExecContext(ctx, `
 		UPDATE notifications
@@ -2297,6 +2447,8 @@ func (p *Postgres) CancelScheduledNotification(ctx context.Context, notification
 	return p.GetNotificationByID(ctx, notificationID)
 }
 
+// RedriveNotification manually promotes eligible scheduled work into the outbox
+// path.
 func (p *Postgres) RedriveNotification(ctx context.Context, notificationID string) (PromotedScheduledNotification, error) {
 	tx, err := p.DB.BeginTx(ctx, nil)
 	if err != nil {
@@ -2375,6 +2527,7 @@ func (p *Postgres) RedriveNotification(ctx context.Context, notificationID strin
 	return item, nil
 }
 
+// RecordAuditEvent inserts one durable audit event.
 func (p *Postgres) RecordAuditEvent(ctx context.Context, id, tenantID, actor, action, resourceType, resourceID string, metadata map[string]any) error {
 	rawMetadata, err := marshalVariables(metadata)
 	if err != nil {
@@ -2387,4 +2540,143 @@ func (p *Postgres) RecordAuditEvent(ctx context.Context, id, tenantID, actor, ac
 		return wrapStoreError("record audit event", err)
 	}
 	return nil
+}
+
+// CollectOperationalMetrics returns the Stage 10 store-backed metrics snapshot
+// used by the metrics endpoint.
+func (p *Postgres) CollectOperationalMetrics(ctx context.Context, now time.Time) (OperationalMetrics, error) {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	metrics := OperationalMetrics{CollectedAt: now}
+	if err := p.DB.QueryRowContext(ctx, `
+		SELECT
+			COALESCE(COUNT(*) FILTER (WHERE status = 'pending'), 0),
+			COALESCE(COUNT(*) FILTER (WHERE status = 'publishing'), 0),
+			COALESCE(FLOOR(MAX(EXTRACT(EPOCH FROM ($1 - created_at))) FILTER (WHERE status = 'pending'))::bigint, 0)
+		FROM dispatch_outbox
+	`, now).Scan(&metrics.OutboxPendingCount, &metrics.OutboxPublishingCount, &metrics.OutboxOldestLagSeconds); err != nil {
+		return OperationalMetrics{}, fmt.Errorf("collect operational metrics: outbox: %w", err)
+	}
+	if err := p.DB.QueryRowContext(ctx, `
+		SELECT
+			COALESCE(COUNT(*) FILTER (WHERE status = 'retry_scheduled' AND next_retry_at <= $1), 0),
+			COALESCE(COUNT(*) FILTER (WHERE status = 'retry_scheduled'), 0)
+		FROM delivery_attempts
+	`, now).Scan(&metrics.DueRetryCount, &metrics.RetryScheduledCount); err != nil {
+		return OperationalMetrics{}, fmt.Errorf("collect operational metrics: retries: %w", err)
+	}
+	if err := p.DB.QueryRowContext(ctx, `
+		SELECT COALESCE(COUNT(*), 0)
+		FROM dead_letters
+		WHERE replayed_at IS NULL
+	`).Scan(&metrics.OpenDeadLetterCount); err != nil {
+		return OperationalMetrics{}, fmt.Errorf("collect operational metrics: dead letters: %w", err)
+	}
+	if err := p.DB.QueryRowContext(ctx, `
+		SELECT
+			COALESCE(COUNT(*) FILTER (WHERE scheduled_for IS NOT NULL AND promoted_at IS NULL AND cancelled_at IS NULL), 0),
+			COALESCE(COUNT(*) FILTER (WHERE scheduled_for IS NOT NULL AND scheduled_for <= $1 AND promoted_at IS NULL AND cancelled_at IS NULL), 0),
+			COALESCE(FLOOR(MAX(EXTRACT(EPOCH FROM ($1 - scheduled_for))) FILTER (WHERE scheduled_for IS NOT NULL AND scheduled_for <= $1 AND promoted_at IS NULL AND cancelled_at IS NULL))::bigint, 0)
+		FROM notifications
+	`, now).Scan(&metrics.ScheduledPendingCount, &metrics.ScheduledDueCount, &metrics.ScheduledOldestLagSeconds); err != nil {
+		return OperationalMetrics{}, fmt.Errorf("collect operational metrics: scheduled: %w", err)
+	}
+	if err := p.DB.QueryRowContext(ctx, `
+		SELECT
+			COALESCE(COUNT(*) FILTER (WHERE action = 'duplicate_job_suppressed'), 0),
+			COALESCE(COUNT(*) FILTER (WHERE action = 'dead_lettered'), 0)
+		FROM audit_events
+	`).Scan(&metrics.DuplicateSuppressionCount, &metrics.DeadLetteredCount); err != nil {
+		return OperationalMetrics{}, fmt.Errorf("collect operational metrics: audits: %w", err)
+	}
+	return metrics, nil
+}
+
+// RunMaintenance performs one explicit retention-driven cleanup pass.
+func (p *Postgres) RunMaintenance(ctx context.Context, params CleanupParams) (CleanupResult, error) {
+	if params.Now.IsZero() {
+		params.Now = time.Now().UTC()
+	}
+	if params.AuditRetention <= 0 {
+		return CleanupResult{}, fmt.Errorf("run maintenance: audit retention must be positive")
+	}
+	if params.OutboxRetention <= 0 {
+		return CleanupResult{}, fmt.Errorf("run maintenance: outbox retention must be positive")
+	}
+	if params.DeadLetterRetention < 0 {
+		return CleanupResult{}, fmt.Errorf("run maintenance: dead letter retention must be >= 0")
+	}
+
+	result := CleanupResult{DryRun: params.DryRun, ExecutedAt: params.Now}
+	auditCutoff := params.Now.Add(-params.AuditRetention)
+	outboxCutoff := params.Now.Add(-params.OutboxRetention)
+	deadLetterCutoff := params.Now.Add(-params.DeadLetterRetention)
+
+	tx, err := p.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return CleanupResult{}, fmt.Errorf("run maintenance: begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM audit_events
+		WHERE created_at < $1
+	`, auditCutoff).Scan(&result.AuditEventsDeleted); err != nil {
+		return CleanupResult{}, fmt.Errorf("run maintenance: audit count: %w", err)
+	}
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM dispatch_outbox
+		WHERE status = 'published' AND published_at IS NOT NULL AND published_at < $1
+	`, outboxCutoff).Scan(&result.PublishedOutboxDeleted); err != nil {
+		return CleanupResult{}, fmt.Errorf("run maintenance: outbox count: %w", err)
+	}
+	if params.DeadLetterRetention > 0 {
+		if err := tx.QueryRowContext(ctx, `
+			SELECT COUNT(*)
+			FROM dead_letters
+			WHERE replayed_at IS NOT NULL AND replayed_at < $1
+		`, deadLetterCutoff).Scan(&result.DeadLettersDeleted); err != nil {
+			return CleanupResult{}, fmt.Errorf("run maintenance: dead letter count: %w", err)
+		}
+	}
+
+	if params.DryRun {
+		if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+			return CleanupResult{}, fmt.Errorf("run maintenance: rollback dry run: %w", err)
+		}
+		return result, nil
+	}
+
+	auditDeleteResult, err := tx.ExecContext(ctx, `DELETE FROM audit_events WHERE created_at < $1`, auditCutoff)
+	if err != nil {
+		return CleanupResult{}, fmt.Errorf("run maintenance: delete audit events: %w", err)
+	}
+	if result.AuditEventsDeleted, err = auditDeleteResult.RowsAffected(); err != nil {
+		return CleanupResult{}, fmt.Errorf("run maintenance: audit rows affected: %w", err)
+	}
+
+	outboxDeleteResult, err := tx.ExecContext(ctx, `DELETE FROM dispatch_outbox WHERE status = 'published' AND published_at IS NOT NULL AND published_at < $1`, outboxCutoff)
+	if err != nil {
+		return CleanupResult{}, fmt.Errorf("run maintenance: delete outbox rows: %w", err)
+	}
+	if result.PublishedOutboxDeleted, err = outboxDeleteResult.RowsAffected(); err != nil {
+		return CleanupResult{}, fmt.Errorf("run maintenance: outbox rows affected: %w", err)
+	}
+	if params.DeadLetterRetention > 0 {
+		deadLetterDeleteResult, err := tx.ExecContext(ctx, `DELETE FROM dead_letters WHERE replayed_at IS NOT NULL AND replayed_at < $1`, deadLetterCutoff)
+		if err != nil {
+			return CleanupResult{}, fmt.Errorf("run maintenance: delete dead letters: %w", err)
+		}
+		if result.DeadLettersDeleted, err = deadLetterDeleteResult.RowsAffected(); err != nil {
+			return CleanupResult{}, fmt.Errorf("run maintenance: dead letter rows affected: %w", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return CleanupResult{}, fmt.Errorf("run maintenance: commit: %w", err)
+	}
+	return result, nil
 }

@@ -9,11 +9,13 @@ import (
 	"strings"
 )
 
+// Server exposes the in-memory MVP service over HTTP.
 type Server struct {
 	service *Service
 	mux     *http.ServeMux
 }
 
+// NewServer constructs the HTTP server wrapper for the in-memory MVP service.
 func NewServer(service *Service) *Server {
 	server := &Server{
 		service: service,
@@ -23,6 +25,7 @@ func NewServer(service *Service) *Server {
 	return server
 }
 
+// Handler returns the configured HTTP handler tree.
 func (s *Server) Handler() http.Handler {
 	return s.mux
 }

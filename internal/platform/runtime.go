@@ -20,6 +20,8 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 )
 
+// NewLogger builds the shared structured JSON logger used by the API and worker
+// commands.
 func NewLogger(level string) *slog.Logger {
 	var slogLevel slog.Level
 	switch strings.ToLower(level) {
@@ -37,6 +39,8 @@ func NewLogger(level string) *slog.Logger {
 	return slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slogLevel}))
 }
 
+// SetupTelemetry configures OpenTelemetry tracing and metrics for a process and
+// returns a shutdown function that should be called during graceful shutdown.
 func SetupTelemetry(ctx context.Context, cfg config.Config) (func(context.Context) error, error) {
 	res, err := resource.Merge(resource.Default(), resource.NewWithAttributes(semconv.SchemaURL, semconv.ServiceName(cfg.AppName), attribute.String("deployment.environment.name", cfg.Environment)))
 	if err != nil {

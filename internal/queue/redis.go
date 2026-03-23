@@ -14,6 +14,7 @@ import (
 	"time"
 )
 
+// RedisQueue is the Redis-backed queue client used by the runtime.
 type RedisQueue struct {
 	addr     string
 	password string
@@ -24,6 +25,8 @@ type RedisQueue struct {
 	rw   *bufio.ReadWriter
 }
 
+// ReservedJob represents a job that has been moved into a processing queue but
+// not yet acknowledged.
 type ReservedJob struct {
 	Job             DispatchJob
 	queueName       string
@@ -31,10 +34,12 @@ type ReservedJob struct {
 	payload         string
 }
 
+// NewRedisQueue creates a queue client for the given Redis connection settings.
 func NewRedisQueue(addr, password string, db int) *RedisQueue {
 	return &RedisQueue{addr: addr, password: password, db: db}
 }
 
+// Close releases the current Redis connection.
 func (q *RedisQueue) Close() error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -50,6 +55,7 @@ func (q *RedisQueue) Close() error {
 	return nil
 }
 
+// Ping verifies that Redis is reachable and responding to basic commands.
 func (q *RedisQueue) Ping(ctx context.Context) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -70,10 +76,12 @@ func (q *RedisQueue) Ping(ctx context.Context) error {
 	return nil
 }
 
+// EnqueueDispatch writes a job to the shared dispatch queue.
 func (q *RedisQueue) EnqueueDispatch(ctx context.Context, job DispatchJob) error {
 	return q.enqueue(ctx, DispatchQueueName, job)
 }
 
+// QueueDepth returns the current Redis list length for a queue.
 func (q *RedisQueue) QueueDepth(ctx context.Context, queueName string) (int, error) {
 	value, err := q.llen(ctx, queueName)
 	if err != nil {
@@ -82,6 +90,8 @@ func (q *RedisQueue) QueueDepth(ctx context.Context, queueName string) (int, err
 	return int(value), nil
 }
 
+// PressureSnapshot returns the current depth of the shared and channel-specific
+// dispatch queues.
 func (q *RedisQueue) PressureSnapshot(ctx context.Context) (PressureSnapshot, error) {
 	depths := map[string]int{}
 	for _, name := range []string{DispatchQueueName, DispatchEmailQueueName, DispatchWebhookQueueName} {
@@ -94,6 +104,7 @@ func (q *RedisQueue) PressureSnapshot(ctx context.Context) (PressureSnapshot, er
 	return PressureSnapshot{Depths: depths}, nil
 }
 
+// AllowTenant applies the Redis-backed fixed-window rate limiter for a tenant.
 func (q *RedisQueue) AllowTenant(ctx context.Context, tenantID string, limit int, window time.Duration) (bool, time.Duration, error) {
 	if limit <= 0 || tenantID == "" {
 		return true, 0, nil
@@ -118,6 +129,7 @@ func (q *RedisQueue) AllowTenant(ctx context.Context, tenantID string, limit int
 	return false, ttl, nil
 }
 
+// EnqueueChannel routes a job directly to its channel-specific queue.
 func (q *RedisQueue) EnqueueChannel(ctx context.Context, job DispatchJob) error {
 	queueName, err := QueueNameForChannel(job.Channel)
 	if err != nil {
@@ -126,14 +138,19 @@ func (q *RedisQueue) EnqueueChannel(ctx context.Context, job DispatchJob) error 
 	return q.enqueue(ctx, queueName, job)
 }
 
+// ReserveDispatch reserves work from the shared dispatch queue.
 func (q *RedisQueue) ReserveDispatch(ctx context.Context, timeoutSeconds int) (ReservedJob, error) {
 	return q.ReserveChannel(ctx, DispatchQueueName, timeoutSeconds)
 }
 
+// ConsumeDispatch reserves and immediately acknowledges a job from the shared
+// dispatch queue.
 func (q *RedisQueue) ConsumeDispatch(ctx context.Context) (DispatchJob, error) {
 	return q.ConsumeChannel(ctx, DispatchQueueName, 1)
 }
 
+// ConsumeChannel reserves and immediately acknowledges a job from the named
+// channel queue.
 func (q *RedisQueue) ConsumeChannel(ctx context.Context, queueName string, timeoutSeconds int) (DispatchJob, error) {
 	reserved, err := q.ReserveChannel(ctx, queueName, timeoutSeconds)
 	if err != nil {
@@ -145,6 +162,8 @@ func (q *RedisQueue) ConsumeChannel(ctx context.Context, queueName string, timeo
 	return reserved.Job, nil
 }
 
+// ReserveChannel moves one job from the named queue to its processing queue and
+// returns the reserved payload.
 func (q *RedisQueue) ReserveChannel(ctx context.Context, queueName string, timeoutSeconds int) (ReservedJob, error) {
 	if timeoutSeconds <= 0 {
 		timeoutSeconds = 1
@@ -169,10 +188,15 @@ func (q *RedisQueue) ReserveChannel(ctx context.Context, queueName string, timeo
 	}
 }
 
+// AckReserved removes a previously reserved job from its processing queue.
 func (q *RedisQueue) AckReserved(ctx context.Context, reserved ReservedJob) error {
 	return q.lrem(ctx, reserved.processingQueue, 1, reserved.payload)
 }
 
+// RequeueReserved moves a reserved job back to its source queue.
+//
+// This is used when routing failed after the job was already reserved, so the
+// dispatcher can preserve work without waiting for a later recovery sweep.
 func (q *RedisQueue) RequeueReserved(ctx context.Context, reserved ReservedJob) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -225,6 +249,7 @@ func (q *RedisQueue) RequeueReserved(ctx context.Context, reserved ReservedJob) 
 	return nil
 }
 
+// RecoverProcessingQueue drains one processing queue back into its source queue.
 func (q *RedisQueue) RecoverProcessingQueue(ctx context.Context, queueName string) (int, error) {
 	processingQueue := ProcessingQueueName(queueName)
 	recovered := 0
@@ -241,6 +266,8 @@ func (q *RedisQueue) RecoverProcessingQueue(ctx context.Context, queueName strin
 	}
 }
 
+// RecoverKnownProcessingQueues drains every processing queue known to the
+// service runtime and reports how many jobs were recovered per queue.
 func (q *RedisQueue) RecoverKnownProcessingQueues(ctx context.Context) (map[string]int, error) {
 	queues := []string{DispatchQueueName, DispatchWebhookQueueName, DispatchEmailQueueName}
 	results := make(map[string]int, len(queues))
@@ -254,10 +281,13 @@ func (q *RedisQueue) RecoverKnownProcessingQueues(ctx context.Context) (map[stri
 	return results, nil
 }
 
+// ProcessingQueueName returns the name of the processing queue paired with a
+// source queue.
 func ProcessingQueueName(queueName string) string {
 	return queueName + ":processing"
 }
 
+// QueueNameForChannel returns the worker queue that should handle a channel.
 func QueueNameForChannel(channel string) (string, error) {
 	switch channel {
 	case "webhook":

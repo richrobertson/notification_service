@@ -13,6 +13,8 @@ type errorResponse struct {
 	Message string `json:"message"`
 }
 
+var errRequestTooLarge = errors.New("request body too large")
+
 func decodeJSON(r *http.Request, dst any) error {
 	defer r.Body.Close()
 
@@ -23,14 +25,30 @@ func decodeJSON(r *http.Request, dst any) error {
 		if errors.Is(err, io.EOF) {
 			return fmt.Errorf("request body must not be empty")
 		}
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			return errRequestTooLarge
+		}
 		return err
 	}
 
 	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			return errRequestTooLarge
+		}
 		return fmt.Errorf("request body must contain only a single JSON object")
 	}
 
 	return nil
+}
+
+func writeDecodeError(w http.ResponseWriter, err error) {
+	if errors.Is(err, errRequestTooLarge) {
+		writeError(w, http.StatusRequestEntityTooLarge, "request_too_large", "request body exceeds configured limit")
+		return
+	}
+	writeError(w, http.StatusBadRequest, "bad_request", fmt.Sprintf("invalid request body: %v", err))
 }
 
 func writeJSON(w http.ResponseWriter, statusCode int, value any) {
