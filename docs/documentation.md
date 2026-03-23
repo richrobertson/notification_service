@@ -9,6 +9,13 @@ The goal is to make the docs useful in two passes:
 - the first sentence should be a terse reference summary for experienced readers
 - the rest of the comment should add enough context, invariants, and examples to help new contributors understand why the code exists and how it is meant to be used
 
+## Further reading
+
+- [www.myrobertson.com](https://www.myrobertson.com/)
+- [What Is a Control Plane?](https://www.myrobertson.com/blog/what-is-a-control-plane.html)
+- [Architecting a Multitenant Control Plane for a Next-Generation Data Tier](https://www.myrobertson.com/blog/architecting-a-multitenant-control-plane-for-a-next-generation-data-tier.html)
+- [Backpressure in Distributed Systems: Stability, Correctness, and Graceful Degradation](https://www.myrobertson.com/blog/backpressure-stability-correctness-distributed-systems.html)
+
 ## Writing style
 
 When documenting exported code:

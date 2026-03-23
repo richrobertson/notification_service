@@ -7,6 +7,13 @@
 See [docs/roadmap.md](docs/roadmap.md) for current milestone status and next steps.
 See [docs/documentation.md](docs/documentation.md) for the documentation writing style and [docs/api/](docs/api/) for generated API reference output.
 
+Further reading:
+
+- [www.myrobertson.com](https://www.myrobertson.com/)
+- [What Is a Control Plane?](https://www.myrobertson.com/blog/what-is-a-control-plane.html)
+- [Architecting a Multitenant Control Plane for a Next-Generation Data Tier](https://www.myrobertson.com/blog/architecting-a-multitenant-control-plane-for-a-next-generation-data-tier.html)
+- [Backpressure in Distributed Systems: Stability, Correctness, and Graceful Degradation](https://www.myrobertson.com/blog/backpressure-stability-correctness-distributed-systems.html)
+
 The service now provides:
 
 - health and readiness endpoints
