@@ -5,6 +5,7 @@
 `notification_service` is a runnable Go notification platform foundation. The repository is currently through Stage 10, with PostgreSQL as the authoritative source of truth for durable dispatch publication, Redis serving as the execution transport, explicit delivery policy controls layered on top, and production/runtime hardening around the API and worker processes.
 
 See [docs/roadmap.md](docs/roadmap.md) for current milestone status and next steps.
+See [docs/documentation.md](docs/documentation.md) for the documentation writing style and [docs/api/](docs/api/) for generated API reference output.
 
 The service now provides:
 

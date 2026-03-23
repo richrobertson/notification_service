@@ -10,6 +10,7 @@ import (
 	"github.com/richrobertson/notification-platform/internal/store"
 )
 
+// Store captures the Postgres behavior the outbox publisher needs.
 type Store interface {
 	ClaimPendingDispatchIntents(ctx context.Context, limit int, staleAfter time.Duration) ([]store.PendingDispatchIntent, error)
 	MarkDispatchIntentPublished(ctx context.Context, intentID string, claimedAt time.Time) error
@@ -17,11 +18,13 @@ type Store interface {
 	RecordAuditEvent(ctx context.Context, id, tenantID, actor, action, resourceType, resourceID string, metadata map[string]any) error
 }
 
+// Queue captures the Redis operations the publisher needs.
 type Queue interface {
 	EnqueueDispatch(ctx context.Context, job queue.DispatchJob) error
 	PressureSnapshot(ctx context.Context) (queue.PressureSnapshot, error)
 }
 
+// IDGenerator returns durable-ish IDs for emitted audit and queue records.
 type IDGenerator func(prefix string) string
 
 const (
@@ -32,6 +35,11 @@ const (
 	claimTimeout = (claimBatchSize + 1) * publishTimeout
 )
 
+// RunOnce claims a batch of pending dispatch intents, publishes them to Redis,
+// and records the durable result back in Postgres.
+//
+// The function is designed for polling workers. Callers typically run it on a
+// ticker and let pending intents remain in Postgres when Redis is unavailable.
 func RunOnce(ctx context.Context, logger *slog.Logger, st Store, q Queue, softLimit int, generateID IDGenerator) error {
 	if q == nil {
 		return fmt.Errorf("outbox publisher queue is required")
@@ -97,6 +105,7 @@ func RunOnce(ctx context.Context, logger *slog.Logger, st Store, q Queue, softLi
 	}
 }
 
+// ErrorString turns a nil-safe error into a stable string for logs and tests.
 func ErrorString(err error) string {
 	if err == nil {
 		return ""

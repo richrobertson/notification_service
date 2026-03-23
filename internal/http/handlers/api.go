@@ -47,16 +47,21 @@ type dispatchQueue interface {
 	EnqueueDispatch(ctx context.Context, job queue.DispatchJob) error
 }
 
+// TenantRateLimiter is the API's tenant-aware request-throttling contract.
 type TenantRateLimiter interface {
 	Allow(ctx context.Context, tenantID string) (bool, time.Duration, error)
 }
 
+// PressureMonitor is the subset of queue-pressure behavior the API uses for
+// Stage 7 overload protection.
 type PressureMonitor interface {
 	Snapshot(ctx context.Context) (queue.PressureSnapshot, error)
 	IncRateLimited(tenantID string)
 	IncRejected(reason, tenantID string)
 }
 
+// API bundles the store, queue, rate limiter, and pressure monitor used by the
+// HTTP handlers.
 type API struct {
 	store   apiStore
 	queue   dispatchQueue
@@ -109,6 +114,7 @@ type upsertPolicyRequest struct {
 	RetryMaxDelaySeconds  *int    `json:"retry_max_delay_seconds"`
 }
 
+// NewAPI constructs the concrete Stage 7+ HTTP handler set.
 func NewAPI(store apiStore, redisQueue dispatchQueue, limiter TenantRateLimiter, monitor PressureMonitor) *API {
 	return &API{store: store, queue: redisQueue, limiter: limiter, monitor: monitor}
 }
@@ -203,6 +209,7 @@ func (a *API) ensureInitialAttempt(ctx context.Context, w http.ResponseWriter, e
 	writeJSON(w, http.StatusAccepted, existing)
 }
 
+// CreateTenant handles `POST /v1/tenants`.
 func (a *API) CreateTenant() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req createTenantRequest
@@ -235,6 +242,7 @@ func (a *API) CreateTenant() http.HandlerFunc {
 	}
 }
 
+// CreateTemplate handles `POST /v1/templates`.
 func (a *API) CreateTemplate() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req createTemplateRequest
@@ -287,6 +295,11 @@ func (a *API) CreateTemplate() http.HandlerFunc {
 	}
 }
 
+// CreateNotification handles `POST /v1/notifications`.
+//
+// The handler applies Stage 7 rate limiting and backpressure checks, Stage 6
+// idempotency repair behavior, and Stage 8/9 durable dispatch or scheduling
+// behavior.
 func (a *API) CreateNotification() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req createNotificationRequest
@@ -426,6 +439,7 @@ func generateID(prefix string) string {
 	return fmt.Sprintf("%s_%s", prefix, hex.EncodeToString(buf))
 }
 
+// ListDeadLetters handles `GET /v1/dead-letters`.
 func (a *API) ListDeadLetters() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		deadLetters, err := a.store.ListDeadLetters(r.Context(), 100)
@@ -437,6 +451,7 @@ func (a *API) ListDeadLetters() http.HandlerFunc {
 	}
 }
 
+// GetDeadLetter handles `GET /v1/dead-letters/{id}`.
 func (a *API) GetDeadLetter() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		deadLetter, err := a.store.GetDeadLetterByID(r.Context(), r.PathValue("id"))
@@ -452,6 +467,7 @@ func (a *API) GetDeadLetter() http.HandlerFunc {
 	}
 }
 
+// ReplayDeadLetter handles `POST /v1/dead-letters/{id}/replay`.
 func (a *API) ReplayDeadLetter() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		deadLetterID := r.PathValue("id")
@@ -502,6 +518,7 @@ func (a *API) ReplayDeadLetter() http.HandlerFunc {
 	}
 }
 
+// GetNotification handles `GET /v1/notifications/{id}`.
 func (a *API) GetNotification() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id := r.PathValue("id")
@@ -523,6 +540,7 @@ func (a *API) GetNotification() http.HandlerFunc {
 	}
 }
 
+// ListNotificationAttempts handles `GET /v1/notifications/{id}/attempts`.
 func (a *API) ListNotificationAttempts() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		attempts, err := a.store.ListDeliveryAttemptsByNotificationID(r.Context(), r.PathValue("id"))
@@ -534,6 +552,7 @@ func (a *API) ListNotificationAttempts() http.HandlerFunc {
 	}
 }
 
+// GetAttempt handles `GET /v1/attempts/{id}`.
 func (a *API) GetAttempt() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		attempt, err := a.store.GetDeliveryAttemptByID(r.Context(), r.PathValue("id"))
@@ -549,6 +568,7 @@ func (a *API) GetAttempt() http.HandlerFunc {
 	}
 }
 
+// CancelNotification handles `POST /v1/notifications/{id}/cancel`.
 func (a *API) CancelNotification() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		notification, err := a.store.CancelScheduledNotification(r.Context(), r.PathValue("id"))
@@ -569,6 +589,7 @@ func (a *API) CancelNotification() http.HandlerFunc {
 	}
 }
 
+// RedriveNotification handles `POST /v1/notifications/{id}/redrive`.
 func (a *API) RedriveNotification() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		result, err := a.store.RedriveNotification(r.Context(), r.PathValue("id"))
@@ -589,6 +610,7 @@ func (a *API) RedriveNotification() http.HandlerFunc {
 	}
 }
 
+// ListPolicies handles `GET /v1/policies`.
 func (a *API) ListPolicies() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		policies, err := a.store.ListDeliveryPolicies(r.Context())
@@ -600,6 +622,7 @@ func (a *API) ListPolicies() http.HandlerFunc {
 	}
 }
 
+// GetPolicy handles `GET /v1/policies/{id}`.
 func (a *API) GetPolicy() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		policy, err := a.store.GetDeliveryPolicyByID(r.Context(), r.PathValue("id"))
@@ -615,6 +638,7 @@ func (a *API) GetPolicy() http.HandlerFunc {
 	}
 }
 
+// UpsertPolicy handles `POST /v1/policies`.
 func (a *API) UpsertPolicy() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req upsertPolicyRequest
@@ -672,6 +696,7 @@ func (a *API) UpsertPolicy() http.HandlerFunc {
 	}
 }
 
+// PausePolicy handles `POST /v1/policies/{id}/pause`.
 func (a *API) PausePolicy() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		policy, err := a.store.SetDeliveryPolicyPaused(r.Context(), r.PathValue("id"), true)
@@ -688,6 +713,7 @@ func (a *API) PausePolicy() http.HandlerFunc {
 	}
 }
 
+// ResumePolicy handles `POST /v1/policies/{id}/resume`.
 func (a *API) ResumePolicy() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		policy, err := a.store.SetDeliveryPolicyPaused(r.Context(), r.PathValue("id"), false)

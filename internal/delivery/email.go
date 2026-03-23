@@ -13,11 +13,13 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 )
 
+// SMTPSender delivers email through one configured SMTP endpoint.
 type SMTPSender struct {
 	cfg  config.Config
 	dial func(network, addr string) (net.Conn, error)
 }
 
+// EmailRequest is the rendered email payload passed to an SMTP sender.
 type EmailRequest struct {
 	To             string
 	Subject        string
@@ -26,10 +28,13 @@ type EmailRequest struct {
 	NotificationID string
 }
 
+// NewSMTPSender constructs the primary SMTP sender from process configuration.
 func NewSMTPSender(cfg config.Config) *SMTPSender {
 	return &SMTPSender{cfg: cfg, dial: net.Dial}
 }
 
+// NewSecondarySMTPSender constructs the secondary SMTP sender used for
+// failover.
 func NewSecondarySMTPSender(cfg config.Config) *SMTPSender {
 	if strings.TrimSpace(cfg.SecondarySMTPHost) == "" || cfg.SecondarySMTPPort <= 0 {
 		return nil
@@ -48,6 +53,8 @@ func NewSecondarySMTPSender(cfg config.Config) *SMTPSender {
 	return &SMTPSender{cfg: secondary, dial: net.Dial}
 }
 
+// NewOptionalSecondaryEmailSender returns the configured secondary sender when
+// one is available, or nil when failover is disabled by configuration.
 func NewOptionalSecondaryEmailSender(cfg config.Config) emailSender {
 	if sender := NewSecondarySMTPSender(cfg); sender != nil {
 		return sender
@@ -55,6 +62,7 @@ func NewOptionalSecondaryEmailSender(cfg config.Config) emailSender {
 	return nil
 }
 
+// Send writes one email message to the configured SMTP endpoint.
 func (s *SMTPSender) Send(ctx context.Context, req EmailRequest) error {
 	_, span := otel.Tracer("notification-platform/delivery").Start(ctx, "email.send")
 	defer span.End()

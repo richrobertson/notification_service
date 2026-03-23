@@ -9,6 +9,8 @@ import (
 	"github.com/richrobertson/notification-platform/internal/store"
 )
 
+// OperationalMetricsProvider supplies the store-backed metrics used by the
+// metrics endpoint.
 type OperationalMetricsProvider interface {
 	CollectOperationalMetrics(ctx context.Context, now time.Time) (store.OperationalMetrics, error)
 }
@@ -19,6 +21,11 @@ type metricsResponse struct {
 	Operational *store.OperationalMetrics `json:"operational,omitempty"`
 }
 
+// Metrics returns the JSON metrics handler used by `/metrics` and `/v1/metrics`.
+//
+// It combines the in-process pressure monitor with optional durable metrics from
+// the store layer so operators can inspect both queue pressure and durable
+// backlog state from one endpoint.
 func Metrics(m *pressure.Monitor, provider OperationalMetricsProvider) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		response := metricsResponse{Status: "ok"}

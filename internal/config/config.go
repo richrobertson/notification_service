@@ -10,6 +10,8 @@ import (
 	"time"
 )
 
+// Config contains the process-level runtime settings used by the API and
+// workers.
 type Config struct {
 	AppName                         string
 	HTTPPort                        string
@@ -72,6 +74,12 @@ type Config struct {
 	MaintenanceDryRun               bool
 }
 
+// Load reads configuration from environment variables and applies pragmatic
+// local-development defaults.
+//
+// The returned value is intentionally usable before validation so commands can
+// tailor app names or command-specific behavior and then call Validate or
+// ValidateForAPI.
 func Load() Config {
 	cfg := Config{
 		AppName:                         envOrDefault("APP_NAME", "notification-platform-api"),
@@ -142,6 +150,11 @@ func Load() Config {
 	return cfg
 }
 
+// Validate checks that the configuration is internally consistent and safe to
+// use for a long-running process.
+//
+// The method validates both individual fields and important cross-field
+// invariants such as retry ranges, queue limits, and timeout ordering.
 func (c Config) Validate() error {
 	if strings.TrimSpace(c.AppName) == "" {
 		return fmt.Errorf("APP_NAME must not be empty")
@@ -269,6 +282,8 @@ func (c Config) Validate() error {
 	return nil
 }
 
+// ValidateForAPI applies the shared validation rules and then enforces the
+// additional operator-token requirement used by the HTTP API.
 func (c Config) ValidateForAPI() error {
 	if err := c.Validate(); err != nil {
 		return err

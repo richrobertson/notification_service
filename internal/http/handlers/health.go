@@ -23,11 +23,13 @@ type readinessResponse struct {
 	Dependencies []dependencyStatus `json:"dependencies"`
 }
 
+// DependencyCheck describes one dependency readiness probe.
 type DependencyCheck struct {
 	Name string
 	Ping func(context.Context) error
 }
 
+// Health returns a simple liveness handler for the current service name.
 func Health(serviceName string) http.HandlerFunc {
 	if serviceName == "" {
 		serviceName = defaultServiceName
@@ -41,6 +43,8 @@ func Health(serviceName string) http.HandlerFunc {
 	}
 }
 
+// Readiness returns a readiness handler that evaluates the supplied dependency
+// checks and reports whether the process can currently do useful work.
 func Readiness(checks ...DependencyCheck) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)

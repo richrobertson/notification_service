@@ -12,6 +12,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 )
 
+// WebhookRequest is the rendered outbound webhook payload.
 type WebhookRequest struct {
 	URL            string
 	Body           string
@@ -19,14 +20,18 @@ type WebhookRequest struct {
 	NotificationID string
 }
 
+// WebhookSender delivers rendered webhook bodies over HTTP.
 type WebhookSender struct {
 	client *http.Client
 }
 
+// NewWebhookSender constructs an HTTP webhook sender with the given timeout.
 func NewWebhookSender(timeout time.Duration) *WebhookSender {
 	return &WebhookSender{client: &http.Client{Timeout: timeout}}
 }
 
+// Send delivers one webhook request and returns the provider-facing message ID
+// when the downstream endpoint supplies one.
 func (s *WebhookSender) Send(ctx context.Context, req WebhookRequest) (string, error) {
 	ctx, span := otel.Tracer("notification-platform/delivery").Start(ctx, "webhook.send")
 	defer span.End()

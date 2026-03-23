@@ -13,8 +13,13 @@ import (
 	"github.com/richrobertson/notification-platform/internal/store"
 )
 
+// Processor performs the business work for one reserved job.
+//
+// Workers supply queue and shutdown mechanics; the Processor owns the
+// channel-specific behavior.
 type Processor func(context.Context, queue.DispatchJob) (delivery.Result, error)
 
+// Options controls concurrency and fairness behavior for RunChannelWorker.
 type Options struct {
 	Concurrency       int
 	TenantBurst       int
@@ -108,6 +113,11 @@ func removeTenant(order []string, tenant string) []string {
 	return out
 }
 
+// RecoverProcessingQueues drains known processing queues back into their source
+// queues.
+//
+// This is a best-effort recovery pass used at startup and during periodic
+// recovery loops.
 func RecoverProcessingQueues(ctx context.Context, logger *slog.Logger, redisQueue *queue.RedisQueue) {
 	results, err := redisQueue.RecoverKnownProcessingQueues(ctx)
 	if err != nil {
@@ -120,6 +130,8 @@ func RecoverProcessingQueues(ctx context.Context, logger *slog.Logger, redisQueu
 		}
 	}
 }
+
+// StartRecoveryLoop launches the periodic stranded-job recovery loop.
 func StartRecoveryLoop(ctx context.Context, logger *slog.Logger, redisQueue *queue.RedisQueue, interval time.Duration) {
 	if interval <= 0 {
 		return
@@ -138,6 +150,11 @@ func StartRecoveryLoop(ctx context.Context, logger *slog.Logger, redisQueue *que
 	}()
 }
 
+// RunChannelWorker consumes jobs from a channel queue using bounded concurrency
+// and lightweight tenant fairness.
+//
+// On shutdown, the worker stops reserving new jobs and waits for in-flight
+// processors to complete before returning.
 func RunChannelWorker(ctx context.Context, logger *slog.Logger, redisQueue *queue.RedisQueue, queueName string, blockTimeout time.Duration, processor Processor, opts Options) {
 	if opts.Concurrency <= 0 {
 		opts.Concurrency = 1

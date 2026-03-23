@@ -6,6 +6,10 @@ import (
 	"text/template"
 )
 
+// RenderTemplate applies `{{variable}}` substitutions to a template body.
+//
+// The renderer is intentionally small and explicit. It is suitable for message
+// bodies and operator-visible examples, not for generalized templating logic.
 func RenderTemplate(body string, variables map[string]any) (string, error) {
 	tmpl, err := template.New("body").Option("missingkey=error").Parse(body)
 	if err != nil {

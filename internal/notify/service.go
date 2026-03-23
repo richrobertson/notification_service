@@ -15,6 +15,7 @@ var (
 	errDailyQuotaExceeded   = errors.New("daily quota exceeded")
 )
 
+// Tenant is the in-memory tenant record used by the MVP service.
 type Tenant struct {
 	ID         string    `json:"id"`
 	Name       string    `json:"name"`
@@ -23,6 +24,7 @@ type Tenant struct {
 	CreatedAt  time.Time `json:"created_at"`
 }
 
+// Template is the in-memory MVP representation of a message template.
 type Template struct {
 	ID        string    `json:"id"`
 	TenantID  string    `json:"tenant_id"`
@@ -33,6 +35,8 @@ type Template struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+// DeliveryAttempt is the simplified in-memory attempt record used by the MVP
+// service.
 type DeliveryAttempt struct {
 	ID             string     `json:"id"`
 	NotificationID string     `json:"notification_id"`
@@ -44,6 +48,7 @@ type DeliveryAttempt struct {
 	CompletedAt    *time.Time `json:"completed_at"`
 }
 
+// Notification is the in-memory notification model exposed by the MVP service.
 type Notification struct {
 	ID             string            `json:"id"`
 	TenantID       string            `json:"tenant_id"`
@@ -57,6 +62,7 @@ type Notification struct {
 	Attempts       []DeliveryAttempt `json:"attempts"`
 }
 
+// DeadLetter is the in-memory representation of a failed notification attempt.
 type DeadLetter struct {
 	ID             string    `json:"id"`
 	NotificationID string    `json:"notification_id"`
@@ -65,6 +71,7 @@ type DeadLetter struct {
 	DeadLetteredAt time.Time `json:"dead_lettered_at"`
 }
 
+// Usage reports a tenant's accepted-notification count for the current day.
 type Usage struct {
 	TenantID              string `json:"tenant_id"`
 	Date                  string `json:"date"`
@@ -73,12 +80,14 @@ type Usage struct {
 	RemainingQuota        int    `json:"remaining_quota"`
 }
 
+// CreateTenantInput is the request payload for tenant creation.
 type CreateTenantInput struct {
 	ID         string `json:"id"`
 	Name       string `json:"name"`
 	DailyQuota int    `json:"daily_quota"`
 }
 
+// CreateTemplateInput is the request payload for template creation.
 type CreateTemplateInput struct {
 	ID       string `json:"id"`
 	TenantID string `json:"tenant_id"`
@@ -87,11 +96,14 @@ type CreateTemplateInput struct {
 	Body     string `json:"body"`
 }
 
+// UpdateTemplateInput is the request payload for template updates.
 type UpdateTemplateInput struct {
 	Name string `json:"name"`
 	Body string `json:"body"`
 }
 
+// CreateNotificationInput is the request payload for MVP notification
+// submission.
 type CreateNotificationInput struct {
 	TenantID       string         `json:"tenant_id"`
 	TemplateID     string         `json:"template_id"`
@@ -101,6 +113,7 @@ type CreateNotificationInput struct {
 	IdempotencyKey string         `json:"idempotency_key"`
 }
 
+// Service is the in-memory MVP implementation of the notification API.
 type Service struct {
 	mu               sync.RWMutex
 	tenants          map[string]Tenant
@@ -112,6 +125,7 @@ type Service struct {
 	idgen            func() string
 }
 
+// NewService creates a new in-memory notify Service.
 func NewService() *Service {
 	return &Service{
 		tenants:          make(map[string]Tenant),
@@ -124,6 +138,7 @@ func NewService() *Service {
 	}
 }
 
+// CreateTenant stores a new tenant in the in-memory service.
 func (s *Service) CreateTenant(input CreateTenantInput) (Tenant, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -143,6 +158,7 @@ func (s *Service) CreateTenant(input CreateTenantInput) (Tenant, error) {
 	return tenant, nil
 }
 
+// GetTenant returns one tenant by ID.
 func (s *Service) GetTenant(id string) (Tenant, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -154,6 +170,7 @@ func (s *Service) GetTenant(id string) (Tenant, error) {
 	return tenant, nil
 }
 
+// CreateTemplate stores a new template for a tenant.
 func (s *Service) CreateTemplate(input CreateTemplateInput) (Template, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -178,6 +195,7 @@ func (s *Service) CreateTemplate(input CreateTemplateInput) (Template, error) {
 	return template, nil
 }
 
+// GetTemplate returns one template by ID.
 func (s *Service) GetTemplate(id string) (Template, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -189,6 +207,7 @@ func (s *Service) GetTemplate(id string) (Template, error) {
 	return template, nil
 }
 
+// UpdateTemplate replaces the mutable parts of an existing template.
 func (s *Service) UpdateTemplate(id string, input UpdateTemplateInput) (Template, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -205,6 +224,8 @@ func (s *Service) UpdateTemplate(id string, input UpdateTemplateInput) (Template
 	return template, nil
 }
 
+// CreateNotification creates a new notification and returns whether it was
+// deduplicated by idempotency key.
 func (s *Service) CreateNotification(input CreateNotificationInput) (Notification, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -264,6 +285,7 @@ func (s *Service) CreateNotification(input CreateNotificationInput) (Notificatio
 	return notification, false, nil
 }
 
+// GetNotification returns one notification by ID.
 func (s *Service) GetNotification(id string) (Notification, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -275,6 +297,8 @@ func (s *Service) GetNotification(id string) (Notification, error) {
 	return notification, nil
 }
 
+// ReplayNotification resets a failed notification so it can be attempted again
+// in the MVP service.
 func (s *Service) ReplayNotification(id string) (Notification, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -304,6 +328,7 @@ func (s *Service) ReplayNotification(id string) (Notification, error) {
 	return notification, nil
 }
 
+// Usage returns the current-day usage counters for one tenant.
 func (s *Service) Usage(tenantID string) (Usage, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -335,6 +360,7 @@ func (s *Service) Usage(tenantID string) (Usage, error) {
 	}, nil
 }
 
+// DeadLetters returns the current in-memory dead-letter set.
 func (s *Service) DeadLetters() []DeadLetter {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

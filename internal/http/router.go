@@ -15,6 +15,8 @@ import (
 	"github.com/richrobertson/notification-platform/internal/store"
 )
 
+// RouterDeps supplies the concrete dependencies needed to build the HTTP
+// router.
 type RouterDeps struct {
 	AppName             string
 	AdminToken          string
@@ -32,6 +34,11 @@ type statusRecorder struct {
 	statusCode int
 }
 
+// NewRouter builds the Stage 10 HTTP surface for the service.
+//
+// The router keeps public submission routes separate from admin-protected
+// operator routes and applies the shared middleware stack used by the API
+// process.
 func NewRouter(deps RouterDeps) http.Handler {
 	mux := http.NewServeMux()
 	api := handlers.NewAPI(deps.Store, deps.Queue, deps.Limiter, deps.Monitor)
