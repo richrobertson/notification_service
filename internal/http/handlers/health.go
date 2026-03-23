@@ -55,12 +55,15 @@ func Readiness(checks ...DependencyCheck) http.HandlerFunc {
 			Dependencies: make([]dependencyStatus, 0, len(checks)),
 		}
 		for _, check := range checks {
-			dependency := dependencyStatus{Name: check.Name, Status: "ok"}
-			if check.Ping != nil {
-				if err := check.Ping(ctx); err != nil {
-					dependency.Status = "down"
-					status.Status = "not_ready"
-				}
+			dependency := dependencyStatus{Name: check.Name}
+			if check.Ping == nil {
+				dependency.Status = "unknown"
+				status.Status = "not_ready"
+			} else if err := check.Ping(ctx); err != nil {
+				dependency.Status = "down"
+				status.Status = "not_ready"
+			} else {
+				dependency.Status = "ok"
 			}
 			status.Dependencies = append(status.Dependencies, dependency)
 		}

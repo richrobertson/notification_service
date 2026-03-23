@@ -138,6 +138,9 @@ CREATE INDEX dispatch_outbox_pending_idx
     ON dispatch_outbox (status, claimed_at, created_at)
     WHERE status IN ('pending', 'publishing');
 
+CREATE INDEX dispatch_outbox_status_created_at_idx
+    ON dispatch_outbox (status, created_at);
+
 CREATE TABLE delivery_policies (
     id TEXT PRIMARY KEY,
     tenant_id TEXT REFERENCES tenants(id) ON DELETE CASCADE,
@@ -176,6 +179,10 @@ CREATE INDEX dead_letters_open_idx
     ON dead_letters (dead_lettered_at DESC)
     WHERE replayed_at IS NULL;
 
+CREATE INDEX dead_letters_replayed_at_idx
+    ON dead_letters (replayed_at)
+    WHERE replayed_at IS NOT NULL;
+
 CREATE UNIQUE INDEX dead_letters_replay_attempt_id_idx
     ON dead_letters (replay_attempt_id)
     WHERE replay_attempt_id IS NOT NULL;
@@ -193,6 +200,9 @@ CREATE TABLE audit_events (
 
 CREATE INDEX audit_events_tenant_created_at_idx
     ON audit_events (tenant_id, created_at DESC);
+
+CREATE INDEX audit_events_action_created_at_idx
+    ON audit_events (action, created_at DESC);
 
 
 CREATE FUNCTION set_updated_at()

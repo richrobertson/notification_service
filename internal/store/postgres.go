@@ -2553,7 +2553,7 @@ func (p *Postgres) CollectOperationalMetrics(ctx context.Context, now time.Time)
 		SELECT
 			COALESCE(COUNT(*) FILTER (WHERE status = 'pending'), 0),
 			COALESCE(COUNT(*) FILTER (WHERE status = 'publishing'), 0),
-			COALESCE(MAX(EXTRACT(EPOCH FROM ($1 - created_at))) FILTER (WHERE status = 'pending'), 0)
+			COALESCE(FLOOR(MAX(EXTRACT(EPOCH FROM ($1 - created_at))) FILTER (WHERE status = 'pending'))::bigint, 0)
 		FROM dispatch_outbox
 	`, now).Scan(&metrics.OutboxPendingCount, &metrics.OutboxPublishingCount, &metrics.OutboxOldestLagSeconds); err != nil {
 		return OperationalMetrics{}, fmt.Errorf("collect operational metrics: outbox: %w", err)
@@ -2577,7 +2577,7 @@ func (p *Postgres) CollectOperationalMetrics(ctx context.Context, now time.Time)
 		SELECT
 			COALESCE(COUNT(*) FILTER (WHERE scheduled_for IS NOT NULL AND promoted_at IS NULL AND cancelled_at IS NULL), 0),
 			COALESCE(COUNT(*) FILTER (WHERE scheduled_for IS NOT NULL AND scheduled_for <= $1 AND promoted_at IS NULL AND cancelled_at IS NULL), 0),
-			COALESCE(MAX(EXTRACT(EPOCH FROM ($1 - scheduled_for))) FILTER (WHERE scheduled_for IS NOT NULL AND scheduled_for <= $1 AND promoted_at IS NULL AND cancelled_at IS NULL), 0)
+			COALESCE(FLOOR(MAX(EXTRACT(EPOCH FROM ($1 - scheduled_for))) FILTER (WHERE scheduled_for IS NOT NULL AND scheduled_for <= $1 AND promoted_at IS NULL AND cancelled_at IS NULL))::bigint, 0)
 		FROM notifications
 	`, now).Scan(&metrics.ScheduledPendingCount, &metrics.ScheduledDueCount, &metrics.ScheduledOldestLagSeconds); err != nil {
 		return OperationalMetrics{}, fmt.Errorf("collect operational metrics: scheduled: %w", err)

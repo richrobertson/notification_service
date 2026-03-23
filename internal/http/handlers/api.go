@@ -214,7 +214,7 @@ func (a *API) CreateTenant() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req createTenantRequest
 		if err := decodeJSON(r, &req); err != nil {
-			writeError(w, http.StatusBadRequest, "bad_request", fmt.Sprintf("invalid request body: %v", err))
+			writeDecodeError(w, err)
 			return
 		}
 		if strings.TrimSpace(req.ID) == "" {
@@ -247,7 +247,7 @@ func (a *API) CreateTemplate() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req createTemplateRequest
 		if err := decodeJSON(r, &req); err != nil {
-			writeError(w, http.StatusBadRequest, "bad_request", fmt.Sprintf("invalid request body: %v", err))
+			writeDecodeError(w, err)
 			return
 		}
 		if strings.TrimSpace(req.ID) == "" {
@@ -304,7 +304,7 @@ func (a *API) CreateNotification() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req createNotificationRequest
 		if err := decodeJSON(r, &req); err != nil {
-			writeError(w, http.StatusBadRequest, "bad_request", fmt.Sprintf("invalid request body: %v", err))
+			writeDecodeError(w, err)
 			return
 		}
 		if strings.TrimSpace(req.ID) == "" {
@@ -643,7 +643,7 @@ func (a *API) UpsertPolicy() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req upsertPolicyRequest
 		if err := decodeJSON(r, &req); err != nil {
-			writeError(w, http.StatusBadRequest, "bad_request", fmt.Sprintf("invalid request body: %v", err))
+			writeDecodeError(w, err)
 			return
 		}
 		if strings.TrimSpace(req.ID) == "" {
