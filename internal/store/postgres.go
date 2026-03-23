@@ -2619,37 +2619,41 @@ func (p *Postgres) RunMaintenance(ctx context.Context, params CleanupParams) (Cl
 	}
 	defer tx.Rollback()
 
-	if err := tx.QueryRowContext(ctx, `
-		SELECT COUNT(*)
-		FROM audit_events
-		WHERE created_at < $1
-	`, auditCutoff).Scan(&result.AuditEventsDeleted); err != nil {
-		return CleanupResult{}, fmt.Errorf("run maintenance: audit count: %w", err)
-	}
-	if err := tx.QueryRowContext(ctx, `
-		SELECT COUNT(*)
-		FROM dispatch_outbox
-		WHERE status = 'published' AND published_at IS NOT NULL AND published_at < $1
-	`, outboxCutoff).Scan(&result.PublishedOutboxDeleted); err != nil {
-		return CleanupResult{}, fmt.Errorf("run maintenance: outbox count: %w", err)
-	}
-	if params.DeadLetterRetention > 0 {
+	if params.DryRun {
+		// For a dry run we only need an estimate of what would be removed;
+		// use SELECT COUNT(*) inside the transaction so the snapshot is
+		// consistent, then roll back without touching any data.
 		if err := tx.QueryRowContext(ctx, `
 			SELECT COUNT(*)
-			FROM dead_letters
-			WHERE replayed_at IS NOT NULL AND replayed_at < $1
-		`, deadLetterCutoff).Scan(&result.DeadLettersDeleted); err != nil {
-			return CleanupResult{}, fmt.Errorf("run maintenance: dead letter count: %w", err)
+			FROM audit_events
+			WHERE created_at < $1
+		`, auditCutoff).Scan(&result.AuditEventsDeleted); err != nil {
+			return CleanupResult{}, fmt.Errorf("run maintenance: audit count: %w", err)
 		}
-	}
-
-	if params.DryRun {
+		if err := tx.QueryRowContext(ctx, `
+			SELECT COUNT(*)
+			FROM dispatch_outbox
+			WHERE status = 'published' AND published_at IS NOT NULL AND published_at < $1
+		`, outboxCutoff).Scan(&result.PublishedOutboxDeleted); err != nil {
+			return CleanupResult{}, fmt.Errorf("run maintenance: outbox count: %w", err)
+		}
+		if params.DeadLetterRetention > 0 {
+			if err := tx.QueryRowContext(ctx, `
+				SELECT COUNT(*)
+				FROM dead_letters
+				WHERE replayed_at IS NOT NULL AND replayed_at < $1
+			`, deadLetterCutoff).Scan(&result.DeadLettersDeleted); err != nil {
+				return CleanupResult{}, fmt.Errorf("run maintenance: dead letter count: %w", err)
+			}
+		}
 		if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
 			return CleanupResult{}, fmt.Errorf("run maintenance: rollback dry run: %w", err)
 		}
 		return result, nil
 	}
 
+	// For an actual run derive counts from RowsAffected so the reported
+	// totals exactly match the cleanup effect.
 	auditDeleteResult, err := tx.ExecContext(ctx, `DELETE FROM audit_events WHERE created_at < $1`, auditCutoff)
 	if err != nil {
 		return CleanupResult{}, fmt.Errorf("run maintenance: delete audit events: %w", err)
